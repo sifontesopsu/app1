@@ -119,7 +119,7 @@ def parse_manifest_pdf(uploaded_file):
             "Agrega 'pdfplumber' a requirements.txt en Streamlit."
         )
 
-    import pdfplumber as _pdfplumber  # asegurar
+    import pdfplumber as _pdfplumber  # asegurar import interno
 
     records = []
     with _pdfplumber.open(uploaded_file) as pdf:
@@ -389,20 +389,20 @@ def page_import_ml():
             st.error(f"Faltan columnas en el archivo de Mercado Libre: {missing}")
             st.stop()
 
-      # Buscar la columna de MLC (# publicación) entre varios candidatos
-mlc_candidates = [
-    "Publicaciones | # de publicación",   # 👈 ESTE ES EL QUE REALMENTE TIENES
-    "Publicaciones | ID de publicación",
-    "Publicaciones | # publicación",
-    "# de publicación",
-    "# publicación",
-    "ID de publicación",
-]
-mlc_col_found = None
-for cand in mlc_candidates:
-    if cand in df.columns:
-        mlc_col_found = cand
-        break
+        # Buscar la columna de MLC (# publicación) entre varios candidatos
+        mlc_candidates = [
+            "Publicaciones | # de publicación",   # la que realmente tienes
+            "Publicaciones | ID de publicación",
+            "Publicaciones | # publicación",
+            "# de publicación",
+            "# publicación",
+            "ID de publicación",
+        ]
+        mlc_col_found = None
+        for cand in mlc_candidates:
+            if cand in df.columns:
+                mlc_col_found = cand
+                break
 
         cols_to_copy = [COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
         col_names = ["ml_order_id", "qty", "sku_ml", "title_ml", "buyer"]
