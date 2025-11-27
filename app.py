@@ -106,6 +106,47 @@ def init_db():
     conn.close()
 
 
+
+
+def normalize_image_url(raw):
+    """
+    Normaliza el valor crudo de la URL de imagen proveniente de Excel/CSV.
+
+    - Convierte a string y hace strip.
+    - Ignora valores vacíos o tipo 'nan', 'none', 'null'.
+    - Corrige formas típicas de URLs de MercadoLibre (http2.mlstatic.com).
+    - Devuelve una URL http(s) válida o None si no lo es.
+    """
+    if raw is None:
+        return None
+
+    url = str(raw).strip()
+    if not url:
+        return None
+
+    # Filtrar textos típicos de valores vacíos
+    if url.lower() in ("nan", "none", "null"):
+        return None
+
+    # Caso típico: viene sin esquema: "http2.mlstatic.com/..."
+    if url.startswith("http2.mlstatic.com/"):
+        url = "https://" + url
+
+    # Caso típico: http://http2.mlstatic.com/... → lo pasamos a https
+    if url.startswith("http://http2.mlstatic.com/"):
+        url = "https://" + url[len("http://"):]
+
+    # Caso típico: empieza con //http2.mlstatic.com/...
+    if url.startswith("//"):
+        url = "https:" + url
+
+    # Validar que finalmente tenga esquema http/https
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return None
+
+    return url
+
+
 # ---------- PARSER MANIFIESTO PDF ----------
 def parse_manifest_pdf(uploaded_file):
     """
@@ -565,13 +606,17 @@ def page_import_ml():
             inserted = 0
             for _, row in img_df.iterrows():
                 mlc_val = str(row[img_mlc_col]).strip()
-                url_val = str(row[img_url_col]).strip()
-                if mlc_val and url_val:
-                    c.execute("""
-                        INSERT OR REPLACE INTO sku_images (mlc_id, image_url)
-                        VALUES (?, ?)
-                    """, (mlc_val, url_val))
-                    inserted += 1
+                raw_url_val = row[img_url_col]
+                if not mlc_val:
+                    continue
+                url_val = normalize_image_url(raw_url_val)
+                if not url_val:
+                    continue
+                c.execute("""
+                    INSERT OR REPLACE INTO sku_images (mlc_id, image_url)
+                    VALUES (?, ?)
+                """, (mlc_val, url_val))
+                inserted += 1
             st.success(f"Se cargaron {inserted} imágenes en la tabla sku_images (por MLC).")
 
         conn.commit()
@@ -723,7 +768,15 @@ def page_picking():
 
     with col_img:
         if image_url and isinstance(image_url, str) and image_url.strip():
-            st.image(image_url, use_container_width=True)
+            url_to_show = normalize_image_url(image_url)
+            if not url_to_show:
+                st.write("URL de imagen no válida.")
+            else:
+                try:
+                    st.image(url_to_show, use_container_width=True)
+                except Exception as e:
+                    st.write("Error al cargar la imagen.")
+                    st.caption(f"Detalle técnico: {e}")
         else:
             st.write("Sin imagen")
 
