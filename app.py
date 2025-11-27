@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -6,9 +5,11 @@ from datetime import datetime
 
 DB_NAME = "aurora_ml.db"
 
+
 # ---------- HELPERS DB ----------
 def get_conn():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
+
 
 def init_db():
     conn = get_conn()
@@ -46,7 +47,7 @@ def init_db():
     );
     """)
 
-    # Paquetes escaneados en conteo final
+    # Paquetes escaneados en conteo final (solo tracking)
     c.execute("""
     CREATE TABLE IF NOT EXISTS packages_scan (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,104 +59,111 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 # ---------- PÁGINA: IMPORTAR VENTAS ML ----------
 def page_import_ml():
     st.header("1) Importar ventas Mercado Libre")
 
-    st.write("Sube el archivo de ventas del día exportado desde Mercado Libre (CSV o XLSX).")
+    st.write("Sube el archivo de ventas del día exportado desde Mercado Libre (XLSX).")
 
-    file = st.file_uploader("Archivo de ventas ML", type=["csv", "xlsx"])
+    file = st.file_uploader("Archivo de ventas ML (.xlsx)", type=["xlsx"])
 
-    st.markdown("""
-    **Suposición básica de columnas (puedes adaptar en el código si cambian):**
-    - `order_id` → ID del pedido ML  
-    - `title` → título del producto en la venta  
-    - `seller_custom_field` (o `sku`) → SKU que usas para escanear  
-    - `buyer_nickname` (o similar) → comprador  
-    - `quantity` → cantidad vendida de ese ítem
-    """)
+    if file is None:
+        st.info("Esperando archivo de ventas de Mercado Libre...")
+        return
 
-    if file is not None:
-        # Leer archivo
-        if file.name.endswith(".csv"):
-            df = pd.read_csv(file)
-        else:
-            df = pd.read_excel(file)
+    # 1) LEER EL EXCEL DE ML CON DOBLE ENCABEZADO (FORMATO REAL ML)
+    # Normalmente, ML pone encabezados en dos filas y datos a partir de la fila 6.
+    # Por eso usamos header=[4,5] (fila 5 y 6, índices 4 y 5).
+    try:
+        df = pd.read_excel(file, header=[4, 5])
+    except Exception as e:
+        st.error(f"Error leyendo el Excel de ML: {e}")
+        st.stop()
 
-        st.subheader("Vista previa de las primeras filas")
-        st.dataframe(df.head())
+    # Aplanar MultiIndex de columnas: "Ventas | # de venta", etc.
+    df.columns = [
+        " | ".join([str(x) for x in col if str(x) != "nan"])
+        for col in df.columns
+    ]
 
-        # Aquí mapeamos columnas reales a las que usaremos internamente.
-        # Ajusta estos nombres según EXACTAMENTE cómo viene tu archivo de ML.
-        COLUMN_ORDER_ID = "order_id"
-        COLUMN_TITLE = "title"
-        COLUMN_SKU = "seller_custom_field"  # o "sku" si usas otra columna
-        COLUMN_BUYER = "buyer_nickname"
-        COLUMN_QTY = "quantity"
+    # 2) COLUMNAS REALES QUE VAMOS A USAR DE TU ARCHIVO
+    COLUMN_ORDER_ID = "Ventas | # de venta"
+    COLUMN_QTY = "Ventas | Unidades"
+    COLUMN_SKU = "Publicaciones | SKU"
+    COLUMN_TITLE = "Publicaciones | Título de la publicación"
+    COLUMN_BUYER = "Compradores | Comprador"
 
-        # Verificar que existan
-        missing_cols = [
-            col for col in [COLUMN_ORDER_ID, COLUMN_TITLE, COLUMN_SKU, COLUMN_BUYER, COLUMN_QTY]
-            if col not in df.columns
-        ]
-        if missing_cols:
-            st.error(f"Faltan columnas en el archivo ML: {missing_cols}. Ajusta los nombres en el código.")
-            return
+    required_cols = [COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
+    missing = [c for c in required_cols if c not in df.columns]
 
-        if st.button("Cargar ventas en el sistema"):
-            conn = get_conn()
-            c = conn.cursor()
+    if missing:
+        st.error(f"Faltan columnas en el archivo de Mercado Libre: {missing}")
+        st.stop()
 
-            # Limpiamos tablas del día anterior (para MVP simple)
-            c.execute("DELETE FROM order_items;")
-            c.execute("DELETE FROM orders;")
-            c.execute("DELETE FROM picking_global;")
-            c.execute("DELETE FROM packages_scan;")
+    st.subheader("Vista previa (columnas relevantes)")
+    st.dataframe(df[required_cols].head())
 
-            # Insertar pedidos y líneas
-            for ml_order_id, grupo in df.groupby(COLUMN_ORDER_ID):
-                buyer = grupo[COLUMN_BUYER].iloc[0]
-                created_at = datetime.now().isoformat()
+    # 3) RENOMBRAR A NOMBRES INTERNOS SIMPLES
+    work_df = df[required_cols].copy()
+    work_df.columns = ["ml_order_id", "qty", "sku_ml", "title_ml", "buyer"]
 
-                c.execute("""
-                    INSERT INTO orders (ml_order_id, buyer, created_at)
-                    VALUES (?, ?, ?)
-                """, (str(ml_order_id), str(buyer), created_at))
-                order_id = c.lastrowid
+    # 4) BOTÓN PARA CARGAR A LA BASE DE DATOS
+    if st.button("Cargar ventas en el sistema"):
+        conn = get_conn()
+        c = conn.cursor()
 
-                for _, row in grupo.iterrows():
-                    sku = str(row[COLUMN_SKU])
-                    title = str(row[COLUMN_TITLE])
-                    qty = int(row[COLUMN_QTY])
+        # Limpiamos datos de ejecuciones anteriores (MVP diario)
+        c.execute("DELETE FROM order_items;")
+        c.execute("DELETE FROM orders;")
+        c.execute("DELETE FROM picking_global;")
+        c.execute("DELETE FROM packages_scan;")
 
-                    c.execute("""
-                        INSERT INTO order_items (order_id, sku_ml, title_ml, qty)
-                        VALUES (?, ?, ?, ?)
-                    """, (order_id, sku, title, qty))
+        # Insertar pedidos y sus líneas
+        for ml_order_id, grupo in work_df.groupby("ml_order_id"):
+            buyer = str(grupo["buyer"].iloc[0])
+            created_at = datetime.now().isoformat()
 
-            # Generar picking_global
             c.execute("""
-                SELECT sku_ml, title_ml, SUM(qty) as total
-                FROM order_items
-                GROUP BY sku_ml, title_ml
-            """)
-            rows = c.fetchall()
-            for sku, title, total in rows:
+                INSERT INTO orders (ml_order_id, buyer, created_at)
+                VALUES (?, ?, ?)
+            """, (str(ml_order_id), buyer, created_at))
+            order_id = c.lastrowid
+
+            for _, row in grupo.iterrows():
+                sku = str(row["sku_ml"])
+                title = str(row["title_ml"])
+                qty = int(row["qty"])
+
                 c.execute("""
-                    INSERT INTO picking_global (sku_ml, title_ml, qty_total, qty_picked)
-                    VALUES (?, ?, ?, 0)
-                """, (sku, title, total))
+                    INSERT INTO order_items (order_id, sku_ml, title_ml, qty)
+                    VALUES (?, ?, ?, ?)
+                """, (order_id, sku, title, qty))
 
-            conn.commit()
-            conn.close()
+        # Generar picking_global agrupando todos los SKUs del día
+        c.execute("""
+            SELECT sku_ml, title_ml, SUM(qty) as total
+            FROM order_items
+            GROUP BY sku_ml, title_ml
+        """)
+        rows = c.fetchall()
+        for sku, title, total in rows:
+            c.execute("""
+                INSERT INTO picking_global (sku_ml, title_ml, qty_total, qty_picked)
+                VALUES (?, ?, ?, 0)
+            """, (sku, title, total))
 
-            st.success("Ventas cargadas y lista de picking generada.")
+        conn.commit()
+        conn.close()
+
+        st.success("Ventas cargadas y lista de picking generada correctamente.")
+
 
 # ---------- PÁGINA: PICKING GLOBAL ----------
 def page_picking():
     st.header("2) Picking global por producto")
 
-    st.write("Usa el PDA para escanear el SKU (seller_custom_field) cada vez que bajas un producto a la zona.")
+    st.write("Usa el PDA para escanear el SKU (columna 'Publicaciones | SKU') cada vez que bajas un producto a la zona de armado.")
 
     conn = get_conn()
     c = conn.cursor()
@@ -168,16 +176,16 @@ def page_picking():
     rows = c.fetchall()
 
     if not rows:
-        st.info("Aún no hay lista de picking. Primero importa ventas ML.")
+        st.info("Aún no hay lista de picking. Primero importa ventas de Mercado Libre.")
         conn.close()
         return
 
-    df = pd.DataFrame(rows, columns=["SKU ML", "Título producto", "Cantidad total", "Cantidad pickeada"])
+    df = pd.DataFrame(rows, columns=["SKU ML", "Título producto (ML)", "Cantidad total", "Cantidad pickeada"])
     st.subheader("Resumen de picking")
     st.dataframe(df, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("Registrar escaneo")
+    st.subheader("Registrar escaneo de SKU")
 
     scanned_sku = st.text_input("Escanee SKU aquí (PDA)", key="scan_picking")
 
@@ -213,27 +221,28 @@ def page_picking():
                         )
 
     with col2:
-        if st.button("Resetear pickeos (solo visual, cuidado)"):
+        if st.button("Resetear cantidades pickeadas (cuidado)"):
             c.execute("UPDATE picking_global SET qty_picked = 0;")
             conn.commit()
             st.warning("Se reiniciaron las cantidades pickeadas (para el día actual).")
 
     conn.close()
 
+
 # ---------- PÁGINA: CONTEO FINAL DE PAQUETES ----------
 def page_conteo_final():
     st.header("3) Conteo final de paquetes (tracking)")
 
     st.write("""
-    Idea: después de embalar y etiquetar, en la zona de despacho
-    escanean **una vez** el código de tracking de cada paquete.
+    Después de embalar y etiquetar, en la zona de despacho
+    escanea una sola vez el código de tracking de cada paquete.
     La app compara cuántos pedidos hay vs cuántos paquetes escaneados.
     """)
 
     conn = get_conn()
     c = conn.cursor()
 
-    # Pedidos esperados
+    # Pedidos esperados (ventas ML)
     c.execute("SELECT COUNT(DISTINCT ml_order_id) FROM orders;")
     expected_orders = c.fetchone()[0] or 0
 
@@ -280,13 +289,21 @@ def page_conteo_final():
 
     conn.close()
 
+
 # ---------- MAIN ----------
 def main():
     st.set_page_config(page_title="Aurora ML – MVP Picking", layout="wide")
     init_db()
 
     st.sidebar.title("Aurora ML – MVP")
-    page = st.sidebar.radio("Menú", ["1) Importar ventas ML", "2) Picking global", "3) Conteo final paquetes"])
+    page = st.sidebar.radio(
+        "Menú",
+        [
+            "1) Importar ventas ML",
+            "2) Picking global",
+            "3) Conteo final paquetes"
+        ]
+    )
 
     if page.startswith("1"):
         page_import_ml()
@@ -294,6 +311,7 @@ def main():
         page_picking()
     elif page.startswith("3"):
         page_conteo_final()
+
 
 if __name__ == "__main__":
     main()
