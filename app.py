@@ -289,7 +289,7 @@ def page_picking():
                     WHERE sku_ml = ?
                 """, (sku_ml,))
                 conn.commit()
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.warning("Ya alcanzaste la cantidad total de este producto.")
 
@@ -302,7 +302,7 @@ def page_picking():
                     WHERE sku_ml = ?
                 """, (sku_ml,))
                 conn.commit()
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.warning("La cantidad pickeada ya es 0.")
 
@@ -317,7 +317,7 @@ def page_picking():
                 conn.commit()
             # Pasar automáticamente al siguiente producto
             st.session_state["pick_index"] = min(idx + 1, total_productos - 1)
-            st.experimental_rerun()
+            st.rerun()
 
     with col4:
         if st.button("Poner en 0"):
@@ -327,7 +327,7 @@ def page_picking():
                 WHERE sku_ml = ?
             """, (sku_ml,))
             conn.commit()
-            st.experimental_rerun()
+            st.rerun()
 
     st.markdown("---")
     st.write("**Navegación entre productos**")
@@ -336,12 +336,12 @@ def page_picking():
     with col_prev:
         if st.button("⬅️ Producto anterior"):
             st.session_state["pick_index"] = max(idx - 1, 0)
-            st.experimental_rerun()
+            st.rerun()
 
     with col_next:
         if st.button("Producto siguiente ➡️"):
             st.session_state["pick_index"] = min(idx + 1, total_productos - 1)
-            st.experimental_rerun()
+            st.rerun()
 
     conn.close()
 
