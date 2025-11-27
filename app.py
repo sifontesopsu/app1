@@ -51,7 +51,7 @@ def init_db():
     );
     """)
 
-    # Paquetes escaneados en conteo final (solo tracking)
+    # Paquetes escaneados en conteo final (guardamos aquí el número de venta / tracking)
     c.execute("""
     CREATE TABLE IF NOT EXISTS packages_scan (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -375,17 +375,6 @@ def page_picking():
     conn = get_conn()
     c = conn.cursor()
 
-    # ------- SONIDOS (REEMPLAZA ESTAS URLS POR TUS AUDIOS AMIGABLES) -------
-    sound_urls = {
-        "plus":    "https://www2.cs.uic.edu/~i101/SoundFiles/Click1.wav",
-        "minus":   "https://www2.cs.uic.edu/~i101/SoundFiles/Click2.wav",
-        "complete":"https://www2.cs.uic.edu/~i101/SoundFiles/Chord.wav",
-        "reset":   "https://www2.cs.uic.edu/~i101/SoundFiles/Pop.wav",
-        "prev":    "https://www2.cs.uic.edu/~i101/SoundFiles/Click1.wav",
-        "next":    "https://www2.cs.uic.edu/~i101/SoundFiles/Click1.wav",
-    }
-    # -----------------------------------------------------------------------
-
     # Selector de piqueador
     c.execute("SELECT id, name FROM pickers ORDER BY id;")
     picker_rows = c.fetchall()
@@ -421,8 +410,6 @@ def page_picking():
 
     if "pick_index" not in st.session_state:
         st.session_state["pick_index"] = 0
-    if "last_action" not in st.session_state:
-        st.session_state["last_action"] = None
 
     total_productos = len(rows)
     idx = st.session_state["pick_index"]
@@ -564,7 +551,6 @@ def page_picking():
                     WHERE sku_ml = ?
                 """, (sku_ml,))
                 conn.commit()
-                st.session_state["last_action"] = "plus"
                 st.rerun()
             else:
                 st.warning("Cantidad completa.")
@@ -580,7 +566,6 @@ def page_picking():
                     WHERE sku_ml = ?
                 """, (sku_ml,))
                 conn.commit()
-                st.session_state["last_action"] = "minus"
                 st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -593,7 +578,6 @@ def page_picking():
                 WHERE sku_ml = ?
             """, (qty_total, sku_ml))
             conn.commit()
-            st.session_state["last_action"] = "complete"
             st.session_state["pick_index"] = min(idx + 1, total_productos - 1)
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
@@ -607,7 +591,6 @@ def page_picking():
                 WHERE sku_ml = ?
             """, (sku_ml,))
             conn.commit()
-            st.session_state["last_action"] = "reset"
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -620,7 +603,6 @@ def page_picking():
         st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
         if st.button("⬅️ ANTERIOR"):
             st.session_state["pick_index"] = max(idx - 1, 0)
-            st.session_state["last_action"] = "prev"
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -628,86 +610,111 @@ def page_picking():
         st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
         if st.button("➡️ SIGUIENTE"):
             st.session_state["pick_index"] = min(idx + 1, total_productos - 1)
-            st.session_state["last_action"] = "next"
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
-
-    # ======== SONIDO SEGÚN ÚLTIMA ACCIÓN =========
-    last_action = st.session_state.get("last_action")
-    if last_action and last_action in sound_urls and sound_urls[last_action]:
-        url = sound_urls[last_action]
-        st.markdown(
-            f"""
-            <script>
-            var audio = new Audio("{url}");
-            audio.volume = 0.5;
-            audio.play();
-            </script>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.session_state["last_action"] = None
 
     conn.close()
 
 
 # ---------- PÁGINA: CONTEO FINAL DE PAQUETES ----------
 def page_conteo_final():
-    st.header("3) Conteo final de paquetes (tracking)")
+    st.header("3) Conteo final de paquetes (tracking / número de venta)")
 
     st.write("""
     Después de embalar y etiquetar, en la zona de despacho
-    escanea una sola vez el código de tracking de cada paquete.
-    La app compara cuántos pedidos hay vs cuántos paquetes escaneados.
+    escanea una sola vez el **número de venta de Mercado Libre** (o el código que uses
+    en la etiqueta) para marcar ese pedido como contado.
     """)
 
     conn = get_conn()
     c = conn.cursor()
 
     # Pedidos esperados (ventas ML)
-    c.execute("SELECT COUNT(DISTINCT ml_order_id) FROM orders;")
-    expected_orders = c.fetchone()[0] or 0
+    c.execute("SELECT DISTINCT ml_order_id FROM orders;")
+    orders_all = [row[0] for row in c.fetchall()]
+    expected_orders = len(orders_all)
 
-    # Paquetes escaneados
-    c.execute("SELECT COUNT(*) FROM packages_scan;")
-    scanned_packages = c.fetchone()[0] or 0
+    # Paquetes escaneados (usamos tracking_code como "número de venta escaneado")
+    c.execute("SELECT DISTINCT tracking_code FROM packages_scan;")
+    scanned_codes = [row[0] for row in c.fetchall()]
+    scanned_packages = len(scanned_codes)
 
     st.subheader("Resumen")
     col1, col2, col3 = st.columns(3)
     col1.metric("Pedidos (ventas ML)", expected_orders)
-    col2.metric("Paquetes escaneados", scanned_packages)
+    col2.metric("Pedidos escaneados", scanned_packages)
     diff = scanned_packages - expected_orders
     col3.metric("Diferencia (escaneados - pedidos)", diff)
 
     st.markdown("---")
-    st.subheader("Escanear tracking de paquetes")
+    st.subheader("Escanear número de venta / tracking")
 
-    tracking = st.text_input("Escanee código de tracking aquí", key="scan_tracking")
+    tracking = st.text_input(
+        "Escanee o escriba el **número de venta de ML** (o código que uses para identificar el pedido)",
+        key="scan_tracking"
+    )
 
     col4, col5 = st.columns(2)
     with col4:
         if st.button("Registrar paquete"):
             if not tracking:
-                st.warning("Escanee o escriba un tracking primero.")
+                st.warning("Escanee o escriba un número de venta primero.")
             else:
-                # Evitar duplicados exactos (mismo tracking)
+                # Evitar duplicados exactos (mismo código)
                 c.execute("SELECT COUNT(*) FROM packages_scan WHERE tracking_code = ?;", (tracking,))
                 exists = c.fetchone()[0]
                 if exists:
-                    st.error("Este tracking ya fue escaneado antes (paquete duplicado).")
+                    st.error("Este código ya fue escaneado antes (pedido duplicado).")
                 else:
                     c.execute("""
                         INSERT INTO packages_scan (tracking_code, scanned_at)
                         VALUES (?, ?)
                     """, (tracking, datetime.now().isoformat()))
                     conn.commit()
-                    st.success(f"Tracking {tracking} registrado.")
+                    st.success(f"Código {tracking} registrado como escaneado.")
 
     with col5:
         if st.button("Resetear conteo de paquetes del día"):
             c.execute("DELETE FROM packages_scan;")
             conn.commit()
-            st.warning("Se borraron todos los paquetes escaneados.")
+            st.warning("Se borraron todos los pedidos escaneados del día.")
+
+    st.markdown("---")
+    st.subheader("Pedidos que **faltan** por escanear")
+
+    # Cálculo de pedidos no escaneados:
+    # Asumimos que tracking_code = ml_order_id (o al menos lo que tú escaneas coincide)
+    missing_orders = []
+    scanned_set = set(scanned_codes)
+
+    c.execute("SELECT id, ml_order_id, buyer FROM orders;")
+    for order_id, ml_order_id, buyer in c.fetchall():
+        if ml_order_id not in scanned_set:
+            missing_orders.append((order_id, ml_order_id, buyer))
+
+    if not missing_orders:
+        st.success("Todos los pedidos están escaneados. 🎉")
+    else:
+        st.warning(f"Faltan {len(missing_orders)} pedidos por escanear.")
+        # Mostrar detalle: número de venta, cliente y productos
+        for order_id, ml_order_id, buyer in missing_orders:
+            with st.expander(f"Venta {ml_order_id} · Cliente: {buyer}"):
+                c.execute("""
+                    SELECT sku_ml,
+                           COALESCE(title_tec, title_ml) AS nombre_producto,
+                           qty
+                    FROM order_items
+                    WHERE order_id = ?
+                """, (order_id,))
+                rows_items = c.fetchall()
+                if rows_items:
+                    df_items = pd.DataFrame(
+                        rows_items,
+                        columns=["SKU", "Producto", "Cantidad"]
+                    )
+                    st.table(df_items)
+                else:
+                    st.write("Sin líneas de productos registradas para este pedido.")
 
     conn.close()
 
