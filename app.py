@@ -33,6 +33,7 @@ def init_db():
         order_id INTEGER,
         sku_ml TEXT,
         title_ml TEXT,
+        title_tec TEXT,
         qty INTEGER
     );
     """)
@@ -43,6 +44,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sku_ml TEXT,
         title_ml TEXT,
+        title_tec TEXT,
         qty_total INTEGER,
         qty_picked INTEGER DEFAULT 0,
         picker_id INTEGER
@@ -58,7 +60,7 @@ def init_db():
     );
     """)
 
-    # Imágenes opcionales por SKU (para mostrar foto en el picking)
+    # Imágenes opcionales por SKU (para el futuro)
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_images (
         sku_ml TEXT PRIMARY KEY,
@@ -74,10 +76,17 @@ def init_db():
     );
     """)
 
-    # Asegurar que picking_global tenga columna picker_id aunque venga de una versión vieja
+    # Asegurar columnas por si vienes de una versión vieja
+    c.execute("PRAGMA table_info(order_items);")
+    cols_oi = [row[1] for row in c.fetchall()]
+    if "title_tec" not in cols_oi:
+        c.execute("ALTER TABLE order_items ADD COLUMN title_tec TEXT;")
+
     c.execute("PRAGMA table_info(picking_global);")
-    cols = [row[1] for row in c.fetchall()]
-    if "picker_id" not in cols:
+    cols_pg = [row[1] for row in c.fetchall()]
+    if "title_tec" not in cols_pg:
+        c.execute("ALTER TABLE picking_global ADD COLUMN title_tec TEXT;")
+    if "picker_id" not in cols_pg:
         c.execute("ALTER TABLE picking_global ADD COLUMN picker_id INTEGER;")
 
     conn.commit()
@@ -204,8 +213,12 @@ def page_import_ml():
         step=1,
     )
 
-    # (OCULTAMOS SUBIDA DE FOTOS POR AHORA)
-    # Antes teníamos un uploader para CSV de imágenes; se deja desactivado por ahora.
+    st.markdown("### Maestro de SKUs y nombres técnicos (opcional, recomendado)")
+    inv_file = st.file_uploader(
+        "Archivo maestro de inventario (.xlsx) con columnas 'SKU' y 'Artículo'",
+        type=["xlsx"],
+        key="inv_uploader",
+    )
 
     if file is None:
         st.info("Esperando archivo de ventas de Mercado Libre...")
@@ -253,6 +266,25 @@ def page_import_ml():
         st.error("Después de limpiar las cantidades, no quedó ninguna línea con qty > 0.")
         st.stop()
 
+    # Cargar maestro de SKUs → dict {sku: nombre_técnico}
+    inv_map = {}
+    if inv_file is not None:
+        try:
+            inv_df = pd.read_excel(inv_file)
+            cols_inv = inv_df.columns.tolist()
+            if "SKU" in cols_inv and "Artículo" in cols_inv:
+                inv_df = inv_df.dropna(subset=["SKU", "Artículo"])
+                for _, row in inv_df.iterrows():
+                    sku_key = str(row["SKU"]).strip()
+                    art = str(row["Artículo"]).strip()
+                    if sku_key:
+                        inv_map[sku_key] = art
+                st.success(f"Maestro de inventario cargado ({len(inv_map)} SKUs con nombre técnico).")
+            else:
+                st.warning("El maestro no tiene columnas 'SKU' y 'Artículo'. Se continuará sin nombres técnicos.")
+        except Exception as e:
+            st.warning(f"No se pudo leer el maestro de inventario: {e}")
+
     if st.button("Cargar ventas en el sistema"):
         conn = get_conn()
         c = conn.cursor()
@@ -263,7 +295,7 @@ def page_import_ml():
         c.execute("DELETE FROM picking_global;")
         c.execute("DELETE FROM packages_scan;")
         c.execute("DELETE FROM pickers;")
-        # NO tocamos sku_images por ahora; se queda lo que haya o nada.
+        # sku_images se deja tal cual (no estamos usando fotos aún)
 
         # Insertar pedidos y sus líneas
         for ml_order_id, grupo in work_df.groupby("ml_order_id"):
@@ -277,29 +309,31 @@ def page_import_ml():
             order_id = c.lastrowid
 
             for _, row in grupo.iterrows():
-                sku = str(row["sku_ml"])
+                sku = str(row["sku_ml"]).strip()
                 title = str(row["title_ml"])
                 qty = int(row["qty"])
                 if qty <= 0:
                     continue
 
+                title_tec = inv_map.get(sku)  # puede ser None si no está en maestro
+
                 c.execute("""
-                    INSERT INTO order_items (order_id, sku_ml, title_ml, qty)
-                    VALUES (?, ?, ?, ?)
-                """, (order_id, sku, title, qty))
+                    INSERT INTO order_items (order_id, sku_ml, title_ml, title_tec, qty)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (order_id, sku, title, title_tec, qty))
 
         # Generar picking_global agrupando todos los SKUs del día
         c.execute("""
-            SELECT sku_ml, title_ml, SUM(qty) as total
+            SELECT sku_ml, title_ml, title_tec, SUM(qty) as total
             FROM order_items
-            GROUP BY sku_ml, title_ml
+            GROUP BY sku_ml, title_ml, title_tec
         """)
         rows = c.fetchall()
-        for sku, title, total in rows:
+        for sku, title_ml, title_tec, total in rows:
             c.execute("""
-                INSERT INTO picking_global (sku_ml, title_ml, qty_total, qty_picked, picker_id)
-                VALUES (?, ?, ?, 0, NULL)
-            """, (sku, title, total))
+                INSERT INTO picking_global (sku_ml, title_ml, title_tec, qty_total, qty_picked, picker_id)
+                VALUES (?, ?, ?, ?, 0, NULL)
+            """, (sku, title_ml, title_tec, total))
 
         # Crear piqueadores y repartir SKUs en forma equitativa
         num_pickers_int = int(num_pickers)
@@ -312,7 +346,14 @@ def page_import_ml():
         total_pickers = len(pickers)
 
         if total_pickers > 0:
-            c.execute("SELECT id FROM picking_global ORDER BY title_ml;")
+            # Ordenamos por nombre técnico si existe, si no por título ML
+            c.execute("""
+                SELECT id FROM picking_global
+                ORDER BY 
+                    CASE WHEN title_tec IS NULL OR title_tec = '' THEN 1 ELSE 0 END,
+                    title_tec,
+                    title_ml
+            """)
             skus_pg = c.fetchall()
             for idx, (pg_id,) in enumerate(skus_pg):
                 picker_id = pickers[idx % total_pickers][0]
@@ -324,7 +365,7 @@ def page_import_ml():
         # Resetear índice de producto actual del pickeador
         st.session_state["pick_index"] = 0
 
-        st.success("Ventas cargadas y picking generado y distribuido entre piqueadores correctamente.")
+        st.success("Ventas cargadas, picking generado y distribuido entre piqueadores correctamente.")
 
 
 # ---------- PÁGINA: PICKING GLOBAL (PRODUCTO POR PRODUCTO) ----------
@@ -356,19 +397,22 @@ def page_picking():
 
     selected_picker = st.selectbox("Lista de trabajo:", picker_options, index=0)
 
-    # Traer productos
+    # Traer productos (incluyendo nombre técnico)
     c.execute("""
-        SELECT pg.sku_ml, pg.title_ml, pg.qty_total, pg.qty_picked, si.image_url, pg.picker_id
+        SELECT pg.sku_ml, pg.title_ml, pg.title_tec, pg.qty_total, pg.qty_picked, si.image_url, pg.picker_id
         FROM picking_global pg
         LEFT JOIN sku_images si ON si.sku_ml = pg.sku_ml
-        ORDER BY pg.title_ml
+        ORDER BY 
+            CASE WHEN pg.title_tec IS NULL OR pg.title_tec = '' THEN 1 ELSE 0 END,
+            pg.title_tec,
+            pg.title_ml
     """)
     rows = c.fetchall()
 
     # Filtrar por piqueador
     if selected_picker != "Todos":
         target_id = picker_id_map.get(selected_picker)
-        rows = [r for r in rows if r[5] == target_id]
+        rows = [r for r in rows if r[6] == target_id]
 
     if not rows:
         st.info("No hay productos asignados con el filtro actual.")
@@ -390,9 +434,12 @@ def page_picking():
 
     st.session_state["pick_index"] = idx
 
-    sku_ml, title_ml, qty_total, qty_picked, image_url, picker_id = rows[idx]
+    sku_ml, title_ml, title_tec, qty_total, qty_picked, image_url, picker_id = rows[idx]
     restantes = qty_total - qty_picked
     is_complete = restantes <= 0
+
+    # Título a mostrar: técnico si existe, si no el de ML
+    display_title = title_tec if title_tec and str(title_tec).strip().lower() not in ["", "nan"] else title_ml
 
     # ======== ESTILO VISUAL Y RESPONSIVE ==========
     st.markdown("""
@@ -400,12 +447,18 @@ def page_picking():
         .title-big {
             font-size: 32px;
             font-weight: bold;
-            margin-bottom: 10px;
+            margin-bottom: 6px;
         }
         .sku-big {
             font-size: 18px;
             color: #555;
+            margin-bottom: 4px;
+        }
+        .ml-name {
+            font-size: 14px;
+            color: #777;
             margin-bottom: 15px;
+            font-style: italic;
         }
 
         .kpi-box {
@@ -456,8 +509,10 @@ def page_picking():
     """, unsafe_allow_html=True)
 
     # ======== HEADER DEL PRODUCTO =========
-    st.markdown(f"<div class='title-big'>{title_ml}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='title-big'>{display_title}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='sku-big'>SKU: {sku_ml}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='ml-name'>Nombre ML: {title_ml}</div>", unsafe_allow_html=True)
+
     info_sub = f"Producto {idx+1} de {total_productos}"
     if selected_picker != "Todos":
         info_sub += f" · Lista de {selected_picker}"
