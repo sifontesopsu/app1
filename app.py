@@ -37,14 +37,15 @@ def init_db():
     );
     """)
 
-    # Picking global por SKU
+    # Picking global por SKU (incluye picker_id para distribución)
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_global (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sku_ml TEXT,
         title_ml TEXT,
         qty_total INTEGER,
-        qty_picked INTEGER DEFAULT 0
+        qty_picked INTEGER DEFAULT 0,
+        picker_id INTEGER
     );
     """)
 
@@ -64,6 +65,20 @@ def init_db():
         image_url TEXT
     );
     """)
+
+    # Tabla de piqueadores
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS pickers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT
+    );
+    """)
+
+    # Asegurar que picking_global tenga columna picker_id aunque venga de una versión vieja
+    c.execute("PRAGMA table_info(picking_global);")
+    cols = [row[1] for row in c.fetchall()]
+    if "picker_id" not in cols:
+        c.execute("ALTER TABLE picking_global ADD COLUMN picker_id INTEGER;")
 
     conn.commit()
     conn.close()
@@ -104,19 +119,29 @@ def page_admin():
     c.execute("SELECT COUNT(*) FROM picking_global;")
     total_skus = c.fetchone()[0] or 0
 
+    c.execute("SELECT COALESCE(SUM(qty_total), 0), COALESCE(SUM(qty_picked), 0) FROM picking_global;")
+    total_qty, total_picked = c.fetchone()
+    total_qty = total_qty or 0
+    total_picked = total_picked or 0
+    avance = 0
+    if total_qty > 0:
+        avance = round((total_picked / total_qty) * 100, 1)
+
     c.execute("SELECT COUNT(*) FROM packages_scan;")
     total_packages_scanned = c.fetchone()[0] or 0
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Pedidos cargados", total_orders)
     col2.metric("Líneas de ítems", total_items)
-    col3.metric("SKUs en picking_global", total_skus)
-    col4.metric("Paquetes escaneados (tracking)", total_packages_scanned)
+    col3.metric("SKUs en picking", total_skus)
+    col4.metric("Paquetes escaneados", total_packages_scanned)
+
+    st.metric("Avance global de picking", f"{avance} %", help="Unidades pickeadas / unidades totales del día")
 
     st.markdown("---")
     st.subheader("Acciones de administración")
 
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c = st.columns(3)
 
     # Resetear solo cantidades pickeadas
     with col_a:
@@ -127,8 +152,17 @@ def page_admin():
             conn.commit()
             st.success("Se reiniciaron todas las cantidades pickeadas.")
 
-    # Resetear TODO el sistema
+    # Resetear solo paquetes
     with col_b:
+        st.write("**Resetear SOLO paquetes (tracking)**")
+        st.caption("Borra todos los códigos de tracking escaneados, pero mantiene pedidos e ítems.")
+        if st.button("Resetear paquetes escaneados"):
+            c.execute("DELETE FROM packages_scan;")
+            conn.commit()
+            st.warning("Se borraron todos los paquetes escaneados.")
+
+    # Resetear TODO el sistema
+    with col_c:
         st.write("**Resetear TODO el sistema**")
         st.caption("Borra pedidos, ítems, picking, paquetes escaneados e imágenes. Úsalo solo al cambiar de día o en pruebas.")
         confirm = st.checkbox("Confirmo que quiero borrar TODOS los datos", key="confirm_reset_all")
@@ -139,6 +173,7 @@ def page_admin():
                 c.execute("DELETE FROM picking_global;")
                 c.execute("DELETE FROM packages_scan;")
                 c.execute("DELETE FROM sku_images;")
+                c.execute("DELETE FROM pickers;")
                 conn.commit()
                 st.warning("Se borraron TODOS los datos del sistema.")
             else:
@@ -159,6 +194,15 @@ def page_import_ml():
 
     st.write("Sube el archivo de ventas del día exportado desde Mercado Libre (XLSX).")
     file = st.file_uploader("Archivo de ventas ML (.xlsx)", type=["xlsx"])
+
+    # Cantidad de piqueadores para distribución
+    num_pickers = st.number_input(
+        "Cantidad de piqueadores para hoy",
+        min_value=1,
+        max_value=20,
+        value=1,
+        step=1,
+    )
 
     st.markdown("""
     Opcionalmente, puedes subir un archivo CSV con columnas:
@@ -225,8 +269,8 @@ def page_import_ml():
         c.execute("DELETE FROM orders;")
         c.execute("DELETE FROM picking_global;")
         c.execute("DELETE FROM packages_scan;")
-
-        # También limpiamos imágenes si se va a subir archivo nuevo
+        c.execute("DELETE FROM pickers;")
+        # Sólo limpiamos imágenes si se sube archivo nuevo
         if img_file is not None:
             c.execute("DELETE FROM sku_images;")
 
@@ -262,9 +306,26 @@ def page_import_ml():
         rows = c.fetchall()
         for sku, title, total in rows:
             c.execute("""
-                INSERT INTO picking_global (sku_ml, title_ml, qty_total, qty_picked)
-                VALUES (?, ?, ?, 0)
+                INSERT INTO picking_global (sku_ml, title_ml, qty_total, qty_picked, picker_id)
+                VALUES (?, ?, ?, 0, NULL)
             """, (sku, title, total))
+
+        # Crear piqueadores y repartir SKUs en forma equitativa
+        num_pickers_int = int(num_pickers)
+        for i in range(num_pickers_int):
+            name = f"P{i+1}"
+            c.execute("INSERT INTO pickers (name) VALUES (?);", (name,))
+
+        c.execute("SELECT id, name FROM pickers ORDER BY id;")
+        pickers = c.fetchall()
+        total_pickers = len(pickers)
+
+        if total_pickers > 0:
+            c.execute("SELECT id FROM picking_global ORDER BY title_ml;")
+            skus_pg = c.fetchall()
+            for idx, (pg_id,) in enumerate(skus_pg):
+                picker_id = pickers[idx % total_pickers][0]
+                c.execute("UPDATE picking_global SET picker_id = ? WHERE id = ?;", (picker_id, pg_id))
 
         # Si se subió archivo de imágenes, guardarlo en BD
         if img_file is not None:
@@ -290,39 +351,61 @@ def page_import_ml():
         # Resetear índice de producto actual del pickeador
         st.session_state["pick_index"] = 0
 
-        st.success("Ventas cargadas y lista de picking generada correctamente.")
+        st.success("Ventas cargadas, picking generado y distribuido entre piqueadores correctamente.")
 
 
 # ---------- PÁGINA: PICKING GLOBAL (PRODUCTO POR PRODUCTO) ----------
 def page_picking():
-    st.header("2) Picking global – Producto por producto")
-
-    st.write("""
-    Esta pantalla está pensada para el piqueador:
-    ve **un producto a la vez**, con su título, SKU, cantidad total y pickeada,
-    puede sumar/restar con botones (1, 2, 3 clics) y pasar al siguiente producto.
-    """)
+    st.header("2) Picking por producto")
 
     conn = get_conn()
     c = conn.cursor()
 
-    # Traer todos los productos de picking_global, junto con URL de imagen si existe
+    # ------- SONIDOS (REEMPLAZA ESTAS URLS POR TUS AUDIOS AMIGABLES) -------
+    sound_urls = {
+        "plus":    "https://www2.cs.uic.edu/~i101/SoundFiles/Click1.wav",
+        "minus":   "https://www2.cs.uic.edu/~i101/SoundFiles/Click2.wav",
+        "complete":"https://www2.cs.uic.edu/~i101/SoundFiles/Chord.wav",
+        "reset":   "https://www2.cs.uic.edu/~i101/SoundFiles/Pop.wav",
+        "prev":    "https://www2.cs.uic.edu/~i101/SoundFiles/Click1.wav",
+        "next":    "https://www2.cs.uic.edu/~i101/SoundFiles/Click1.wav",
+    }
+    # -----------------------------------------------------------------------
+
+    # Selector de piqueador
+    c.execute("SELECT id, name FROM pickers ORDER BY id;")
+    picker_rows = c.fetchall()
+    picker_options = ["Todos"]
+    picker_id_map = {}
+    for pid, pname in picker_rows:
+        picker_options.append(pname)
+        picker_id_map[pname] = pid
+
+    selected_picker = st.selectbox("Lista de trabajo:", picker_options, index=0)
+
+    # Traer productos
     c.execute("""
-        SELECT pg.sku_ml, pg.title_ml, pg.qty_total, pg.qty_picked, si.image_url
+        SELECT pg.sku_ml, pg.title_ml, pg.qty_total, pg.qty_picked, si.image_url, pg.picker_id
         FROM picking_global pg
         LEFT JOIN sku_images si ON si.sku_ml = pg.sku_ml
         ORDER BY pg.title_ml
     """)
     rows = c.fetchall()
 
+    # Filtrar por piqueador
+    if selected_picker != "Todos":
+        target_id = picker_id_map.get(selected_picker)
+        rows = [r for r in rows if r[5] == target_id]
+
     if not rows:
-        st.info("Aún no hay lista de picking. Primero importa ventas de Mercado Libre.")
+        st.info("No hay productos asignados con el filtro actual.")
         conn.close()
         return
 
-    # Controlar índice de producto actual en session_state
     if "pick_index" not in st.session_state:
         st.session_state["pick_index"] = 0
+    if "last_action" not in st.session_state:
+        st.session_state["last_action"] = None
 
     total_productos = len(rows)
     idx = st.session_state["pick_index"]
@@ -331,42 +414,121 @@ def page_picking():
         idx = 0
     if idx >= total_productos:
         idx = total_productos - 1
+
     st.session_state["pick_index"] = idx
 
-    # Producto actual
-    sku_ml, title_ml, qty_total, qty_picked, image_url = rows[idx]
+    sku_ml, title_ml, qty_total, qty_picked, image_url, picker_id = rows[idx]
     restantes = qty_total - qty_picked
+    is_complete = restantes <= 0
 
-    # Mostrar info del producto actual
-    st.subheader(f"Producto {idx+1} de {total_productos}")
+    # ======== ESTILO VISUAL Y RESPONSIVE ==========
+    st.markdown("""
+        <style>
+        .title-big {
+            font-size: 32px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .sku-big {
+            font-size: 18px;
+            color: #555;
+            margin-bottom: 15px;
+        }
+
+        .kpi-box {
+            padding: 18px;
+            border-radius: 12px;
+            text-align: center;
+            font-size: 26px;
+            font-weight: bold;
+        }
+        .kpi-label {
+            font-size: 14px;
+        }
+        .kpi-total { background-color: #e6f0ff; color: #0047ab; }
+        .kpi-picked { background-color: #e6ffe6; color: #0a7a0a; }
+        .kpi-rest { background-color: #fff1e6; color: #b34700; }
+
+        .kpi-complete {
+            background-color: #e1ffe1 !important;
+            color: #0a7a0a !important;
+            border: 2px solid #0a7a0a;
+        }
+
+        .btn-big button {
+            height: 80px !important;
+            font-size: 20px !important;
+            font-weight: bold !important;
+            width: 100% !important;
+        }
+
+        /* En pantallas más angostas (PDA / móvil), agrandar aún más */
+        @media (max-width: 768px) {
+            .title-big {
+                font-size: 26px;
+            }
+            .sku-big {
+                font-size: 16px;
+            }
+            .kpi-box {
+                font-size: 24px;
+                padding: 16px;
+            }
+            .btn-big button {
+                height: 90px !important;
+                font-size: 22px !important;
+            }
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # ======== HEADER DEL PRODUCTO =========
+    st.markdown(f"<div class='title-big'>{title_ml}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='sku-big'>SKU: {sku_ml}</div>", unsafe_allow_html=True)
+    info_sub = f"Producto {idx+1} de {total_productos}"
+    if selected_picker != "Todos":
+        info_sub += f" · Lista de {selected_picker}"
+    st.markdown(info_sub)
 
     col_info, col_img = st.columns([2, 1])
 
-    with col_info:
-        st.markdown(f"**SKU ML:** `{sku_ml}`")
-        st.markdown(f"**Título (ML):** {title_ml}")
-        st.markdown(f"**Cantidad total a pickear:** {qty_total}")
-        st.markdown(f"**Cantidad pickeada:** {qty_picked}")
-        st.markdown(f"**Restantes:** {restantes}")
-
     with col_img:
         if image_url and isinstance(image_url, str) and image_url.strip():
-            try:
-                st.image(image_url, caption="Imagen del producto", use_container_width=True)
-            except Exception:
-                st.write("No se pudo cargar la imagen.")
-                st.write(image_url)
+            st.image(image_url, use_container_width=True)
         else:
-            st.write("Sin imagen configurada para este SKU.")
+            st.write("Sin imagen")
 
-    st.markdown("---")
+    # ======== KPIs GRANDES =========
+    col1, col2, col3 = st.columns(3)
 
-    # Controles de picking tipo "1, 2, 3 clics"
-    st.write("**Actualizar cantidad pickeada**")
-    col1, col2, col3, col4 = st.columns(4)
+    extra_class = " kpi-complete" if is_complete else ""
 
     with col1:
-        if st.button("+1 unidad"):
+        st.markdown(
+            f"<div class='kpi-box kpi-total{extra_class}'><div class='kpi-label'>TOTAL</div>{qty_total}</div>",
+            unsafe_allow_html=True,
+        )
+
+    with col2:
+        st.markdown(
+            f"<div class='kpi-box kpi-picked{extra_class}'><div class='kpi-label'>PICKEADO</div>{qty_picked}</div>",
+            unsafe_allow_html=True,
+        )
+
+    with col3:
+        st.markdown(
+            f"<div class='kpi-box kpi-rest{extra_class}'><div class='kpi-label'>RESTANTE</div>{restantes}</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ======== BOTONES GRANDES DE ACCIÓN =========
+    col_a, col_b, col_c, col_d = st.columns(4)
+
+    with col_a:
+        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
+        if st.button("➕ SUMAR"):
             if qty_picked < qty_total:
                 c.execute("""
                     UPDATE picking_global
@@ -374,12 +536,15 @@ def page_picking():
                     WHERE sku_ml = ?
                 """, (sku_ml,))
                 conn.commit()
+                st.session_state["last_action"] = "plus"
                 st.rerun()
             else:
-                st.warning("Ya alcanzaste la cantidad total de este producto.")
+                st.warning("Cantidad completa.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    with col2:
-        if st.button("-1 unidad"):
+    with col_b:
+        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
+        if st.button("➖ RESTAR"):
             if qty_picked > 0:
                 c.execute("""
                     UPDATE picking_global
@@ -387,46 +552,73 @@ def page_picking():
                     WHERE sku_ml = ?
                 """, (sku_ml,))
                 conn.commit()
+                st.session_state["last_action"] = "minus"
                 st.rerun()
-            else:
-                st.warning("La cantidad pickeada ya es 0.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    with col3:
-        if st.button("Marcar completo"):
-            if qty_picked < qty_total:
-                c.execute("""
-                    UPDATE picking_global
-                    SET qty_picked = ?
-                    WHERE sku_ml = ?
-                """, (qty_total, sku_ml))
-                conn.commit()
-            # Pasar automáticamente al siguiente producto
+    with col_c:
+        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
+        if st.button("✅ COMPLETAR"):
+            c.execute("""
+                UPDATE picking_global
+                SET qty_picked = ?
+                WHERE sku_ml = ?
+            """, (qty_total, sku_ml))
+            conn.commit()
+            st.session_state["last_action"] = "complete"
             st.session_state["pick_index"] = min(idx + 1, total_productos - 1)
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    with col4:
-        if st.button("Poner en 0"):
+    with col_d:
+        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
+        if st.button("🔄 REINICIAR"):
             c.execute("""
                 UPDATE picking_global
                 SET qty_picked = 0
                 WHERE sku_ml = ?
             """, (sku_ml,))
             conn.commit()
+            st.session_state["last_action"] = "reset"
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.write("**Navegación entre productos**")
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ======== NAVEGACIÓN GRANDE =========
     col_prev, col_next = st.columns(2)
 
     with col_prev:
-        if st.button("⬅️ Producto anterior"):
+        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
+        if st.button("⬅️ ANTERIOR"):
             st.session_state["pick_index"] = max(idx - 1, 0)
+            st.session_state["last_action"] = "prev"
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with col_next:
-        if st.button("Producto siguiente ➡️"):
+        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
+        if st.button("➡️ SIGUIENTE"):
             st.session_state["pick_index"] = min(idx + 1, total_productos - 1)
+            st.session_state["last_action"] = "next"
             st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ======== SONIDO SEGÚN ÚLTIMA ACCIÓN =========
+    last_action = st.session_state.get("last_action")
+    if last_action and last_action in sound_urls and sound_urls[last_action]:
+        url = sound_urls[last_action]
+        st.markdown(
+            f"""
+            <script>
+            var audio = new Audio("{url}");
+            audio.volume = 0.5;
+            audio.play();
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.session_state["last_action"] = None
 
     conn.close()
 
