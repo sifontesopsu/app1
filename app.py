@@ -73,8 +73,6 @@ def page_import_ml():
         return
 
     # 1) LEER EL EXCEL DE ML CON DOBLE ENCABEZADO (FORMATO REAL ML)
-    # Normalmente, ML pone encabezados en dos filas y datos a partir de la fila 6.
-    # Por eso usamos header=[4,5] (fila 5 y 6, índices 4 y 5).
     try:
         df = pd.read_excel(file, header=[4, 5])
     except Exception as e:
@@ -108,6 +106,15 @@ def page_import_ml():
     work_df = df[required_cols].copy()
     work_df.columns = ["ml_order_id", "qty", "sku_ml", "title_ml", "buyer"]
 
+    # 🔧 LIMPIEZA DE CANTIDADES:
+    # Convertir a número, poner 0 donde no se pueda y eliminar filas con qty <= 0
+    work_df["qty"] = pd.to_numeric(work_df["qty"], errors="coerce").fillna(0).astype(int)
+    work_df = work_df[work_df["qty"] > 0]
+
+    if work_df.empty:
+        st.error("Después de limpiar las cantidades, no quedó ninguna línea con qty > 0.")
+        st.stop()
+
     # 4) BOTÓN PARA CARGAR A LA BASE DE DATOS
     if st.button("Cargar ventas en el sistema"):
         conn = get_conn()
@@ -134,6 +141,10 @@ def page_import_ml():
                 sku = str(row["sku_ml"])
                 title = str(row["title_ml"])
                 qty = int(row["qty"])
+
+                # Por seguridad, saltar cantidades no positivas
+                if qty <= 0:
+                    continue
 
                 c.execute("""
                     INSERT INTO order_items (order_id, sku_ml, title_ml, qty)
