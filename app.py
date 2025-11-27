@@ -77,7 +77,7 @@ def init_db():
     );
     """)
 
-    # 🔄 Asegurar columnas nuevas en tablas existentes
+    # Asegurar columnas nuevas en tablas existentes
     c.execute("PRAGMA table_info(order_items);")
     cols_oi = [row[1] for row in c.fetchall()]
     if "mlc_id" not in cols_oi:
@@ -94,8 +94,7 @@ def init_db():
     if "picker_id" not in cols_pg:
         c.execute("ALTER TABLE picking_global ADD COLUMN picker_id INTEGER;")
 
-    # 🔄 sku_images: siempre basada en MLC
-    c.execute("DROP TABLE IF EXISTS sku_images;")
+    # Crear sku_images SIN borrarla cada vez
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_images (
         mlc_id TEXT PRIMARY KEY,
