@@ -86,7 +86,7 @@ def init_db():
 
 # ---------- PÁGINA: ADMIN ----------
 def page_admin():
-    st.header("0) Panel de administrador")
+    st.header("Panel de administrador")
 
     # Login simple de admin
     if not st.session_state.get("admin_authenticated", False):
@@ -204,15 +204,8 @@ def page_import_ml():
         step=1,
     )
 
-    st.markdown("""
-    Opcionalmente, puedes subir un archivo CSV con columnas:
-    **sku_ml, image_url** para mostrar la foto del producto al piqueador.
-    """)
-    img_file = st.file_uploader(
-        "Archivo opcional de imágenes (CSV con columnas sku_ml,image_url)",
-        type=["csv"],
-        key="img_uploader",
-    )
+    # (OCULTAMOS SUBIDA DE FOTOS POR AHORA)
+    # Antes teníamos un uploader para CSV de imágenes; se deja desactivado por ahora.
 
     if file is None:
         st.info("Esperando archivo de ventas de Mercado Libre...")
@@ -270,9 +263,7 @@ def page_import_ml():
         c.execute("DELETE FROM picking_global;")
         c.execute("DELETE FROM packages_scan;")
         c.execute("DELETE FROM pickers;")
-        # Sólo limpiamos imágenes si se sube archivo nuevo
-        if img_file is not None:
-            c.execute("DELETE FROM sku_images;")
+        # NO tocamos sku_images por ahora; se queda lo que haya o nada.
 
         # Insertar pedidos y sus líneas
         for ml_order_id, grupo in work_df.groupby("ml_order_id"):
@@ -327,31 +318,13 @@ def page_import_ml():
                 picker_id = pickers[idx % total_pickers][0]
                 c.execute("UPDATE picking_global SET picker_id = ? WHERE id = ?;", (picker_id, pg_id))
 
-        # Si se subió archivo de imágenes, guardarlo en BD
-        if img_file is not None:
-            try:
-                img_df = pd.read_csv(img_file)
-                if "sku_ml" in img_df.columns and "image_url" in img_df.columns:
-                    for _, r in img_df.iterrows():
-                        sku_img = str(r["sku_ml"])
-                        url = str(r["image_url"])
-                        if sku_img and url:
-                            c.execute("""
-                                INSERT OR REPLACE INTO sku_images (sku_ml, image_url)
-                                VALUES (?, ?)
-                            """, (sku_img, url))
-                else:
-                    st.warning("El archivo de imágenes no tiene columnas sku_ml,image_url. Se ignoró.")
-            except Exception as e:
-                st.warning(f"No se pudo procesar el archivo de imágenes: {e}")
-
         conn.commit()
         conn.close()
 
         # Resetear índice de producto actual del pickeador
         st.session_state["pick_index"] = 0
 
-        st.success("Ventas cargadas, picking generado y distribuido entre piqueadores correctamente.")
+        st.success("Ventas cargadas y picking generado y distribuido entre piqueadores correctamente.")
 
 
 # ---------- PÁGINA: PICKING GLOBAL (PRODUCTO POR PRODUCTO) ----------
@@ -693,21 +666,21 @@ def main():
     page = st.sidebar.radio(
         "Menú",
         [
-            "0) Admin",
             "1) Importar ventas ML",
             "2) Picking global (producto por producto)",
             "3) Conteo final paquetes",
+            "4) Admin",
         ],
     )
 
-    if page.startswith("0"):
-        page_admin()
-    elif page.startswith("1"):
+    if page.startswith("1"):
         page_import_ml()
     elif page.startswith("2"):
         page_picking()
     elif page.startswith("3"):
         page_conteo_final()
+    elif page.startswith("4"):
+        page_admin()
 
 
 if __name__ == "__main__":
