@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime
 
 DB_NAME = "aurora_ml.db"
+ADMIN_PASSWORD = "aurora123"  # 🔐 CAMBIA ESTA CLAVE A LA QUE QUIERAS
 
 
 # ---------- HELPERS DB ----------
@@ -65,6 +66,90 @@ def init_db():
     """)
 
     conn.commit()
+    conn.close()
+
+
+# ---------- PÁGINA: ADMIN ----------
+def page_admin():
+    st.header("0) Panel de administrador")
+
+    # Login simple de admin
+    if not st.session_state.get("admin_authenticated", False):
+        st.info("Ingresa la clave de administrador para acceder a las opciones avanzadas.")
+        pwd = st.text_input("Clave de administrador", type="password")
+        if st.button("Entrar como administrador"):
+            if pwd == ADMIN_PASSWORD:
+                st.session_state["admin_authenticated"] = True
+                st.success("Sesión de administrador iniciada.")
+                st.rerun()
+            else:
+                st.error("Clave incorrecta.")
+        return
+
+    # Si ya está autenticado:
+    st.success("Estás en modo administrador.")
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    # Resumen rápido del sistema
+    st.subheader("Resumen del sistema")
+
+    c.execute("SELECT COUNT(*) FROM orders;")
+    total_orders = c.fetchone()[0] or 0
+
+    c.execute("SELECT COUNT(*) FROM order_items;")
+    total_items = c.fetchone()[0] or 0
+
+    c.execute("SELECT COUNT(*) FROM picking_global;")
+    total_skus = c.fetchone()[0] or 0
+
+    c.execute("SELECT COUNT(*) FROM packages_scan;")
+    total_packages_scanned = c.fetchone()[0] or 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Pedidos cargados", total_orders)
+    col2.metric("Líneas de ítems", total_items)
+    col3.metric("SKUs en picking_global", total_skus)
+    col4.metric("Paquetes escaneados (tracking)", total_packages_scanned)
+
+    st.markdown("---")
+    st.subheader("Acciones de administración")
+
+    col_a, col_b = st.columns(2)
+
+    # Resetear solo cantidades pickeadas
+    with col_a:
+        st.write("**Resetear SOLO picking (qty_picked = 0)**")
+        st.caption("No borra pedidos ni ítems, solo deja todas las cantidades pickeadas en 0.")
+        if st.button("Resetear cantidades pickeadas"):
+            c.execute("UPDATE picking_global SET qty_picked = 0;")
+            conn.commit()
+            st.success("Se reiniciaron todas las cantidades pickeadas.")
+
+    # Resetear TODO el sistema
+    with col_b:
+        st.write("**Resetear TODO el sistema**")
+        st.caption("Borra pedidos, ítems, picking, paquetes escaneados e imágenes. Úsalo solo al cambiar de día o en pruebas.")
+        confirm = st.checkbox("Confirmo que quiero borrar TODOS los datos", key="confirm_reset_all")
+        if st.button("BORRAR TODO (sistema completo)"):
+            if confirm:
+                c.execute("DELETE FROM order_items;")
+                c.execute("DELETE FROM orders;")
+                c.execute("DELETE FROM picking_global;")
+                c.execute("DELETE FROM packages_scan;")
+                c.execute("DELETE FROM sku_images;")
+                conn.commit()
+                st.warning("Se borraron TODOS los datos del sistema.")
+            else:
+                st.error("Marca la casilla de confirmación antes de borrar todo.")
+
+    st.markdown("---")
+    if st.button("Cerrar sesión de administrador"):
+        st.session_state["admin_authenticated"] = False
+        st.success("Sesión de administrador cerrada.")
+        st.rerun()
+
     conn.close()
 
 
@@ -416,13 +501,16 @@ def main():
     page = st.sidebar.radio(
         "Menú",
         [
+            "0) Admin",
             "1) Importar ventas ML",
             "2) Picking global (producto por producto)",
             "3) Conteo final paquetes",
         ],
     )
 
-    if page.startswith("1"):
+    if page.startswith("0"):
+        page_admin()
+    elif page.startswith("1"):
         page_import_ml()
     elif page.startswith("2"):
         page_picking()
