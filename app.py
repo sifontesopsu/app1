@@ -13,12 +13,18 @@ try:
 except ImportError:
     HAS_BARCODE_LIB = False
 
-# Intentar importar pdfplumber para leer manifiestos PDF
+# PDF desde manifiestos
 try:
     import pdfplumber
     HAS_PDF_LIB = True
 except ImportError:
     HAS_PDF_LIB = False
+
+# PDF de hojas de picking (reportlab)
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 
 DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # 🔐 CAMBIA ESTA CLAVE A LA QUE QUIERAS
@@ -140,6 +146,86 @@ def generate_barcode_bytes(data: str):
     rv = BytesIO()
     Code128(data, writer=ImageWriter()).write(rv)
     return rv.getvalue()
+
+
+# ---------- PDF HOJAS DE PICKING ----------
+def build_picklist_pdf(ot_data_list):
+    """
+    ot_data_list: lista de dicts:
+      {
+        "ot_code": str,
+        "picker_name": str,
+        "created_at": str,
+        "items": [(sku, producto, qty), ...]
+      }
+    Devuelve bytes de un PDF con todas las OTs.
+    """
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    for idx, ot in enumerate(ot_data_list):
+        if idx > 0:
+            c.showPage()  # nueva página para cada OT
+
+        ot_code = ot["ot_code"]
+        picker_name = ot["picker_name"]
+        created_at = ot["created_at"]
+        items = ot["items"]
+
+        # Encabezado
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(20 * mm, height - 20 * mm, f"OT: {ot_code}  –  Piqueador: {picker_name}")
+        c.setFont("Helvetica", 10)
+        c.drawString(20 * mm, height - 26 * mm, f"Creada: {created_at}")
+
+        y = height - 40 * mm
+
+        # Código de barras (si se puede)
+        img_bytes = generate_barcode_bytes(ot_code)
+        if img_bytes is not None:
+            try:
+                img = ImageReader(BytesIO(img_bytes))
+                c.drawImage(img, 20 * mm, y - 20 * mm, width=60 * mm, preserveAspectRatio=True, mask='auto')
+                y -= 35 * mm
+            except Exception:
+                y -= 10 * mm
+        else:
+            y -= 10 * mm
+
+        # Tabla simple de SKUs
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(20 * mm, y, "SKU")
+        c.drawString(60 * mm, y, "Producto")
+        c.drawString(170 * mm, y, "Cant.")
+        y -= 6 * mm
+        c.line(20 * mm, y, 190 * mm, y)
+        y -= 4 * mm
+
+        c.setFont("Helvetica", 9)
+
+        for sku, producto, qty in items:
+            if y < 20 * mm:  # salto de página si no cabe
+                c.showPage()
+                y = height - 20 * mm
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(20 * mm, y, "SKU")
+                c.drawString(60 * mm, y, "Producto")
+                c.drawString(170 * mm, y, "Cant.")
+                y -= 6 * mm
+                c.line(20 * mm, y, 190 * mm, y)
+                y -= 4 * mm
+                c.setFont("Helvetica", 9)
+
+            c.drawString(20 * mm, y, str(sku)[:20])
+            c.drawString(60 * mm, y, str(producto)[:80])
+            c.drawRightString(185 * mm, y, str(qty))
+            y -= 5 * mm
+
+    c.save()
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
 
 
 # ---------- PARSER MANIFIESTO PDF ----------
@@ -647,17 +733,6 @@ def page_import_ml():
 def page_hojas_picking():
     st.header("2) Hojas de picking (papel por OT)")
 
-    # Botón para imprimir vía ventana del navegador
-    if st.button("🖨️ Imprimir hojas de picking"):
-        st.markdown(
-            """
-            <script>
-            window.print();
-            </script>
-            """,
-            unsafe_allow_html=True
-        )
-
     conn = get_conn()
     c = conn.cursor()
 
@@ -682,7 +757,7 @@ def page_hojas_picking():
         opciones.append(label)
         ot_map[label] = (ot_id, ot_code, picker_name, created_at)
 
-    seleccion = st.selectbox("Selecciona OT para imprimir", opciones, index=0)
+    seleccion = st.selectbox("Selecciona OT para ver/imprimir", opciones, index=0)
 
     # Lista de OTs a mostrar
     if seleccion == "Todas las OTs":
@@ -692,7 +767,9 @@ def page_hojas_picking():
         ot_id, ot_code, picker_name, created_at = ot_map[seleccion]
         ots_a_mostrar.append((ot_id, ot_code, picker_name, created_at))
 
-    st.write("Imprime estas hojas y entrégalas a cada piqueador correspondiente.")
+    st.write("Estas son las hojas de picking que puedes imprimir o descargar en PDF.")
+
+    ot_data_list = []
 
     for ot_id, ot_code, picker_name, created_at in ots_a_mostrar:
         st.markdown("---")
@@ -708,7 +785,7 @@ def page_hojas_picking():
                 st.write(f"Error generando código de barras para {ot_code}: {e}")
         else:
             # Fallback si no hay librería de código de barras
-            st.markdown(f"**Código OT (para imprimir / escribir en la hoja):** `{ot_code}`")
+            st.markdown(f"**Código OT:** `{ot_code}`")
 
         # Productos de esta OT
         c.execute("""
@@ -728,7 +805,28 @@ def page_hojas_picking():
         df = pd.DataFrame(rows, columns=["SKU", "Producto", "Cantidad a pickear"])
         st.table(df)
 
+        # Guardar datos para el PDF
+        items = [(r[0], r[1], r[2]) for r in rows]
+        ot_data_list.append(
+            {
+                "ot_code": ot_code,
+                "picker_name": picker_name,
+                "created_at": created_at,
+                "items": items,
+            }
+        )
+
     conn.close()
+
+    # Si hay OTs, generar PDF para descarga
+    if ot_data_list:
+        pdf_bytes = build_picklist_pdf(ot_data_list)
+        st.download_button(
+            "📄 Descargar PDF de hojas de picking",
+            data=pdf_bytes,
+            file_name="hojas_picking_aurora.pdf",
+            mime="application/pdf",
+        )
 
 
 # ---------- PÁGINA: CERRAR OT (ESCANEO ÚNICO) ----------
