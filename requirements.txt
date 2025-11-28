@@ -4,3 +4,4 @@ openpyxl
 pdfplumber
 python-barcode
 Pillow
+reportlab
