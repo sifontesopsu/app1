@@ -4,9 +4,14 @@ import sqlite3
 from datetime import datetime
 from io import BytesIO
 
-# Para códigos de barras internos (sin integraciones externas)
-from barcode import Code128
-from barcode.writer import ImageWriter
+# ========= CÓDIGOS DE BARRAS (SIN INTEGRACIONES EXTERNAS) =========
+HAS_BARCODE_LIB = False
+try:
+    from barcode import Code128
+    from barcode.writer import ImageWriter
+    HAS_BARCODE_LIB = True
+except ImportError:
+    HAS_BARCODE_LIB = False
 
 # Intentar importar pdfplumber para leer manifiestos PDF
 try:
@@ -83,7 +88,7 @@ def init_db():
     );
     """)
 
-    # Tabla de OTs de picking (una por piqueador)
+    # Tabla de OTs de picking (una por piqueador por corrida)
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_ots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,11 +130,13 @@ def init_db():
 
 
 # ---------- CÓDIGOS DE BARRAS ----------
-def generate_barcode_bytes(data: str) -> bytes:
+def generate_barcode_bytes(data: str):
     """
     Genera un código de barras Code128 en memoria y devuelve los bytes de la imagen.
-    Sin integraciones externas, solo python-barcode + Pillow.
+    Si la librería python-barcode no está disponible, devuelve None.
     """
+    if not HAS_BARCODE_LIB:
+        return None
     rv = BytesIO()
     Code128(data, writer=ImageWriter()).write(rv)
     return rv.getvalue()
@@ -291,7 +298,7 @@ def page_admin():
     # Resetear TODO
     with col_c:
         st.write("**Resetear TODO el sistema**")
-        st.caption("Borra pedidos, ítems, picking, OTs, imágenes y paquetes. Úsalo solo al cambiar de día o en pruebas.")
+        st.caption("Borra pedidos, ítems, picking, OTs, imágenes y paquetes. Úsalo solo al cambiar de ciclo o en pruebas.")
         confirm = st.checkbox("Confirmo que quiero borrar TODOS los datos", key="confirm_reset_all")
         if st.button("BORRAR TODO (sistema completo)"):
             if confirm:
@@ -328,7 +335,7 @@ def page_import_ml():
 
     # Cantidad de piqueadores
     num_pickers = st.number_input(
-        "Cantidad de piqueadores para hoy",
+        "Cantidad de piqueadores para esta corrida",
         min_value=1,
         max_value=20,
         value=1,
@@ -420,7 +427,7 @@ def page_import_ml():
 
         # Buscar la columna de MLC (# publicación) entre varios candidatos
         mlc_candidates = [
-            "Publicaciones | # de publicación",   # la que realmente sueles tener
+            "Publicaciones | # de publicación",   # usual en tus exports
             "Publicaciones | ID de publicación",
             "Publicaciones | # publicación",
             "# de publicación",
@@ -509,17 +516,22 @@ def page_import_ml():
         conn = get_conn()
         c = conn.cursor()
 
-        # Limpiar datos anteriores
-        c.execute("DELETE FROM order_items;")
-        c.execute("DELETE FROM orders;")
+        # ✅ YA NO BORRAMOS ventas históricas (orders / order_items)
+        # Solo limpiamos la parte operativa de picking de la corrida actual
         c.execute("DELETE FROM picking_global;")
         c.execute("DELETE FROM packages_scan;")
         c.execute("DELETE FROM pickers;")
         c.execute("DELETE FROM sku_images;")
         c.execute("DELETE FROM picking_ots;")
 
-        # Insertar pedidos y sus líneas
+        # Insertar pedidos y sus líneas (acumulando historia de ventas)
         for ml_order_id, grupo in sales_df.groupby("ml_order_id"):
+            # Si ya existe esa venta, la saltamos para no duplicar trazabilidad
+            c.execute("SELECT id FROM orders WHERE ml_order_id = ?;", (str(ml_order_id),))
+            row_exist = c.fetchone()
+            if row_exist:
+                continue
+
             buyer = str(grupo["buyer"].iloc[0]) if "buyer" in grupo.columns else ""
             created_at = datetime.now().isoformat()
 
@@ -555,7 +567,7 @@ def page_import_ml():
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (order_id, sku, mlc_id, title_ml, title_tec, qty))
 
-        # Generar picking_global agrupando todos los SKUs/MLC del día
+        # Generar picking_global agrupando todos los SKUs/MLC existentes (corrida completa)
         c.execute("""
             SELECT sku_ml, mlc_id, title_ml, title_tec, SUM(qty) as total
             FROM order_items
@@ -568,7 +580,7 @@ def page_import_ml():
                 VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
             """, (sku, mlc_id, title_ml, title_tec, total))
 
-        # Crear piqueadores y repartir SKUs
+        # Crear piqueadores y repartir SKUs de esta corrida
         num_pickers_int = int(num_pickers)
         for i in range(num_pickers_int):
             name = f"P{i+1}"
@@ -595,7 +607,6 @@ def page_import_ml():
             # Crear una OT por piqueador y asignarla a sus SKUs
             for pid, pname in pickers:
                 created_at = datetime.now().isoformat()
-                # Primero insertamos sin código
                 c.execute("""
                     INSERT INTO picking_ots (picker_id, ot_code, created_at)
                     VALUES (?, ?, ?)
@@ -629,11 +640,23 @@ def page_import_ml():
         conn.close()
 
         st.success("Ventas cargadas, picking generado, OTs creadas y distribuidas entre piqueadores correctamente.")
+        st.info("Las ventas anteriores se mantienen en la base de datos para trazabilidad. Solo se reinició el picking de esta corrida.")
 
 
 # ---------- PÁGINA: HOJAS DE PICKING (PAPEL POR OT) ----------
 def page_hojas_picking():
     st.header("2) Hojas de picking (papel por OT)")
+
+    # Botón para imprimir vía ventana del navegador
+    if st.button("🖨️ Imprimir hojas de picking"):
+        st.markdown(
+            """
+            <script>
+            window.print();
+            </script>
+            """,
+            unsafe_allow_html=True
+        )
 
     conn = get_conn()
     c = conn.cursor()
@@ -661,7 +684,7 @@ def page_hojas_picking():
 
     seleccion = st.selectbox("Selecciona OT para imprimir", opciones, index=0)
 
-    # Prepare lista de OTs a mostrar
+    # Lista de OTs a mostrar
     if seleccion == "Todas las OTs":
         ots_a_mostrar = ot_rows
     else:
@@ -676,12 +699,16 @@ def page_hojas_picking():
         st.subheader(f"OT: {ot_code} – Piqueador: {picker_name}")
         st.caption(f"Creada: {created_at}")
 
-        # Código de barras de la OT
-        try:
-            img_bytes = generate_barcode_bytes(ot_code)
-            st.image(img_bytes, caption=f"Código de barras OT {ot_code}", use_container_width=False)
-        except Exception as e:
-            st.write(f"Error generando código de barras para {ot_code}: {e}")
+        # Código de barras de la OT (si la librería está disponible)
+        img_bytes = generate_barcode_bytes(ot_code)
+        if img_bytes is not None:
+            try:
+                st.image(img_bytes, caption=f"Código de barras OT {ot_code}", use_container_width=False)
+            except Exception as e:
+                st.write(f"Error generando código de barras para {ot_code}: {e}")
+        else:
+            # Fallback si no hay librería de código de barras
+            st.markdown(f"**Código OT (para imprimir / escribir en la hoja):** `{ot_code}`")
 
         # Productos de esta OT
         c.execute("""
@@ -713,7 +740,7 @@ def page_cerrar_ot():
 
     st.write("""
     El piqueador termina su recorrido con la hoja en papel.
-    En esta pantalla, escanea el **código de barras de la OT** (una sola vez)
+    En esta pantalla, escanea el **código de barras de la OT** (o escribe el código OT)
     para marcar como pickeados todos los productos asignados a esa OT.
     """)
 
