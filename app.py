@@ -2,6 +2,11 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import datetime
+from io import BytesIO
+
+# Para códigos de barras internos (sin integraciones externas)
+from barcode import Code128
+from barcode.writer import ImageWriter
 
 # Intentar importar pdfplumber para leer manifiestos PDF
 try:
@@ -46,7 +51,7 @@ def init_db():
     );
     """)
 
-    # Picking global por SKU / MLC (incluye picker_id para distribución)
+    # Picking global por SKU / MLC (incluye picker_id y ot_id)
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_global (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +61,8 @@ def init_db():
         title_tec TEXT,
         qty_total INTEGER,
         qty_picked INTEGER DEFAULT 0,
-        picker_id INTEGER
+        picker_id INTEGER,
+        ot_id INTEGER
     );
     """)
 
@@ -77,6 +83,16 @@ def init_db():
     );
     """)
 
+    # Tabla de OTs de picking (una por piqueador)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS picking_ots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        picker_id INTEGER,
+        ot_code TEXT UNIQUE,
+        created_at TEXT
+    );
+    """)
+
     # Asegurar columnas nuevas en tablas existentes
     c.execute("PRAGMA table_info(order_items);")
     cols_oi = [row[1] for row in c.fetchall()]
@@ -93,8 +109,10 @@ def init_db():
         c.execute("ALTER TABLE picking_global ADD COLUMN title_tec TEXT;")
     if "picker_id" not in cols_pg:
         c.execute("ALTER TABLE picking_global ADD COLUMN picker_id INTEGER;")
+    if "ot_id" not in cols_pg:
+        c.execute("ALTER TABLE picking_global ADD COLUMN ot_id INTEGER;")
 
-    # Crear sku_images SIN borrarla cada vez
+    # Crear tabla de imágenes por MLC (por si sigues usándolas en otros módulos)
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_images (
         mlc_id TEXT PRIMARY KEY,
@@ -106,45 +124,15 @@ def init_db():
     conn.close()
 
 
-
-
-def normalize_image_url(raw):
+# ---------- CÓDIGOS DE BARRAS ----------
+def generate_barcode_bytes(data: str) -> bytes:
     """
-    Normaliza el valor crudo de la URL de imagen proveniente de Excel/CSV.
-
-    - Convierte a string y hace strip.
-    - Ignora valores vacíos o tipo 'nan', 'none', 'null'.
-    - Corrige formas típicas de URLs de MercadoLibre (http2.mlstatic.com).
-    - Devuelve una URL http(s) válida o None si no lo es.
+    Genera un código de barras Code128 en memoria y devuelve los bytes de la imagen.
+    Sin integraciones externas, solo python-barcode + Pillow.
     """
-    if raw is None:
-        return None
-
-    url = str(raw).strip()
-    if not url:
-        return None
-
-    # Filtrar textos típicos de valores vacíos
-    if url.lower() in ("nan", "none", "null"):
-        return None
-
-    # Caso típico: viene sin esquema: "http2.mlstatic.com/..."
-    if url.startswith("http2.mlstatic.com/"):
-        url = "https://" + url
-
-    # Caso típico: http://http2.mlstatic.com/... → lo pasamos a https
-    if url.startswith("http://http2.mlstatic.com/"):
-        url = "https://" + url[len("http://"):]
-
-    # Caso típico: empieza con //http2.mlstatic.com/...
-    if url.startswith("//"):
-        url = "https:" + url
-
-    # Validar que finalmente tenga esquema http/https
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return None
-
-    return url
+    rv = BytesIO()
+    Code128(data, writer=ImageWriter()).write(rv)
+    return rv.getvalue()
 
 
 # ---------- PARSER MANIFIESTO PDF ----------
@@ -303,7 +291,7 @@ def page_admin():
     # Resetear TODO
     with col_c:
         st.write("**Resetear TODO el sistema**")
-        st.caption("Borra pedidos, ítems, picking, imágenes y paquetes. Úsalo solo al cambiar de día o en pruebas.")
+        st.caption("Borra pedidos, ítems, picking, OTs, imágenes y paquetes. Úsalo solo al cambiar de día o en pruebas.")
         confirm = st.checkbox("Confirmo que quiero borrar TODOS los datos", key="confirm_reset_all")
         if st.button("BORRAR TODO (sistema completo)"):
             if confirm:
@@ -313,6 +301,7 @@ def page_admin():
                 c.execute("DELETE FROM packages_scan;")
                 c.execute("DELETE FROM sku_images;")
                 c.execute("DELETE FROM pickers;")
+                c.execute("DELETE FROM picking_ots;")
                 conn.commit()
                 st.warning("Se borraron TODOS los datos del sistema.")
             else:
@@ -431,7 +420,7 @@ def page_import_ml():
 
         # Buscar la columna de MLC (# publicación) entre varios candidatos
         mlc_candidates = [
-            "Publicaciones | # de publicación",   # la que realmente tienes
+            "Publicaciones | # de publicación",   # la que realmente sueles tener
             "Publicaciones | ID de publicación",
             "Publicaciones | # publicación",
             "# de publicación",
@@ -527,6 +516,7 @@ def page_import_ml():
         c.execute("DELETE FROM packages_scan;")
         c.execute("DELETE FROM pickers;")
         c.execute("DELETE FROM sku_images;")
+        c.execute("DELETE FROM picking_ots;")
 
         # Insertar pedidos y sus líneas
         for ml_order_id, grupo in sales_df.groupby("ml_order_id"):
@@ -574,8 +564,8 @@ def page_import_ml():
         rows = c.fetchall()
         for sku, mlc_id, title_ml, title_tec, total in rows:
             c.execute("""
-                INSERT INTO picking_global (sku_ml, mlc_id, title_ml, title_tec, qty_total, qty_picked, picker_id)
-                VALUES (?, ?, ?, ?, ?, 0, NULL)
+                INSERT INTO picking_global (sku_ml, mlc_id, title_ml, title_tec, qty_total, qty_picked, picker_id, ot_id)
+                VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
             """, (sku, mlc_id, title_ml, title_tec, total))
 
         # Crear piqueadores y repartir SKUs
@@ -589,6 +579,7 @@ def page_import_ml():
         total_pickers = len(pickers)
 
         if total_pickers > 0:
+            # Asignar SKUs a piqueadores
             c.execute("""
                 SELECT id FROM picking_global
                 ORDER BY 
@@ -601,289 +592,211 @@ def page_import_ml():
                 picker_id = pickers[idx % total_pickers][0]
                 c.execute("UPDATE picking_global SET picker_id = ? WHERE id = ?;", (picker_id, pg_id))
 
+            # Crear una OT por piqueador y asignarla a sus SKUs
+            for pid, pname in pickers:
+                created_at = datetime.now().isoformat()
+                # Primero insertamos sin código
+                c.execute("""
+                    INSERT INTO picking_ots (picker_id, ot_code, created_at)
+                    VALUES (?, ?, ?)
+                """, (pid, "", created_at))
+                ot_id = c.lastrowid
+                ot_code = f"OT{ot_id:06d}"
+                c.execute("UPDATE picking_ots SET ot_code = ? WHERE id = ?;", (ot_code, ot_id))
+
+                # Asignar esta OT a todos los SKUs de ese piqueador
+                c.execute("""
+                    UPDATE picking_global
+                    SET ot_id = ?
+                    WHERE picker_id = ?
+                """, (ot_id, pid))
+
         # Cargar imágenes por MLC (si tenemos archivo)
         if img_df is not None and img_mlc_col and img_url_col:
             inserted = 0
             for _, row in img_df.iterrows():
                 mlc_val = str(row[img_mlc_col]).strip()
-                raw_url_val = row[img_url_col]
-                if not mlc_val:
-                    continue
-                url_val = normalize_image_url(raw_url_val)
-                if not url_val:
-                    continue
-                c.execute("""
-                    INSERT OR REPLACE INTO sku_images (mlc_id, image_url)
-                    VALUES (?, ?)
-                """, (mlc_val, url_val))
-                inserted += 1
+                url_val = str(row[img_url_col]).strip()
+                if mlc_val and url_val:
+                    c.execute("""
+                        INSERT OR REPLACE INTO sku_images (mlc_id, image_url)
+                        VALUES (?, ?)
+                    """, (mlc_val, url_val))
+                    inserted += 1
             st.success(f"Se cargaron {inserted} imágenes en la tabla sku_images (por MLC).")
 
         conn.commit()
         conn.close()
 
-        st.session_state["pick_index"] = 0
-        st.success("Ventas cargadas, picking generado y distribuido entre piqueadores correctamente.")
+        st.success("Ventas cargadas, picking generado, OTs creadas y distribuidas entre piqueadores correctamente.")
 
 
-# ---------- PÁGINA: PICKING GLOBAL ----------
-def page_picking():
-    st.header("2) Picking por producto")
+# ---------- PÁGINA: HOJAS DE PICKING (PAPEL POR OT) ----------
+def page_hojas_picking():
+    st.header("2) Hojas de picking (papel por OT)")
 
     conn = get_conn()
     c = conn.cursor()
 
-    # Selector de piqueador
-    c.execute("SELECT id, name FROM pickers ORDER BY id;")
-    picker_rows = c.fetchall()
-    picker_options = ["Todos"]
-    picker_id_map = {}
-    for pid, pname in picker_rows:
-        picker_options.append(pname)
-        picker_id_map[pname] = pid
-
-    selected_picker = st.selectbox("Lista de trabajo:", picker_options, index=0)
-
-    # Traer productos (incluyendo imagen por MLC)
+    # Traer OTs y piqueadores
     c.execute("""
-        SELECT pg.id,
-               pg.sku_ml,
-               pg.mlc_id,
-               pg.title_ml,
-               pg.title_tec,
-               pg.qty_total,
-               pg.qty_picked,
-               si.image_url,
-               pg.picker_id
-        FROM picking_global pg
-        LEFT JOIN sku_images si
-               ON si.mlc_id = pg.mlc_id
-        ORDER BY 
-            CASE WHEN pg.title_tec IS NULL OR pg.title_tec = '' THEN 1 ELSE 0 END,
-            pg.title_tec,
-            pg.title_ml
+        SELECT po.id, po.ot_code, pk.name, po.created_at
+        FROM picking_ots po
+        JOIN pickers pk ON pk.id = po.picker_id
+        ORDER BY po.id
     """)
-    rows = c.fetchall()
+    ot_rows = c.fetchall()
 
-    # Filtrar por piqueador
-    if selected_picker != "Todos":
-        target_id = picker_id_map.get(selected_picker)
-        rows = [r for r in rows if r[8] == target_id]
-
-    if not rows:
-        st.info("No hay productos asignados con el filtro actual.")
+    if not ot_rows:
+        st.info("No hay OTs generadas. Primero importa ventas en '1) Importar ventas'.")
         conn.close()
         return
 
-    if "pick_index" not in st.session_state:
-        st.session_state["pick_index"] = 0
+    opciones = ["Todas las OTs"]
+    ot_map = {}
+    for ot_id, ot_code, picker_name, created_at in ot_rows:
+        label = f"{ot_code} – {picker_name}"
+        opciones.append(label)
+        ot_map[label] = (ot_id, ot_code, picker_name, created_at)
 
-    total_productos = len(rows)
-    idx = st.session_state["pick_index"]
+    seleccion = st.selectbox("Selecciona OT para imprimir", opciones, index=0)
 
-    if idx < 0:
-        idx = 0
-    if idx >= total_productos:
-        idx = total_productos - 1
+    # Prepare lista de OTs a mostrar
+    if seleccion == "Todas las OTs":
+        ots_a_mostrar = ot_rows
+    else:
+        ots_a_mostrar = []
+        ot_id, ot_code, picker_name, created_at = ot_map[seleccion]
+        ots_a_mostrar.append((ot_id, ot_code, picker_name, created_at))
 
-    st.session_state["pick_index"] = idx
+    st.write("Imprime estas hojas y entrégalas a cada piqueador correspondiente.")
 
-    pg_id, sku_ml, mlc_id, title_ml, title_tec, qty_total, qty_picked, image_url, picker_id = rows[idx]
-    restantes = qty_total - qty_picked
+    for ot_id, ot_code, picker_name, created_at in ots_a_mostrar:
+        st.markdown("---")
+        st.subheader(f"OT: {ot_code} – Piqueador: {picker_name}")
+        st.caption(f"Creada: {created_at}")
 
-    # Título a mostrar
-    display_title = title_tec if title_tec and str(title_tec).strip().lower() not in ["", "nan"] else title_ml
+        # Código de barras de la OT
+        try:
+            img_bytes = generate_barcode_bytes(ot_code)
+            st.image(img_bytes, caption=f"Código de barras OT {ot_code}", use_container_width=False)
+        except Exception as e:
+            st.write(f"Error generando código de barras para {ot_code}: {e}")
 
-    # ======== ESTILO VISUAL ==========
-    st.markdown("""
-        <style>
-        .title-big {
-            font-size: 32px;
-            font-weight: bold;
-            margin-bottom: 6px;
-        }
-        .sku-big {
-            font-size: 18px;
-            color: #555;
-            margin-bottom: 4px;
-        }
-        .ml-name {
-            font-size: 14px;
-            color: #777;
-            margin-bottom: 15px;
-            font-style: italic;
-        }
+        # Productos de esta OT
+        c.execute("""
+            SELECT sku_ml,
+                   COALESCE(title_tec, title_ml) AS producto,
+                   qty_total
+            FROM picking_global
+            WHERE ot_id = ?
+            ORDER BY producto
+        """, (ot_id,))
+        rows = c.fetchall()
 
-        .kpi-box {
-            padding: 18px;
-            border-radius: 12px;
-            text-align: center;
-            font-size: 26px;
-            font-weight: bold;
-        }
-        .kpi-label {
-            font-size: 14px;
-        }
-        .kpi-total { background-color: #e6f0ff; color: #0047ab; }
-        .kpi-picked { background-color: #e6ffe6; color: #0a7a0a; }
-        .kpi-rest { background-color: #fff1e6; color: #b34700; }
+        if not rows:
+            st.write("No hay SKUs asignados a esta OT.")
+            continue
 
-        .btn-big button {
-            height: 80px !important;
-            font-size: 20px !important;
-            font-weight: bold !important;
-            width: 100% !important;
-        }
-
-        @media (max-width: 768px) {
-            .title-big {
-                font-size: 26px;
-            }
-            .sku-big {
-                font-size: 16px;
-            }
-            .kpi-box {
-                font-size: 24px;
-                padding: 16px;
-            }
-            .btn-big button {
-                height: 90px !important;
-                font-size: 22px !important;
-            }
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    # ======== HEADER DEL PRODUCTO =========
-    st.markdown(f"<div class='title-big'>{display_title}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='sku-big'>SKU: {sku_ml}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='ml-name'>Nombre ML: {title_ml}</div>", unsafe_allow_html=True)
-
-    info_sub = f"Producto {idx+1} de {total_productos}"
-    if selected_picker != "Todos":
-        info_sub += f" · Lista de {selected_picker}"
-    st.markdown(info_sub)
-
-    col_info, col_img = st.columns([2, 1])
-
-    with col_img:
-        if image_url and isinstance(image_url, str) and image_url.strip():
-            url_to_show = normalize_image_url(image_url)
-            if not url_to_show:
-                st.write("URL de imagen no válida.")
-            else:
-                try:
-                    st.image(url_to_show, use_container_width=True)
-                except Exception as e:
-                    st.write("Error al cargar la imagen.")
-                    st.caption(f"Detalle técnico: {e}")
-        else:
-            st.write("Sin imagen")
-
-    # ======== KPIs =========
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown(
-            f"<div class='kpi-box kpi-total'><div class='kpi-label'>TOTAL</div>{qty_total}</div>",
-            unsafe_allow_html=True,
-        )
-
-    with col2:
-        st.markdown(
-            f"<div class='kpi-box kpi-picked'><div class='kpi-label'>PICKEADO</div>{qty_picked}</div>",
-            unsafe_allow_html=True,
-        )
-
-    with col3:
-        st.markdown(
-            f"<div class='kpi-box kpi-rest'><div class='kpi-label'>RESTANTE</div>{restantes}</div>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ======== BOTONES GRANDES =========
-    col_a, col_b, col_c, col_d = st.columns(4)
-
-    with col_a:
-        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
-        if st.button("➕ SUMAR"):
-            if qty_picked < qty_total:
-                c.execute("""
-                    UPDATE picking_global
-                    SET qty_picked = qty_picked + 1
-                    WHERE id = ?
-                """, (pg_id,))
-                conn.commit()
-                st.rerun()
-            else:
-                st.warning("Cantidad completa.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col_b:
-        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
-        if st.button("➖ RESTAR"):
-            if qty_picked > 0:
-                c.execute("""
-                    UPDATE picking_global
-                    SET qty_picked = qty_picked - 1
-                    WHERE id = ?
-                """, (pg_id,))
-                conn.commit()
-                st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col_c:
-        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
-        if st.button("✅ COMPLETAR"):
-            c.execute("""
-                UPDATE picking_global
-                SET qty_picked = ?
-                WHERE id = ?
-            """, (qty_total, pg_id))
-            conn.commit()
-            st.session_state["pick_index"] = min(idx + 1, total_productos - 1)
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col_d:
-        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
-        if st.button("🔄 REINICIAR"):
-            c.execute("""
-                UPDATE picking_global
-                SET qty_picked = 0
-                WHERE id = ?
-            """, (pg_id,))
-            conn.commit()
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ======== NAVEGACIÓN =========
-    col_prev, col_next = st.columns(2)
-
-    with col_prev:
-        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
-        if st.button("⬅️ ANTERIOR"):
-            st.session_state["pick_index"] = max(idx - 1, 0)
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col_next:
-        st.markdown("<div class='btn-big'>", unsafe_allow_html=True)
-        if st.button("➡️ SIGUIENTE"):
-            st.session_state["pick_index"] = min(idx + 1, total_productos - 1)
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+        df = pd.DataFrame(rows, columns=["SKU", "Producto", "Cantidad a pickear"])
+        st.table(df)
 
     conn.close()
 
 
+# ---------- PÁGINA: CERRAR OT (ESCANEO ÚNICO) ----------
+def page_cerrar_ot():
+    st.header("3) Cerrar OT (escaneo único por piqueador)")
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    st.write("""
+    El piqueador termina su recorrido con la hoja en papel.
+    En esta pantalla, escanea el **código de barras de la OT** (una sola vez)
+    para marcar como pickeados todos los productos asignados a esa OT.
+    """)
+
+    code = st.text_input("Escanee o escriba el código de la OT (ej: OT000001)", key="scan_ot")
+
+    if st.button("Cerrar OT"):
+        if not code:
+            st.warning("Escanee o escriba un código de OT primero.")
+        else:
+            code = code.strip()
+
+            # Buscar la OT
+            c.execute("""
+                SELECT po.id, po.picker_id, pk.name
+                FROM picking_ots po
+                JOIN pickers pk ON pk.id = po.picker_id
+                WHERE po.ot_code = ?
+            """, (code,))
+            ot_row = c.fetchone()
+
+            if not ot_row:
+                st.error("OT no encontrada.")
+            else:
+                ot_id, picker_id, picker_name = ot_row
+
+                # Verificar estado actual
+                c.execute("""
+                    SELECT COUNT(*),
+                           SUM(CASE WHEN qty_picked >= qty_total THEN 1 ELSE 0 END)
+                FROM picking_global
+                WHERE ot_id = ?
+                """, (ot_id,))
+                total_skus, skus_completos = c.fetchone()
+                total_skus = total_skus or 0
+                skus_completos = skus_completos or 0
+
+                if total_skus == 0:
+                    st.warning("Esta OT no tiene SKUs asignados.")
+                elif skus_completos == total_skus:
+                    st.info(f"La OT {code} ya estaba completamente cerrada (todos los SKUs pickeados).")
+                else:
+                    # Marcar todos los SKUs como completamente pickeados
+                    c.execute("""
+                        UPDATE picking_global
+                        SET qty_picked = qty_total
+                        WHERE ot_id = ?
+                    """, (ot_id,))
+                    conn.commit()
+                    st.success(
+                        f"OT {code} cerrada para {picker_name}: "
+                        f"{total_skus} SKUs marcados como pickeados."
+                    )
+
+    st.markdown("---")
+    st.subheader("Resumen de OTs")
+
+    c.execute("""
+        SELECT po.ot_code,
+               pk.name,
+               COUNT(pg.id) AS skus_total,
+               SUM(CASE WHEN pg.qty_picked >= pg.qty_total THEN 1 ELSE 0 END) AS skus_completos
+        FROM picking_ots po
+        JOIN pickers pk ON pk.id = po.picker_id
+        LEFT JOIN picking_global pg ON pg.ot_id = po.id
+        GROUP BY po.id
+        ORDER BY po.id
+    """)
+    resumen = c.fetchall()
+    conn.close()
+
+    if resumen:
+        df_res = pd.DataFrame(
+            resumen,
+            columns=["OT", "Piqueador", "SKUs totales", "SKUs completos"]
+        )
+        st.table(df_res)
+    else:
+        st.write("No hay OTs para mostrar.")
+
+
 # ---------- PÁGINA: CONTEO FINAL ----------
 def page_conteo_final():
-    st.header("3) Conteo final de paquetes (tracking / número de venta)")
+    st.header("4) Conteo final de paquetes (tracking / número de venta)")
 
     st.write("""
     Después de embalar y etiquetar, en la zona de despacho
@@ -982,27 +895,30 @@ def page_conteo_final():
 
 # ---------- MAIN ----------
 def main():
-    st.set_page_config(page_title="Aurora ML – MVP Picking", layout="wide")
+    st.set_page_config(page_title="Aurora ML – Picking por OT", layout="wide")
     init_db()
 
-    st.sidebar.title("Aurora ML – MVP")
+    st.sidebar.title("Aurora ML – Picking OT")
     page = st.sidebar.radio(
         "Menú",
         [
             "1) Importar ventas",
-            "2) Picking global (producto por producto)",
-            "3) Conteo final paquetes",
-            "4) Admin",
+            "2) Hojas de picking (papel por OT)",
+            "3) Cerrar OT (escaneo)",
+            "4) Conteo final paquetes",
+            "5) Admin",
         ],
     )
 
     if page.startswith("1"):
         page_import_ml()
     elif page.startswith("2"):
-        page_picking()
+        page_hojas_picking()
     elif page.startswith("3"):
-        page_conteo_final()
+        page_cerrar_ot()
     elif page.startswith("4"):
+        page_conteo_final()
+    elif page.startswith("5"):
         page_admin()
 
 
