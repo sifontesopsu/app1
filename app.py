@@ -3,6 +3,7 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 from io import BytesIO
+import re  # <--- para regex en el parser de PDF
 
 # ========= CÓDIGOS DE BARRAS (SIN INTEGRACIONES EXTERNAS) =========
 HAS_BARCODE_LIB = False
@@ -123,7 +124,7 @@ def init_db():
     if "ot_id" not in cols_pg:
         c.execute("ALTER TABLE picking_global ADD COLUMN ot_id INTEGER;")
 
-    # Crear tabla de imágenes por MLC
+    # Tabla de imágenes por MLC
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_images (
         mlc_id TEXT PRIMARY KEY,
@@ -195,17 +196,23 @@ def build_picklist_pdf(ot_data_list):
         c.setFont("Helvetica", 10)
         c.drawString(margin_left, height - margin_top - 11 * mm, f"Creada: {created_at}")
 
-        # Posición inicial para el contenido bajo el encabezado (bajo todo el texto)
-        y = height - margin_top - 25 * mm  # más espacio para que el código de barras NO se cruce
+        # Posición inicial (dejamos espacio antes del código de barras)
+        y = height - margin_top - 25 * mm
 
         # Código de barras (si se puede)
         img_bytes = generate_barcode_bytes(ot_code)
         if img_bytes is not None:
             try:
                 img = ImageReader(BytesIO(img_bytes))
-                # Alto aprox 20 mm, ancho proporcional
-                c.drawImage(img, margin_left, y - 20 * mm, width=60 * mm, preserveAspectRatio=True, mask='auto')
-                y -= 32 * mm  # bajar más para que quede espacio después del código
+                c.drawImage(
+                    img,
+                    margin_left,
+                    y - 20 * mm,
+                    width=60 * mm,
+                    preserveAspectRatio=True,
+                    mask='auto'
+                )
+                y -= 32 * mm  # espacio después del código
             except Exception:
                 y -= 10 * mm
         else:
@@ -214,9 +221,9 @@ def build_picklist_pdf(ot_data_list):
         def draw_header_row(y_top):
             """Dibuja la fila de header con bordes."""
             c.setFont("Helvetica-Bold", 9)
-            # Rectángulo del header completo
+            # Rectángulo header
             c.rect(margin_left, y_top - header_height, table_width, header_height, stroke=1, fill=0)
-            # Líneas verticales de columnas
+            # Líneas verticales
             c.line(col_prod, y_top - header_height, col_prod, y_top)
             c.line(col_qty, y_top - header_height, col_qty, y_top)
             # Textos
@@ -225,15 +232,14 @@ def build_picklist_pdf(ot_data_list):
             c.drawString(col_qty + 2 * mm, y_top - header_height + 2 * mm, "Cant.")
             return y_top - header_height
 
-        # Dibuja header de tabla
+        # Header de tabla
         y = draw_header_row(y)
-
         c.setFont("Helvetica", 9)
 
         for sku, producto, qty in items:
             # ¿Cabe una fila más?
             if y - row_height < margin_bottom:
-                # Página nueva para seguir con la MISMA OT (sin repetir barcode, solo texto)
+                # Nueva página para misma OT (continuación)
                 c.showPage()
                 c.setFont("Helvetica-Bold", 12)
                 c.drawString(margin_left, height - margin_top, f"OT: {ot_code} (continuación)")
@@ -243,19 +249,21 @@ def build_picklist_pdf(ot_data_list):
                 y = draw_header_row(y)
                 c.setFont("Helvetica", 9)
 
-            # Dibujar rectángulo de la fila
             y_row_bottom = y - row_height
+            # Rectángulo de fila
             c.rect(margin_left, y_row_bottom, table_width, row_height, stroke=1, fill=0)
-            # Líneas verticales columnas
+            # Columnas
             c.line(col_prod, y_row_bottom, col_prod, y)
             c.line(col_qty, y_row_bottom, col_qty, y)
 
-            # Textos dentro de la celda (con pequeño margen)
+            # Textos
             c.drawString(col_sku + 2 * mm, y_row_bottom + 2 * mm, str(sku)[:20])
             c.drawString(col_prod + 2 * mm, y_row_bottom + 2 * mm, str(producto)[:80])
-            c.drawRightString(col_qty + (margin_right - col_qty) - 2 * mm, y_row_bottom + 2 * mm, str(qty))
+            c.drawRightString(col_qty + (margin_right - col_qty) - 2 * mm,
+                              y_row_bottom + 2 * mm,
+                              str(qty))
 
-            y = y_row_bottom  # bajar
+            y = y_row_bottom
 
     c.save()
     pdf_bytes = buf.getvalue()
@@ -263,16 +271,19 @@ def build_picklist_pdf(ot_data_list):
     return pdf_bytes
 
 
-# ---------- PARSER MANIFIESTO PDF (más tolerante) ----------
+# ---------- PARSER MANIFIESTO PDF (regex, multi-página) ----------
 def parse_manifest_pdf(uploaded_file):
     """
     Lee un PDF de manifiesto con etiquetas y devuelve un DataFrame con columnas:
     ml_order_id, buyer, sku_ml, mlc_id (None), title_ml (''), qty.
 
-    Más tolerante en:
-      - "Venta:", "Venta N°", "Venta " (busca la palabra 'Venta')
-      - "SKU:", "SKU " (busca 'SKU')
-      - "Cantidad:", "Cantidad " (busca 'Cantidad')
+    Usa regex para encontrar bloques tipo:
+      Venta: <id_venta>
+      <nombre comprador>
+      ...
+      SKU: <sku>
+      Cantidad: <n>
+    en todas las páginas.
     """
     if not HAS_PDF_LIB:
         raise RuntimeError(
@@ -280,75 +291,63 @@ def parse_manifest_pdf(uploaded_file):
             "Agrega 'pdfplumber' a requirements.txt en Streamlit."
         )
 
-    import pdfplumber as _pdfplumber  # asegurar import interno
+    import pdfplumber as _pdfplumber
 
     records = []
     with _pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            lines = text.splitlines()
+            # Normalizar saltos
+            text = text.replace("\r", "\n")
 
-            current_order_id = None
-            current_buyer = None
-            next_is_buyer = False
-            current_sku = None
+            # Patrón:
+            # Venta ... (captura ID)
+            # (bloque comprador)
+            # SKU ...
+            # Cantidad ...
+            pattern = re.compile(
+                r"Venta\s*[:#]?\s*(\d+)(.*?)SKU\s*[:#]?\s*([0-9A-Za-z.\-]+).*?Cantidad\s*[:#]?\s*([0-9]+)",
+                re.DOTALL
+            )
 
-            for line in lines:
-                raw_line = line
-                line = line.strip()
-                if not line:
+            for m in pattern.finditer(text):
+                order_id = m.group(1).strip()
+                buyer_block = (m.group(2) or "").strip()
+                sku = m.group(3).strip()
+                qty_str = m.group(4).strip()
+
+                # Sacar comprador de buyer_block
+                buyer = ""
+                for line in buyer_block.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    lower = line.lower()
+                    if lower.startswith("sku") or lower.startswith("pack id") or lower.startswith("venta"):
+                        continue
+                    # líneas sólo numéricas (código carrier, etc.) las ignoramos
+                    if line.isdigit():
+                        continue
+                    buyer = line
+                    break
+
+                try:
+                    qty = int(qty_str)
+                except Exception:
                     continue
 
-                # ---- Venta ----
-                # Aceptamos líneas que contengan la palabra "Venta"
-                if "Venta" in line:
-                    parts = line.split("Venta", 1)
-                    tail = parts[1].strip(" :#.-")
-                    if tail:  # si hay algo después de "Venta"
-                        current_order_id = tail
-                        current_buyer = None
-                        next_is_buyer = True
-                        current_sku = None
-                        continue
-
-                # La línea siguiente después de la venta suele ser el comprador
-                if next_is_buyer and current_order_id:
-                    current_buyer = line.strip()
-                    next_is_buyer = False
-                    continue
-
-                # ---- SKU ----
-                if "SKU" in line and current_order_id:
-                    parts = line.split("SKU", 1)
-                    sku_tail = parts[1].strip(" :#.-")
-                    if sku_tail:
-                        current_sku = sku_tail
-                        continue
-
-                # ---- Cantidad ----
-                if "Cantidad" in line and current_order_id and current_sku:
-                    parts = line.split("Cantidad", 1)
-                    qty_tail = parts[1].strip(" :#.-")
-                    try:
-                        qty = int(qty_tail.split()[0])
-                    except Exception:
-                        continue
-
-                    records.append(
-                        {
-                            "ml_order_id": current_order_id,
-                            "buyer": current_buyer or "",
-                            "sku_ml": current_sku,
-                            "mlc_id": None,
-                            "title_ml": "",
-                            "qty": qty,
-                        }
-                    )
-                    current_sku = None
-                    continue
+                records.append(
+                    {
+                        "ml_order_id": order_id,
+                        "buyer": buyer,
+                        "sku_ml": sku,
+                        "mlc_id": None,
+                        "title_ml": "",
+                        "qty": qty,
+                    }
+                )
 
     if not records:
-        # Devolvemos DF vacío y el llamador se encarga del error
         return pd.DataFrame(
             columns=["ml_order_id", "buyer", "sku_ml", "mlc_id", "title_ml", "qty"]
         )
@@ -464,9 +463,9 @@ def page_import_ml():
             st.error(f"Faltan columnas en el archivo de Mercado Libre: {missing}")
             st.stop()
 
-        # Buscar la columna de MLC (# publicación) entre varios candidatos
+        # Buscar columna de MLC
         mlc_candidates = [
-            "Publicaciones | # de publicación",   # usual en tus exports
+            "Publicaciones | # de publicación",
             "Publicaciones | ID de publicación",
             "Publicaciones | # publicación",
             "# de publicación",
@@ -502,8 +501,6 @@ def page_import_ml():
 
         if work_df.empty:
             st.error("Después de limpiar las cantidades, no quedó ninguna línea con qty > 0.")
-            st.stop()
-
         sales_df = work_df[["ml_order_id", "buyer", "sku_ml", "mlc_id", "title_ml", "qty"]].copy()
 
         st.subheader("Vista previa (ventas procesadas)")
@@ -555,17 +552,15 @@ def page_import_ml():
         conn = get_conn()
         c = conn.cursor()
 
-        # ✅ YA NO BORRAMOS ventas históricas (orders / order_items)
-        # Solo limpiamos la parte operativa de picking de la corrida actual
+        # Sólo limpiamos parte operativa de picking
         c.execute("DELETE FROM picking_global;")
         c.execute("DELETE FROM packages_scan;")
         c.execute("DELETE FROM pickers;")
         c.execute("DELETE FROM sku_images;")
         c.execute("DELETE FROM picking_ots;")
 
-        # Insertar pedidos y sus líneas (acumulando historia de ventas)
+        # Insertar pedidos y líneas (histórico de ventas se mantiene)
         for ml_order_id, grupo in sales_df.groupby("ml_order_id"):
-            # Si ya existe esa venta, la saltamos para no duplicar trazabilidad
             c.execute("SELECT id FROM orders WHERE ml_order_id = ?;", (str(ml_order_id),))
             row_exist = c.fetchone()
             if row_exist:
@@ -585,13 +580,11 @@ def page_import_ml():
                 title_ml_raw = str(row["title_ml"]) if "title_ml" in row and str(row["title_ml"]) not in ["nan"] else ""
                 mlc_id_raw = row.get("mlc_id", None)
 
-                # Normalizar mlc_id
                 mlc_id = None
                 if mlc_id_raw is not None and str(mlc_id_raw).lower() != "nan":
                     mlc_id = str(mlc_id_raw).strip()
 
                 title_tec = inv_map.get(sku)
-
                 if not title_ml_raw and title_tec:
                     title_ml = title_tec
                 else:
@@ -606,7 +599,7 @@ def page_import_ml():
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (order_id, sku, mlc_id, title_ml, title_tec, qty))
 
-        # Generar picking_global agrupando todos los SKUs/MLC existentes (corrida completa)
+        # Generar picking_global agrupado
         c.execute("""
             SELECT sku_ml, mlc_id, title_ml, title_tec, SUM(qty) as total
             FROM order_items
@@ -619,7 +612,7 @@ def page_import_ml():
                 VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
             """, (sku, mlc_id, title_ml, title_tec, total))
 
-        # Crear piqueadores y repartir SKUs de esta corrida
+        # Crear piqueadores y repartir SKUs
         num_pickers_int = int(num_pickers)
         for i in range(num_pickers_int):
             name = f"P{i+1}"
@@ -630,7 +623,6 @@ def page_import_ml():
         total_pickers = len(pickers)
 
         if total_pickers > 0:
-            # Asignar SKUs a piqueadores
             c.execute("""
                 SELECT id FROM picking_global
                 ORDER BY 
@@ -643,7 +635,7 @@ def page_import_ml():
                 picker_id = pickers[idx % total_pickers][0]
                 c.execute("UPDATE picking_global SET picker_id = ? WHERE id = ?;", (picker_id, pg_id))
 
-            # Crear una OT por piqueador y asignarla a sus SKUs
+            # Crear una OT por piqueador
             for pid, pname in pickers:
                 created_at = datetime.now().isoformat()
                 c.execute("""
@@ -654,14 +646,13 @@ def page_import_ml():
                 ot_code = f"OT{ot_id:06d}"
                 c.execute("UPDATE picking_ots SET ot_code = ? WHERE id = ?;", (ot_code, ot_id))
 
-                # Asignar esta OT a todos los SKUs de ese piqueador
                 c.execute("""
                     UPDATE picking_global
                     SET ot_id = ?
                     WHERE picker_id = ?
                 """, (ot_id, pid))
 
-        # Cargar imágenes por MLC (si tenemos archivo)
+        # Imágenes por MLC
         if img_df is not None and img_mlc_col and img_url_col:
             inserted = 0
             for _, row in img_df.iterrows():
@@ -689,7 +680,6 @@ def page_hojas_picking():
     conn = get_conn()
     c = conn.cursor()
 
-    # Traer OTs y piqueadores
     c.execute("""
         SELECT po.id, po.ot_code, pk.name, po.created_at
         FROM picking_ots po
@@ -712,13 +702,11 @@ def page_hojas_picking():
 
     seleccion = st.selectbox("Selecciona OT para ver/imprimir", opciones, index=0)
 
-    # Lista de OTs a mostrar
     if seleccion == "Todas las OTs":
         ots_a_mostrar = ot_rows
     else:
-        ots_a_mostrar = []
         ot_id, ot_code, picker_name, created_at = ot_map[seleccion]
-        ots_a_mostrar.append((ot_id, ot_code, picker_name, created_at))
+        ots_a_mostrar = [(ot_id, ot_code, picker_name, created_at)]
 
     st.write("Estas son las hojas de picking que puedes imprimir o descargar en PDF.")
 
@@ -729,7 +717,6 @@ def page_hojas_picking():
         st.subheader(f"OT: {ot_code} – Piqueador: {picker_name}")
         st.caption(f"Creada: {created_at}")
 
-        # Código de barras de la OT (si la librería está disponible)
         img_bytes = generate_barcode_bytes(ot_code)
         if img_bytes is not None:
             try:
@@ -737,10 +724,8 @@ def page_hojas_picking():
             except Exception as e:
                 st.write(f"Error generando código de barras para {ot_code}: {e}")
         else:
-            # Fallback si no hay librería de código de barras
             st.markdown(f"**Código OT:** `{ot_code}`")
 
-        # Productos de esta OT
         c.execute("""
             SELECT sku_ml,
                    COALESCE(title_tec, title_ml) AS producto,
@@ -758,7 +743,6 @@ def page_hojas_picking():
         df = pd.DataFrame(rows, columns=["SKU", "Producto", "Cantidad a pickear"])
         st.table(df)
 
-        # Guardar datos para el PDF
         items = [(r[0], r[1], r[2]) for r in rows]
         ot_data_list.append(
             {
@@ -771,7 +755,6 @@ def page_hojas_picking():
 
     conn.close()
 
-    # Si hay OTs, generar PDF para descarga
     if ot_data_list:
         pdf_bytes = build_picklist_pdf(ot_data_list)
         st.download_button(
@@ -803,7 +786,6 @@ def page_cerrar_ot():
         else:
             code = code.strip()
 
-            # Buscar la OT
             c.execute("""
                 SELECT po.id, po.picker_id, pk.name
                 FROM picking_ots po
@@ -817,7 +799,6 @@ def page_cerrar_ot():
             else:
                 ot_id, picker_id, picker_name = ot_row
 
-                # Verificar estado actual
                 c.execute("""
                     SELECT COUNT(*),
                            SUM(CASE WHEN qty_picked >= qty_total THEN 1 ELSE 0 END)
@@ -833,7 +814,6 @@ def page_cerrar_ot():
                 elif skus_completos == total_skus:
                     st.info(f"La OT {code} ya estaba completamente cerrada (todos los SKUs pickeados).")
                 else:
-                    # Marcar todos los SKUs como completamente pickeados
                     c.execute("""
                         UPDATE picking_global
                         SET qty_picked = qty_total
@@ -861,7 +841,7 @@ def main():
 
     st.sidebar.title("Aurora ML – Picking OT")
 
-    # SOLO mostramos estos 3 módulos en el menú (los demás quedan pausados)
+    # Solo estos 3 módulos visibles por ahora
     page = st.sidebar.radio(
         "Menú",
         [
@@ -881,4 +861,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
