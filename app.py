@@ -123,7 +123,7 @@ def init_db():
     if "ot_id" not in cols_pg:
         c.execute("ALTER TABLE picking_global ADD COLUMN ot_id INTEGER;")
 
-    # Crear tabla de imágenes por MLC (por si sigues usándolas en otros módulos)
+    # Crear tabla de imágenes por MLC
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_images (
         mlc_id TEXT PRIMARY KEY,
@@ -148,7 +148,7 @@ def generate_barcode_bytes(data: str):
     return rv.getvalue()
 
 
-# ---------- PDF HOJAS DE PICKING ----------
+# ---------- PDF HOJAS DE PICKING (TABLA CON CELDAS) ----------
 def build_picklist_pdf(ot_data_list):
     """
     ot_data_list: lista de dicts:
@@ -159,10 +159,24 @@ def build_picklist_pdf(ot_data_list):
         "items": [(sku, producto, qty), ...]
       }
     Devuelve bytes de un PDF con todas las OTs.
+    Cada OT en su página, con tabla de celdas bien marcadas.
     """
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
+
+    margin_left = 20 * mm
+    margin_right = 190 * mm
+    margin_top = 20 * mm
+    margin_bottom = 20 * mm
+
+    col_sku = margin_left
+    col_prod = 60 * mm
+    col_qty = 170 * mm
+    table_width = margin_right - margin_left
+
+    header_height = 8 * mm
+    row_height = 6 * mm
 
     for idx, ot in enumerate(ot_data_list):
         if idx > 0:
@@ -173,54 +187,75 @@ def build_picklist_pdf(ot_data_list):
         created_at = ot["created_at"]
         items = ot["items"]
 
-        # Encabezado
+        # Encabezado OT
         c.setFont("Helvetica-Bold", 14)
-        c.drawString(20 * mm, height - 20 * mm, f"OT: {ot_code}  –  Piqueador: {picker_name}")
+        c.drawString(margin_left, height - margin_top, f"OT: {ot_code}")
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(margin_left, height - margin_top - 6 * mm, f"Piqueador: {picker_name}")
         c.setFont("Helvetica", 10)
-        c.drawString(20 * mm, height - 26 * mm, f"Creada: {created_at}")
+        c.drawString(margin_left, height - margin_top - 11 * mm, f"Creada: {created_at}")
 
-        y = height - 40 * mm
+        # Posición inicial para el contenido bajo el encabezado (bajo todo el texto)
+        y = height - margin_top - 25 * mm  # más espacio para que el código de barras NO se cruce
 
         # Código de barras (si se puede)
         img_bytes = generate_barcode_bytes(ot_code)
         if img_bytes is not None:
             try:
                 img = ImageReader(BytesIO(img_bytes))
-                c.drawImage(img, 20 * mm, y - 20 * mm, width=60 * mm, preserveAspectRatio=True, mask='auto')
-                y -= 35 * mm
+                # Alto aprox 20 mm, ancho proporcional
+                c.drawImage(img, margin_left, y - 20 * mm, width=60 * mm, preserveAspectRatio=True, mask='auto')
+                y -= 32 * mm  # bajar más para que quede espacio después del código
             except Exception:
                 y -= 10 * mm
         else:
-            y -= 10 * mm
+            y -= 5 * mm
 
-        # Tabla simple de SKUs
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(20 * mm, y, "SKU")
-        c.drawString(60 * mm, y, "Producto")
-        c.drawString(170 * mm, y, "Cant.")
-        y -= 6 * mm
-        c.line(20 * mm, y, 190 * mm, y)
-        y -= 4 * mm
+        def draw_header_row(y_top):
+            """Dibuja la fila de header con bordes."""
+            c.setFont("Helvetica-Bold", 9)
+            # Rectángulo del header completo
+            c.rect(margin_left, y_top - header_height, table_width, header_height, stroke=1, fill=0)
+            # Líneas verticales de columnas
+            c.line(col_prod, y_top - header_height, col_prod, y_top)
+            c.line(col_qty, y_top - header_height, col_qty, y_top)
+            # Textos
+            c.drawString(col_sku + 2 * mm, y_top - header_height + 2 * mm, "SKU")
+            c.drawString(col_prod + 2 * mm, y_top - header_height + 2 * mm, "Producto")
+            c.drawString(col_qty + 2 * mm, y_top - header_height + 2 * mm, "Cant.")
+            return y_top - header_height
+
+        # Dibuja header de tabla
+        y = draw_header_row(y)
 
         c.setFont("Helvetica", 9)
 
         for sku, producto, qty in items:
-            if y < 20 * mm:  # salto de página si no cabe
+            # ¿Cabe una fila más?
+            if y - row_height < margin_bottom:
+                # Página nueva para seguir con la MISMA OT (sin repetir barcode, solo texto)
                 c.showPage()
-                y = height - 20 * mm
-                c.setFont("Helvetica-Bold", 10)
-                c.drawString(20 * mm, y, "SKU")
-                c.drawString(60 * mm, y, "Producto")
-                c.drawString(170 * mm, y, "Cant.")
-                y -= 6 * mm
-                c.line(20 * mm, y, 190 * mm, y)
-                y -= 4 * mm
+                c.setFont("Helvetica-Bold", 12)
+                c.drawString(margin_left, height - margin_top, f"OT: {ot_code} (continuación)")
+                c.setFont("Helvetica", 10)
+                c.drawString(margin_left, height - margin_top - 6 * mm, f"Piqueador: {picker_name}")
+                y = height - margin_top - 12 * mm
+                y = draw_header_row(y)
                 c.setFont("Helvetica", 9)
 
-            c.drawString(20 * mm, y, str(sku)[:20])
-            c.drawString(60 * mm, y, str(producto)[:80])
-            c.drawRightString(185 * mm, y, str(qty))
-            y -= 5 * mm
+            # Dibujar rectángulo de la fila
+            y_row_bottom = y - row_height
+            c.rect(margin_left, y_row_bottom, table_width, row_height, stroke=1, fill=0)
+            # Líneas verticales columnas
+            c.line(col_prod, y_row_bottom, col_prod, y)
+            c.line(col_qty, y_row_bottom, col_qty, y)
+
+            # Textos dentro de la celda (con pequeño margen)
+            c.drawString(col_sku + 2 * mm, y_row_bottom + 2 * mm, str(sku)[:20])
+            c.drawString(col_prod + 2 * mm, y_row_bottom + 2 * mm, str(producto)[:80])
+            c.drawRightString(col_qty + (margin_right - col_qty) - 2 * mm, y_row_bottom + 2 * mm, str(qty))
+
+            y = y_row_bottom  # bajar
 
     c.save()
     pdf_bytes = buf.getvalue()
@@ -228,11 +263,16 @@ def build_picklist_pdf(ot_data_list):
     return pdf_bytes
 
 
-# ---------- PARSER MANIFIESTO PDF ----------
+# ---------- PARSER MANIFIESTO PDF (más tolerante) ----------
 def parse_manifest_pdf(uploaded_file):
     """
     Lee un PDF de manifiesto con etiquetas y devuelve un DataFrame con columnas:
     ml_order_id, buyer, sku_ml, mlc_id (None), title_ml (''), qty.
+
+    Más tolerante en:
+      - "Venta:", "Venta N°", "Venta " (busca la palabra 'Venta')
+      - "SKU:", "SKU " (busca 'SKU')
+      - "Cantidad:", "Cantidad " (busca 'Cantidad')
     """
     if not HAS_PDF_LIB:
         raise RuntimeError(
@@ -254,35 +294,44 @@ def parse_manifest_pdf(uploaded_file):
             current_sku = None
 
             for line in lines:
+                raw_line = line
                 line = line.strip()
                 if not line:
                     continue
 
-                # Ej: "Venta: 2000014009097738"
-                if line.startswith("Venta:"):
-                    current_order_id = line.split("Venta:")[1].strip()
-                    current_buyer = None
-                    next_is_buyer = True
-                    current_sku = None
-                    continue
+                # ---- Venta ----
+                # Aceptamos líneas que contengan la palabra "Venta"
+                if "Venta" in line:
+                    parts = line.split("Venta", 1)
+                    tail = parts[1].strip(" :#.-")
+                    if tail:  # si hay algo después de "Venta"
+                        current_order_id = tail
+                        current_buyer = None
+                        next_is_buyer = True
+                        current_sku = None
+                        continue
 
-                # La línea siguiente después de "Venta:" es el comprador
+                # La línea siguiente después de la venta suele ser el comprador
                 if next_is_buyer and current_order_id:
                     current_buyer = line.strip()
                     next_is_buyer = False
                     continue
 
-                # Ej: "SKU: 2444103"
-                if line.startswith("SKU:") and current_order_id:
-                    current_sku = line.split("SKU:")[1].strip()
-                    continue
+                # ---- SKU ----
+                if "SKU" in line and current_order_id:
+                    parts = line.split("SKU", 1)
+                    sku_tail = parts[1].strip(" :#.-")
+                    if sku_tail:
+                        current_sku = sku_tail
+                        continue
 
-                # Ej: "Cantidad: 1"
-                if line.startswith("Cantidad:") and current_order_id and current_sku:
-                    qty_part = line.split("Cantidad:")[1].strip()
+                # ---- Cantidad ----
+                if "Cantidad" in line and current_order_id and current_sku:
+                    parts = line.split("Cantidad", 1)
+                    qty_tail = parts[1].strip(" :#.-")
                     try:
-                        qty = int(qty_part.split()[0])
-                    except ValueError:
+                        qty = int(qty_tail.split()[0])
+                    except Exception:
                         continue
 
                     records.append(
@@ -299,114 +348,18 @@ def parse_manifest_pdf(uploaded_file):
                     continue
 
     if not records:
+        # Devolvemos DF vacío y el llamador se encarga del error
         return pd.DataFrame(
             columns=["ml_order_id", "buyer", "sku_ml", "mlc_id", "title_ml", "qty"]
         )
+
     return pd.DataFrame(records)
 
 
-# ---------- PÁGINA: ADMIN ----------
+# ---------- PÁGINA: ADMIN (pausado, no se muestra en menú) ----------
 def page_admin():
-    st.header("Panel de administrador")
-
-    # Login simple de admin
-    if not st.session_state.get("admin_authenticated", False):
-        st.info("Ingresa la clave de administrador para acceder a las opciones avanzadas.")
-        pwd = st.text_input("Clave de administrador", type="password")
-        if st.button("Entrar como administrador"):
-            if pwd == ADMIN_PASSWORD:
-                st.session_state["admin_authenticated"] = True
-                st.success("Sesión de administrador iniciada.")
-                st.rerun()
-            else:
-                st.error("Clave incorrecta.")
-        return
-
-    st.success("Estás en modo administrador.")
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    # Resumen rápido del sistema
-    st.subheader("Resumen del sistema")
-
-    c.execute("SELECT COUNT(*) FROM orders;")
-    total_orders = c.fetchone()[0] or 0
-
-    c.execute("SELECT COUNT(*) FROM order_items;")
-    total_items = c.fetchone()[0] or 0
-
-    c.execute("SELECT COUNT(*) FROM picking_global;")
-    total_skus = c.fetchone()[0] or 0
-
-    c.execute("SELECT COALESCE(SUM(qty_total), 0), COALESCE(SUM(qty_picked), 0) FROM picking_global;")
-    total_qty, total_picked = c.fetchone()
-    total_qty = total_qty or 0
-    total_picked = total_picked or 0
-    avance = 0
-    if total_qty > 0:
-        avance = round((total_picked / total_qty) * 100, 1)
-
-    c.execute("SELECT COUNT(*) FROM packages_scan;")
-    total_packages_scanned = c.fetchone()[0] or 0
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Pedidos cargados", total_orders)
-    col2.metric("Líneas de ítems", total_items)
-    col3.metric("SKUs en picking", total_skus)
-    col4.metric("Paquetes escaneados", total_packages_scanned)
-
-    st.metric("Avance global de picking", f"{avance} %", help="Unidades pickeadas / unidades totales del día")
-
-    st.markdown("---")
-    st.subheader("Acciones de administración")
-
-    col_a, col_b, col_c = st.columns(3)
-
-    # Resetear solo cantidades pickeadas
-    with col_a:
-        st.write("**Resetear SOLO picking (qty_picked = 0)**")
-        st.caption("No borra pedidos ni ítems, solo deja todas las cantidades pickeadas en 0.")
-        if st.button("Resetear cantidades pickeadas"):
-            c.execute("UPDATE picking_global SET qty_picked = 0;")
-            conn.commit()
-            st.success("Se reiniciaron todas las cantidades pickeadas.")
-
-    # Resetear solo paquetes
-    with col_b:
-        st.write("**Resetear SOLO paquetes (tracking)**")
-        st.caption("Borra todos los códigos escaneados, pero mantiene pedidos e ítems.")
-        if st.button("Resetear paquetes escaneados"):
-            c.execute("DELETE FROM packages_scan;")
-            conn.commit()
-            st.warning("Se borraron todos los paquetes escaneados.")
-
-    # Resetear TODO
-    with col_c:
-        st.write("**Resetear TODO el sistema**")
-        st.caption("Borra pedidos, ítems, picking, OTs, imágenes y paquetes. Úsalo solo al cambiar de ciclo o en pruebas.")
-        confirm = st.checkbox("Confirmo que quiero borrar TODOS los datos", key="confirm_reset_all")
-        if st.button("BORRAR TODO (sistema completo)"):
-            if confirm:
-                c.execute("DELETE FROM order_items;")
-                c.execute("DELETE FROM orders;")
-                c.execute("DELETE FROM picking_global;")
-                c.execute("DELETE FROM packages_scan;")
-                c.execute("DELETE FROM sku_images;")
-                c.execute("DELETE FROM pickers;")
-                c.execute("DELETE FROM picking_ots;")
-                conn.commit()
-                st.warning("Se borraron TODOS los datos del sistema.")
-            else:
-                st.error("Marca la casilla de confirmación antes de borrar todo.")
-
-    st.markdown("---")
-    if st.button("Cerrar sesión de administrador"):
-        st.session_state["admin_authenticated"] = False
-        st.success("Sesión de administrador cerrada.")
-        st.rerun()
-
-    conn.close()
+    st.header("Panel de administrador (PAUSADO)")
+    st.info("Este módulo está oculto del menú por ahora.")
 
 
 # ---------- PÁGINA: IMPORTAR VENTAS (EXCEL / PDF) ----------
@@ -892,130 +845,13 @@ def page_cerrar_ot():
                         f"{total_skus} SKUs marcados como pickeados."
                     )
 
-    st.markdown("---")
-    st.subheader("Resumen de OTs")
-
-    c.execute("""
-        SELECT po.ot_code,
-               pk.name,
-               COUNT(pg.id) AS skus_total,
-               SUM(CASE WHEN pg.qty_picked >= pg.qty_total THEN 1 ELSE 0 END) AS skus_completos
-        FROM picking_ots po
-        JOIN pickers pk ON pk.id = po.picker_id
-        LEFT JOIN picking_global pg ON pg.ot_id = po.id
-        GROUP BY po.id
-        ORDER BY po.id
-    """)
-    resumen = c.fetchall()
     conn.close()
 
-    if resumen:
-        df_res = pd.DataFrame(
-            resumen,
-            columns=["OT", "Piqueador", "SKUs totales", "SKUs completos"]
-        )
-        st.table(df_res)
-    else:
-        st.write("No hay OTs para mostrar.")
 
-
-# ---------- PÁGINA: CONTEO FINAL ----------
+# ---------- PÁGINA: CONTEO FINAL (pausada, no se muestra en menú) ----------
 def page_conteo_final():
-    st.header("4) Conteo final de paquetes (tracking / número de venta)")
-
-    st.write("""
-    Después de embalar y etiquetar, en la zona de despacho
-    escanea una sola vez el **número de venta de Mercado Libre** (o el código que uses
-    en la etiqueta) para marcar ese pedido como contado.
-    """)
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    # Pedidos esperados
-    c.execute("SELECT DISTINCT ml_order_id FROM orders;")
-    orders_all = [row[0] for row in c.fetchall()]
-    expected_orders = len(orders_all)
-
-    # Paquetes escaneados
-    c.execute("SELECT DISTINCT tracking_code FROM packages_scan;")
-    scanned_codes = [row[0] for row in c.fetchall()]
-    scanned_packages = len(scanned_codes)
-
-    st.subheader("Resumen")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Pedidos (ventas ML)", expected_orders)
-    col2.metric("Pedidos escaneados", scanned_packages)
-    diff = scanned_packages - expected_orders
-    col3.metric("Diferencia (escaneados - pedidos)", diff)
-
-    st.markdown("---")
-    st.subheader("Escanear número de venta / tracking")
-
-    tracking = st.text_input(
-        "Escanee o escriba el **número de venta de ML** (o código que uses para identificar el pedido)",
-        key="scan_tracking"
-    )
-
-    col4, col5 = st.columns(2)
-    with col4:
-        if st.button("Registrar paquete"):
-            if not tracking:
-                st.warning("Escanee o escriba un número de venta primero.")
-            else:
-                c.execute("SELECT COUNT(*) FROM packages_scan WHERE tracking_code = ?;", (tracking,))
-                exists = c.fetchone()[0]
-                if exists:
-                    st.error("Este código ya fue escaneado antes (pedido duplicado).")
-                else:
-                    c.execute("""
-                        INSERT INTO packages_scan (tracking_code, scanned_at)
-                        VALUES (?, ?)
-                    """, (tracking, datetime.now().isoformat()))
-                    conn.commit()
-                    st.success(f"Código {tracking} registrado como escaneado.")
-
-    with col5:
-        if st.button("Resetear conteo de paquetes del día"):
-            c.execute("DELETE FROM packages_scan;")
-            conn.commit()
-            st.warning("Se borraron todos los pedidos escaneados del día.")
-
-    st.markdown("---")
-    st.subheader("Pedidos que **faltan** por escanear")
-
-    scanned_set = set(scanned_codes)
-
-    missing_orders = []
-    c.execute("SELECT id, ml_order_id, buyer FROM orders;")
-    for order_id, ml_order_id, buyer in c.fetchall():
-        if ml_order_id not in scanned_set:
-            missing_orders.append((order_id, ml_order_id, buyer))
-
-    if not missing_orders:
-        st.success("Todos los pedidos están escaneados. 🎉")
-    else:
-        st.warning(f"Faltan {len(missing_orders)} pedidos por escanear.")
-        for order_id, ml_order_id, buyer in missing_orders:
-            with st.expander(f"Venta {ml_order_id} · Cliente: {buyer}"):
-                c.execute("""
-                    SELECT sku_ml,
-                           COALESCE(title_tec, title_ml) AS nombre_producto,
-                           qty
-                    FROM order_items
-                    WHERE order_id = ?
-                """, (order_id,))
-                rows_items = c.fetchall()
-                if rows_items:
-                    df_items = pd.DataFrame(
-                        rows_items,
-                        columns=["SKU", "Producto", "Cantidad"]
-                    )
-                    st.table(df_items)
-                else:
-                    st.write("Sin líneas de productos registradas para este pedido.")
-
-    conn.close()
+    st.header("Conteo final (PAUSADO)")
+    st.info("Este módulo está oculto del menú por ahora.")
 
 
 # ---------- MAIN ----------
@@ -1024,14 +860,14 @@ def main():
     init_db()
 
     st.sidebar.title("Aurora ML – Picking OT")
+
+    # SOLO mostramos estos 3 módulos en el menú (los demás quedan pausados)
     page = st.sidebar.radio(
         "Menú",
         [
             "1) Importar ventas",
             "2) Hojas de picking (papel por OT)",
             "3) Cerrar OT (escaneo)",
-            "4) Conteo final paquetes",
-            "5) Admin",
         ],
     )
 
@@ -1041,11 +877,8 @@ def main():
         page_hojas_picking()
     elif page.startswith("3"):
         page_cerrar_ot()
-    elif page.startswith("4"):
-        page_conteo_final()
-    elif page.startswith("5"):
-        page_admin()
 
 
 if __name__ == "__main__":
     main()
+
