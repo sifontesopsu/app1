@@ -3,9 +3,9 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 from io import BytesIO
-import re  # para parsing del PDF
+import re  # para parsing PDF y detección de columnas numéricas
 
-# ========= CÓDIGOS DE BARRAS (SIN INTEGRACIONES EXTERNAS) =========
+# ========= CÓDIGOS DE BARRAS =========
 HAS_BARCODE_LIB = False
 try:
     from barcode import Code128
@@ -28,7 +28,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 
 DB_NAME = "aurora_ml.db"
-ADMIN_PASSWORD = "aurora123"  # 🔐 CAMBIA ESTA CLAVE A LA QUE QUIERAS
+ADMIN_PASSWORD = "aurora123"  # 🔐 cámbiala si quieres
 
 
 # ---------- HELPERS DB ----------
@@ -63,7 +63,7 @@ def init_db():
     );
     """)
 
-    # Picking global por SKU / MLC (incluye picker_id y ot_id)
+    # Picking global por SKU / MLC
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_global (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +78,7 @@ def init_db():
     );
     """)
 
-    # Paquetes escaneados en conteo final (no usados ahora, pero dejamos la tabla)
+    # Escaneos finales (no usados ahora, pero dejamos la tabla)
     c.execute("""
     CREATE TABLE IF NOT EXISTS packages_scan (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +95,7 @@ def init_db():
     );
     """)
 
-    # Tabla de OTs de picking (una por piqueador por corrida)
+    # OTs de picking
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_ots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,7 +146,7 @@ def generate_barcode_bytes(data: str):
     return rv.getvalue()
 
 
-# ---------- PDF HOJAS DE PICKING (TABLA CON CELDAS) ----------
+# ---------- PDF HOJAS DE PICKING ----------
 def build_picklist_pdf(ot_data_list):
     """
     ot_data_list: lista de dicts:
@@ -191,7 +191,6 @@ def build_picklist_pdf(ot_data_list):
         c.setFont("Helvetica", 10)
         c.drawString(margin_left, height - margin_top - 11 * mm, f"Creada: {created_at}")
 
-        # Posición inicial para contenido
         y = height - margin_top - 25 * mm
 
         # Código de barras
@@ -255,17 +254,11 @@ def build_picklist_pdf(ot_data_list):
     return pdf_bytes
 
 
-# ---------- PARSER MANIFIESTO PDF (robusto, multi-página) ----------
+# ---------- PARSER MANIFIESTO PDF ----------
 def parse_manifest_pdf(uploaded_file):
     """
-    Devuelve un DataFrame con:
+    Devuelve DataFrame:
       ml_order_id, buyer, sku_ml, mlc_id(None), title_ml(''), qty
-
-    Lógica:
-      - Recorre todas las páginas.
-      - Cada vez que ve "Cantidad: X", mira hacia arriba (hasta 10 líneas)
-        y busca el SKU y la Venta más cercanos.
-      - El buyer se toma como la primera línea "de texto normal" entre Venta y Cantidad.
     """
     if not HAS_PDF_LIB:
         raise RuntimeError(
@@ -302,12 +295,10 @@ def parse_manifest_pdf(uploaded_file):
                 # Buscar hacia arriba SKU y Venta
                 for j in range(i - 1, start - 1, -1):
                     l = lines[j]
-
                     if sku is None and "SKU" in l:
                         m_sku = re.search(r"SKU\s*[:#]?\s*([0-9A-Za-z.\-]+)", l)
                         if m_sku:
                             sku = m_sku.group(1).strip()
-
                     if order is None and "Venta" in l:
                         m_ord = re.search(r"Venta\s*[:#]?\s*([0-9]+)", l)
                         if m_ord:
@@ -316,7 +307,7 @@ def parse_manifest_pdf(uploaded_file):
                 if not (order and sku):
                     continue
 
-                # Buscar buyer entre la línea de Venta y la de Cantidad
+                # Buyer entre Venta y Cantidad
                 venta_idx = None
                 for k in range(start, i):
                     if "Venta" in lines[k]:
@@ -327,9 +318,11 @@ def parse_manifest_pdf(uploaded_file):
                     for k in range(venta_idx + 1, i):
                         cand = lines[k].strip()
                         low = cand.lower()
-                        if any(tok in low for tok in ["venta", "sku", "pack id", "cantidad",
-                                                      "código carrier", "firma carrier",
-                                                      "fecha y hora de retiro"]):
+                        if any(tok in low for tok in [
+                            "venta", "sku", "pack id", "cantidad",
+                            "código carrier", "firma carrier",
+                            "fecha y hora de retiro"
+                        ]):
                             continue
                         if re.fullmatch(r"[0-9 .:/-]+", cand):
                             continue
@@ -355,13 +348,74 @@ def parse_manifest_pdf(uploaded_file):
     return pd.DataFrame(records)
 
 
-# ---------- PÁGINA: ADMIN (pausada) ----------
+# ---------- PÁGINA ADMIN ----------
 def page_admin():
-    st.header("Panel de administrador (PAUSADO)")
-    st.info("Este módulo está oculto del menú por ahora.")
+    st.header("4) Panel administrador")
+
+    pwd = st.text_input("Contraseña de administrador", type="password")
+    if pwd != ADMIN_PASSWORD:
+        st.info("Ingresa la contraseña para ver las opciones de administración.")
+        return
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    # KPIs básicos
+    c.execute("SELECT COUNT(*), COALESCE(SUM(qty),0) FROM order_items;")
+    total_lineas, total_unidades = c.fetchone()
+
+    c.execute("SELECT COUNT(DISTINCT sku_ml) FROM order_items;")
+    total_skus = c.fetchone()[0] or 0
+
+    c.execute("SELECT COALESCE(SUM(qty_total),0), COALESCE(SUM(qty_picked),0) FROM picking_global;")
+    total_picking, total_picked = c.fetchone()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Órdenes / líneas", total_lineas)
+    col2.metric("SKUs distintos", total_skus)
+    col3.metric("Unidades picking vs pickeadas", f"{total_picked}/{total_picking}")
+
+    # Estado de OTs
+    st.subheader("OTs de picking y estado")
+    c.execute("""
+        SELECT po.id,
+               po.ot_code,
+               COALESCE(pk.name, '—') AS picker,
+               po.created_at,
+               COUNT(pg.id) AS skus_totales,
+               SUM(CASE WHEN pg.qty_picked >= pg.qty_total THEN 1 ELSE 0 END) AS skus_completos
+        FROM picking_ots po
+        LEFT JOIN pickers pk ON pk.id = po.picker_id
+        LEFT JOIN picking_global pg ON pg.ot_id = po.id
+        GROUP BY po.id, po.ot_code, pk.name, po.created_at
+        ORDER BY po.id;
+    """)
+    rows = c.fetchall()
+    if rows:
+        df_ots = pd.DataFrame(
+            rows,
+            columns=[
+                "ID OT", "Código OT", "Piqueador",
+                "Creada", "SKUs totales", "SKUs completos"
+            ],
+        )
+        st.dataframe(df_ots)
+    else:
+        st.info("No hay OTs generadas en esta base.")
+
+    st.subheader("Acciones sobre picking actual")
+    if st.button("Reiniciar picking actual (mantiene ventas históricas)"):
+        c.execute("DELETE FROM picking_global;")
+        c.execute("DELETE FROM packages_scan;")
+        c.execute("DELETE FROM pickers;")
+        c.execute("DELETE FROM sku_images;")
+        c.execute("DELETE FROM picking_ots;")
+        conn.commit()
+        st.success("Picking actual reiniciado. Las ventas (orders y order_items) se mantienen.")
+    conn.close()
 
 
-# ---------- PÁGINA: IMPORTAR VENTAS ----------
+# ---------- PÁGINA IMPORTAR VENTAS ----------
 def page_import_ml():
     st.header("1) Importar ventas")
 
@@ -381,7 +435,7 @@ def page_import_ml():
 
     st.markdown("### Maestro de SKUs y nombres técnicos (opcional, recomendado)")
     inv_file = st.file_uploader(
-        "Archivo maestro de inventario (.xlsx) con columnas 'SKU' y 'Artículo'",
+        "Archivo maestro de inventario (.xlsx) (puede ser LibroInventario o maestro sku)",
         type=["xlsx"],
         key="inv_uploader",
     )
@@ -527,18 +581,68 @@ def page_import_ml():
     inv_map = {}
     if inv_file is not None:
         try:
-            inv_df = pd.read_excel(inv_file)
-            cols_inv = inv_df.columns.tolist()
-            if "SKU" in cols_inv and "Artículo" in cols_inv:
-                inv_df = inv_df.dropna(subset=["SKU", "Artículo"])
-                for _, row in inv_df.iterrows():
-                    sku_key = str(row["SKU"]).strip()
-                    art = str(row["Artículo"]).strip()
-                    if sku_key:
-                        inv_map[sku_key] = art
-                st.success(f"Maestro de inventario cargado ({len(inv_map)} SKUs con nombre técnico).")
+            used_map = False
+
+            # 1) Intento con encabezados normales (LibroInventario)
+            inv_df_h = pd.read_excel(inv_file)
+            cols = inv_df_h.columns.tolist()
+            lower = [str(c).strip().lower() for c in cols]
+
+            if "sku" in lower:
+                sku_col = cols[lower.index("sku")]
+                desc_col = None
+                for cand in ["artículo", "articulo", "descripcion", "descripción",
+                             "nombre", "producto", "detalle"]:
+                    if cand in lower:
+                        desc_col = cols[lower.index(cand)]
+                        break
+                if desc_col is not None:
+                    tmp = inv_df_h[[sku_col, desc_col]].dropna()
+                    for _, row in tmp.iterrows():
+                        sku_key = str(row[sku_col]).strip()
+                        art = str(row[desc_col]).strip()
+                        if sku_key:
+                            inv_map[sku_key] = art
+                    used_map = True
+
+            # 2) Si no funcionó, intento genérico tipo "maestro sku" (2 columnas sin header)
+            if not used_map:
+                inv_df_raw = pd.read_excel(inv_file, header=None)
+                if inv_df_raw.shape[1] >= 2:
+                    colA, colB = inv_df_raw.columns[0], inv_df_raw.columns[1]
+                    sample = inv_df_raw.head(200)
+
+                    def numeric_score(series):
+                        score = 0
+                        for val in series:
+                            s = str(val).strip()
+                            if re.fullmatch(r"\d{4,}", s):
+                                score += 1
+                        return score
+
+                    scoreA = numeric_score(sample[colA])
+                    scoreB = numeric_score(sample[colB])
+
+                    if scoreA == 0 and scoreB == 0:
+                        raise ValueError("No se detectó columna de SKU numérico en el maestro.")
+
+                    if scoreA >= scoreB:
+                        sku_col, desc_col = colA, colB
+                    else:
+                        sku_col, desc_col = colB, colA
+
+                    inv_df_raw = inv_df_raw.dropna(subset=[sku_col, desc_col])
+                    for _, row in inv_df_raw.iterrows():
+                        sku_key = str(row[sku_col]).strip()
+                        art = str(row[desc_col]).strip()
+                        if sku_key:
+                            inv_map[sku_key] = art
+                    used_map = True
+
+            if used_map:
+                st.success(f"Maestro de inventario cargado ({len(inv_map)} SKUs con nombre técnico/packs).")
             else:
-                st.warning("El maestro no tiene columnas 'SKU' y 'Artículo'. Se continuará sin nombres técnicos.")
+                st.warning("No se pudo interpretar el maestro de SKUs. Se continuará sin nombres técnicos.")
         except Exception as e:
             st.warning(f"No se pudo leer el maestro de inventario: {e}")
 
@@ -547,7 +651,7 @@ def page_import_ml():
         conn = get_conn()
         c = conn.cursor()
 
-        # Limpiar solo parte operativa de picking
+        # Limpiar solo picking actual
         c.execute("DELETE FROM picking_global;")
         c.execute("DELETE FROM packages_scan;")
         c.execute("DELETE FROM pickers;")
@@ -591,7 +695,7 @@ def page_import_ml():
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (order_id, sku, mlc_id, title_ml, title_tec, qty))
 
-        # Generar picking_global agrupado por SKU
+        # Generar picking_global agrupado
         c.execute("""
             SELECT sku_ml, mlc_id, title_ml, title_tec, SUM(qty) as total
             FROM order_items
@@ -664,7 +768,7 @@ def page_import_ml():
         st.info("Las ventas anteriores se mantienen en la base de datos para trazabilidad. Solo se reinició el picking de esta corrida.")
 
 
-# ---------- PÁGINA: HOJAS DE PICKING ----------
+# ---------- PÁGINA HOJAS DE PICKING ----------
 def page_hojas_picking():
     st.header("2) Hojas de picking (papel por OT)")
 
@@ -756,7 +860,7 @@ def page_hojas_picking():
         )
 
 
-# ---------- PÁGINA: CERRAR OT ----------
+# ---------- PÁGINA CERRAR OT ----------
 def page_cerrar_ot():
     st.header("3) Cerrar OT (escaneo único por piqueador)")
 
@@ -831,6 +935,7 @@ def main():
             "1) Importar ventas",
             "2) Hojas de picking (papel por OT)",
             "3) Cerrar OT (escaneo)",
+            "4) Panel administrador",
         ],
     )
 
@@ -840,6 +945,8 @@ def main():
         page_hojas_picking()
     elif page.startswith("3"):
         page_cerrar_ot()
+    elif page.startswith("4"):
+        page_admin()
 
 
 if __name__ == "__main__":
