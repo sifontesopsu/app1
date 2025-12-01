@@ -3,7 +3,7 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 from io import BytesIO
-import re  # para parsing PDF y detección de columnas numéricas
+import re  # para parsing PDF y normalizar SKUs
 
 # ========= CÓDIGOS DE BARRAS =========
 HAS_BARCODE_LIB = False
@@ -29,6 +29,30 @@ from reportlab.lib.utils import ImageReader
 
 DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # 🔐 cámbiala si quieres
+
+
+# ---------- NORMALIZAR SKU ----------
+def normalize_sku(value) -> str:
+    """
+    Normaliza un SKU para que maestro y ventas calcen:
+      - Convierte a string
+      - Quita espacios
+      - Elimina sufijo '.0'
+      - Convierte notación científica a entero (si aplica)
+    """
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    # quitar .0 típico de floats
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    # notación científica (ej: 1.80201401001E11)
+    if re.fullmatch(r"\d+(\.\d+)?[eE][+-]?\d+", s):
+        try:
+            s = str(int(float(s)))
+        except Exception:
+            pass
+    return s
 
 
 # ---------- HELPERS DB ----------
@@ -78,7 +102,7 @@ def init_db():
     );
     """)
 
-    # Escaneos finales (no usados ahora, pero dejamos la tabla)
+    # Escaneos finales (no usados ahora)
     c.execute("""
     CREATE TABLE IF NOT EXISTS packages_scan (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +111,7 @@ def init_db():
     );
     """)
 
-    # Tabla de piqueadores
+    # Piqueadores
     c.execute("""
     CREATE TABLE IF NOT EXISTS pickers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +119,7 @@ def init_db():
     );
     """)
 
-    # OTs de picking
+    # OTs
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_ots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,15 +172,6 @@ def generate_barcode_bytes(data: str):
 
 # ---------- PDF HOJAS DE PICKING ----------
 def build_picklist_pdf(ot_data_list):
-    """
-    ot_data_list: lista de dicts:
-      {
-        "ot_code": str,
-        "picker_name": str,
-        "created_at": str,
-        "items": [(sku, producto, qty), ...]
-      }
-    """
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -256,10 +271,6 @@ def build_picklist_pdf(ot_data_list):
 
 # ---------- PARSER MANIFIESTO PDF ----------
 def parse_manifest_pdf(uploaded_file):
-    """
-    Devuelve DataFrame:
-      ml_order_id, buyer, sku_ml, mlc_id(None), title_ml(''), qty
-    """
     if not HAS_PDF_LIB:
         raise RuntimeError(
             "La librería pdfplumber no está instalada. "
@@ -298,7 +309,7 @@ def parse_manifest_pdf(uploaded_file):
                     if sku is None and "SKU" in l:
                         m_sku = re.search(r"SKU\s*[:#]?\s*([0-9A-Za-z.\-]+)", l)
                         if m_sku:
-                            sku = m_sku.group(1).strip()
+                            sku = normalize_sku(m_sku.group(1))
                     if order is None and "Venta" in l:
                         m_ord = re.search(r"Venta\s*[:#]?\s*([0-9]+)", l)
                         if m_ord:
@@ -360,7 +371,6 @@ def page_admin():
     conn = get_conn()
     c = conn.cursor()
 
-    # KPIs básicos
     c.execute("SELECT COUNT(*), COALESCE(SUM(qty),0) FROM order_items;")
     total_lineas, total_unidades = c.fetchone()
 
@@ -375,7 +385,6 @@ def page_admin():
     col2.metric("SKUs distintos", total_skus)
     col3.metric("Unidades picking vs pickeadas", f"{total_picked}/{total_picking}")
 
-    # Estado de OTs
     st.subheader("OTs de picking y estado")
     c.execute("""
         SELECT po.id,
@@ -388,7 +397,7 @@ def page_admin():
         LEFT JOIN pickers pk ON pk.id = po.picker_id
         LEFT JOIN picking_global pg ON pg.ot_id = po.id
         GROUP BY po.id, po.ot_code, pk.name, po.created_at
-        ORDER BY po.id;
+        ORDER BY po.ot_code;
     """)
     rows = c.fetchall()
     if rows:
@@ -435,7 +444,7 @@ def page_import_ml():
 
     st.markdown("### Maestro de SKUs y nombres técnicos (opcional, recomendado)")
     inv_file = st.file_uploader(
-        "Archivo maestro de inventario (.xlsx) (puede ser LibroInventario o maestro sku)",
+        "Archivo maestro de inventario (.xlsx) (LibroInventario o maestro sku)",
         type=["xlsx"],
         key="inv_uploader",
     )
@@ -551,6 +560,9 @@ def page_import_ml():
             st.error("Después de limpiar las cantidades, no quedó ninguna línea con qty > 0.")
             st.stop()
 
+        # Normalizar SKUs de ventas
+        work_df["sku_ml"] = work_df["sku_ml"].apply(normalize_sku)
+
         sales_df = work_df[["ml_order_id", "buyer", "sku_ml", "mlc_id", "title_ml", "qty"]].copy()
         st.subheader("Vista previa (ventas procesadas)")
         st.dataframe(sales_df.head())
@@ -574,17 +586,20 @@ def page_import_ml():
             st.error("No se encontraron ventas válidas en el PDF.")
             st.stop()
 
+        # Normalizar SKUs por si acaso
+        sales_df["sku_ml"] = sales_df["sku_ml"].apply(normalize_sku)
+
         st.subheader("Vista previa de ventas detectadas en PDF")
         st.dataframe(sales_df.head())
 
-    # ---- Maestro de inventario: mapa SKU -> nombre técnico ----
+    # ---- Maestro de inventario: mapa SKU -> nombre técnico/packs ----
     inv_map = {}
     if inv_file is not None:
         try:
             used_map = False
 
             # 1) Intento con encabezados normales (LibroInventario)
-            inv_df_h = pd.read_excel(inv_file)
+            inv_df_h = pd.read_excel(inv_file, dtype=str)
             cols = inv_df_h.columns.tolist()
             lower = [str(c).strip().lower() for c in cols]
 
@@ -599,7 +614,7 @@ def page_import_ml():
                 if desc_col is not None:
                     tmp = inv_df_h[[sku_col, desc_col]].dropna()
                     for _, row in tmp.iterrows():
-                        sku_key = str(row[sku_col]).strip()
+                        sku_key = normalize_sku(row[sku_col])
                         art = str(row[desc_col]).strip()
                         if sku_key:
                             inv_map[sku_key] = art
@@ -607,7 +622,7 @@ def page_import_ml():
 
             # 2) Si no funcionó, intento genérico tipo "maestro sku" (2 columnas sin header)
             if not used_map:
-                inv_df_raw = pd.read_excel(inv_file, header=None)
+                inv_df_raw = pd.read_excel(inv_file, header=None, dtype=str)
                 if inv_df_raw.shape[1] >= 2:
                     colA, colB = inv_df_raw.columns[0], inv_df_raw.columns[1]
                     sample = inv_df_raw.head(200)
@@ -615,7 +630,7 @@ def page_import_ml():
                     def numeric_score(series):
                         score = 0
                         for val in series:
-                            s = str(val).strip()
+                            s = normalize_sku(val)
                             if re.fullmatch(r"\d{4,}", s):
                                 score += 1
                         return score
@@ -633,7 +648,7 @@ def page_import_ml():
 
                     inv_df_raw = inv_df_raw.dropna(subset=[sku_col, desc_col])
                     for _, row in inv_df_raw.iterrows():
-                        sku_key = str(row[sku_col]).strip()
+                        sku_key = normalize_sku(row[sku_col])
                         art = str(row[desc_col]).strip()
                         if sku_key:
                             inv_map[sku_key] = art
@@ -675,7 +690,7 @@ def page_import_ml():
             order_id = c.lastrowid
 
             for _, row in grupo.iterrows():
-                sku = str(row["sku_ml"]).strip()
+                sku = normalize_sku(row["sku_ml"])
                 title_ml_raw = str(row["title_ml"]) if "title_ml" in row and str(row["title_ml"]) not in ["nan"] else ""
                 mlc_id_raw = row.get("mlc_id", None)
 
@@ -722,9 +737,8 @@ def page_import_ml():
             c.execute("""
                 SELECT id FROM picking_global
                 ORDER BY 
-                    CASE WHEN title_tec IS NULL OR title_tec = '' THEN 1 ELSE 0 END,
-                    title_tec,
-                    title_ml
+                    CASE WHEN sku_ml IS NULL OR sku_ml = '' THEN 1 ELSE 0 END,
+                    sku_ml
             """)
             skus_pg = c.fetchall()
             for idx, (pg_id,) in enumerate(skus_pg):
@@ -779,7 +793,7 @@ def page_hojas_picking():
         SELECT po.id, po.ot_code, pk.name, po.created_at
         FROM picking_ots po
         JOIN pickers pk ON pk.id = po.picker_id
-        ORDER BY po.id
+        ORDER BY po.ot_code
     """)
     ot_rows = c.fetchall()
 
@@ -821,13 +835,14 @@ def page_hojas_picking():
         else:
             st.markdown(f"**Código OT:** `{ot_code}`")
 
+        # 👉 Ordenar por SKU de menor a mayor
         c.execute("""
             SELECT sku_ml,
                    COALESCE(title_tec, title_ml) AS producto,
                    qty_total
             FROM picking_global
             WHERE ot_id = ?
-            ORDER BY producto
+            ORDER BY sku_ml
         """, (ot_id,))
         rows = c.fetchall()
 
