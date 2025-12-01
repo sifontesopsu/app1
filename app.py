@@ -30,6 +30,7 @@ from reportlab.lib.utils import ImageReader
 DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cámbiala si quieres
 
+
 # ---------- NORMALIZAR SKU ----------
 def normalize_sku(value) -> str:
     """
@@ -42,8 +43,10 @@ def normalize_sku(value) -> str:
     s = str(value).strip()
     if not s or s.lower() == "nan":
         return ""
+    # quitar .0 típico de floats
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
+    # notación científica (ej: 1.80201401001E11)
     if re.fullmatch(r"\d+(\.\d+)?[eE][+-]?\d+", s):
         try:
             s = str(int(float(s)))
@@ -61,6 +64,7 @@ def init_db():
     conn = get_conn()
     c = conn.cursor()
 
+    # Pedidos ML
     c.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +74,7 @@ def init_db():
     );
     """)
 
+    # Líneas de cada pedido
     c.execute("""
     CREATE TABLE IF NOT EXISTS order_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +87,7 @@ def init_db():
     );
     """)
 
+    # Picking global por SKU / MLC
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_global (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +102,7 @@ def init_db():
     );
     """)
 
+    # Escaneos finales (no usados ahora)
     c.execute("""
     CREATE TABLE IF NOT EXISTS packages_scan (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +111,7 @@ def init_db():
     );
     """)
 
+    # Piqueadores
     c.execute("""
     CREATE TABLE IF NOT EXISTS pickers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +119,7 @@ def init_db():
     );
     """)
 
+    # OTs
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_ots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,6 +129,7 @@ def init_db():
     );
     """)
 
+    # Asegurar columnas nuevas
     c.execute("PRAGMA table_info(order_items);")
     cols_oi = [row[1] for row in c.fetchall()]
     if "mlc_id" not in cols_oi:
@@ -138,6 +148,7 @@ def init_db():
     if "ot_id" not in cols_pg:
         c.execute("ALTER TABLE picking_global ADD COLUMN ot_id INTEGER;")
 
+    # De momento no usamos imágenes, pero la tabla puede quedar creada
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_images (
         mlc_id TEXT PRIMARY KEY,
@@ -151,6 +162,7 @@ def init_db():
 
 # ---------- CÓDIGOS DE BARRAS ----------
 def generate_barcode_bytes(data: str):
+    """Genera un Code128 en memoria y devuelve los bytes de la imagen."""
     if not HAS_BARCODE_LIB:
         return None
     rv = BytesIO()
@@ -160,6 +172,15 @@ def generate_barcode_bytes(data: str):
 
 # ---------- PDF HOJAS DE PICKING ----------
 def build_picklist_pdf(ot_data_list):
+    """
+    ot_data_list: lista de dicts:
+      {
+        "ot_code": str,
+        "picker_name": str,
+        "created_at": str,
+        "items": [(sku, producto, qty), ...]
+      }
+    """
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -186,6 +207,7 @@ def build_picklist_pdf(ot_data_list):
         created_at = ot["created_at"]
         items = ot["items"]
 
+        # Encabezado
         c.setFont("Helvetica-Bold", 14)
         c.drawString(margin_left, height - margin_top, f"OT: {ot_code}")
         c.setFont("Helvetica-Bold", 11)
@@ -195,6 +217,7 @@ def build_picklist_pdf(ot_data_list):
 
         y = height - margin_top - 25 * mm
 
+        # Código de barras
         img_bytes = generate_barcode_bytes(ot_code)
         if img_bytes is not None:
             try:
@@ -242,6 +265,7 @@ def build_picklist_pdf(ot_data_list):
             c.line(col_prod, y_row_bottom, col_prod, y)
             c.line(col_qty, y_row_bottom, col_qty, y)
 
+            # Truncar producto para que no tape la cantidad
             prod_text = str(producto)
             max_len = 60
             if len(prod_text) > max_len:
@@ -264,6 +288,11 @@ def build_picklist_pdf(ot_data_list):
 
 # ---------- PARSER MANIFIESTO PDF ----------
 def parse_manifest_pdf(uploaded_file):
+    """
+    Lee el manifiesto PDF y devuelve un DataFrame con:
+    ml_order_id, buyer, sku_ml, mlc_id, title_ml, qty
+    Ahora soporta casos donde Venta + SKU + Cantidad van en una misma línea.
+    """
     if not HAS_PDF_LIB:
         raise RuntimeError(
             "La librería pdfplumber no está instalada. "
@@ -280,9 +309,11 @@ def parse_manifest_pdf(uploaded_file):
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
             for i, line in enumerate(lines):
+                # Solo procesamos líneas que tengan 'Cantidad'
                 if "Cantidad" not in line:
                     continue
 
+                # Cantidad
                 m_qty = re.search(r"Cantidad\s*[:#]?\s*([0-9]+)", line)
                 if not m_qty:
                     continue
@@ -296,20 +327,33 @@ def parse_manifest_pdf(uploaded_file):
                 buyer = ""
                 start = max(0, i - 10)
 
-                for j in range(i - 1, start - 1, -1):
-                    l = lines[j]
-                    if sku is None and "SKU" in l:
-                        m_sku = re.search(r"SKU\s*[:#]?\s*([0-9A-Za-z.\-]+)", l)
-                        if m_sku:
-                            sku = normalize_sku(m_sku.group(1))
-                    if order is None and "Venta" in l:
-                        m_ord = re.search(r"Venta\s*[:#]?\s*([0-9]+)", l)
-                        if m_ord:
-                            order = m_ord.group(1).strip()
+                # 1) Buscar Venta y SKU en la misma línea de 'Cantidad'
+                m_sku_cur = re.search(r"SKU\s*[:#]?\s*([0-9A-Za-z.\-]+)", line)
+                if m_sku_cur:
+                    sku = normalize_sku(m_sku_cur.group(1))
 
+                m_ord_cur = re.search(r"Venta\s*[:#]?\s*([0-9]+)", line)
+                if m_ord_cur:
+                    order = m_ord_cur.group(1).strip()
+
+                # 2) Si aún falta Venta o SKU, buscar hacia arriba
+                if sku is None or order is None:
+                    for j in range(i - 1, start - 1, -1):
+                        l = lines[j]
+                        if sku is None and "SKU" in l:
+                            m_sku = re.search(r"SKU\s*[:#]?\s*([0-9A-Za-z.\-]+)", l)
+                            if m_sku:
+                                sku = normalize_sku(m_sku.group(1))
+                        if order is None and "Venta" in l:
+                            m_ord = re.search(r"Venta\s*[:#]?\s*([0-9]+)", l)
+                            if m_ord:
+                                order = m_ord.group(1).strip()
+
+                # Si no logramos tener ambos, descartamos esta línea
                 if not (order and sku):
                     continue
 
+                # 3) Buscar nombre del comprador entre la línea de Venta y la de Cantidad
                 venta_idx = None
                 for k in range(start, i):
                     if "Venta" in lines[k]:
@@ -320,15 +364,18 @@ def parse_manifest_pdf(uploaded_file):
                     for k in range(venta_idx + 1, i):
                         cand = lines[k].strip()
                         low = cand.lower()
-                        if any(tok in low for tok in [
-                            "venta",
-                            "sku",
-                            "pack id",
-                            "cantidad",
-                            "código carrier",
-                            "firma carrier",
-                            "fecha y hora de retiro",
-                        ]):
+                        if any(
+                            tok in low
+                            for tok in [
+                                "venta",
+                                "sku",
+                                "pack id",
+                                "cantidad",
+                                "código carrier",
+                                "firma carrier",
+                                "fecha y hora de retiro",
+                            ]
+                        ):
                             continue
                         if re.fullmatch(r"[0-9 .:/-]+", cand):
                             continue
@@ -452,54 +499,13 @@ def page_import_ml():
         key="inv_uploader",
     )
 
-    st.markdown("### Archivo de imágenes por MLC (opcional)")
-    st.caption(
-        "Archivo de publicaciones de MELI con columna MLC (ID de publicación) y URL de imagen."
-    )
-    img_file = st.file_uploader(
-        "Archivo de imágenes (xlsx o csv)", type=["xlsx", "csv"], key="img_uploader"
-    )
-
-    img_df = None
-    img_mlc_col = None
-    img_url_col = None
-
-    if img_file is not None:
-        try:
-            if img_file.name.lower().endswith(".csv"):
-                img_df = pd.read_csv(img_file)
-            else:
-                img_df = pd.read_excel(img_file)
-            st.success(f"Archivo de imágenes cargado con {len(img_df)} filas.")
-            st.dataframe(img_df.head())
-            if len(img_df.columns) >= 2:
-                img_mlc_col = st.selectbox(
-                    "Columna con MLC (ID de publicación)",
-                    img_df.columns,
-                    key="img_mlc_col",
-                )
-                img_url_col = st.selectbox(
-                    "Columna con URL de la imagen",
-                    img_df.columns,
-                    key="img_url_col",
-                )
-            else:
-                st.warning(
-                    "El archivo de imágenes debe tener al menos 2 columnas (MLC y URL)."
-                )
-        except Exception as e:
-            st.error(f"No se pudo leer el archivo de imágenes: {e}")
-            img_df = None
-            img_mlc_col = None
-            img_url_col = None
+    # MODULO DE IMÁGENES OCULTO POR AHORA (no mostramos nada en UI)
 
     sales_df = None
 
     # ------- EXCEL MERCADO LIBRE -------
     if origen == "Excel Mercado Libre":
-        st.write(
-            "Sube el archivo de ventas del día exportado desde Mercado Libre (XLSX)."
-        )
+        st.write("Sube el archivo de ventas del día exportado desde Mercado Libre (XLSX).")
         file = st.file_uploader(
             "Archivo de ventas ML (.xlsx)", type=["xlsx"], key="ventas_xlsx"
         )
@@ -567,10 +573,6 @@ def page_import_ml():
         work_df.columns = col_names
 
         if "mlc_id" not in work_df.columns:
-            st.warning(
-                "No se encontró una columna MLC (# publicación / ID de publicación) en el Excel de ventas. "
-                "Las imágenes por MLC no se podrán enlazar para estas ventas."
-            )
             work_df["mlc_id"] = None
 
         work_df["qty"] = (
@@ -847,25 +849,6 @@ def page_import_ml():
                     (ot_id, pid),
                 )
 
-        # Imágenes por MLC
-        if img_df is not None and img_mlc_col and img_url_col:
-            inserted = 0
-            for _, row in img_df.iterrows():
-                mlc_val = str(row[img_mlc_col]).strip()
-                url_val = str(row[img_url_col]).strip()
-                if mlc_val and url_val:
-                    c.execute(
-                        """
-                        INSERT OR REPLACE INTO sku_images (mlc_id, image_url)
-                        VALUES (?, ?)
-                        """,
-                        (mlc_val, url_val),
-                    )
-                    inserted += 1
-            st.success(
-                f"Se cargaron {inserted} imágenes en la tabla sku_images (por MLC)."
-            )
-
         conn.commit()
         conn.close()
 
@@ -915,9 +898,7 @@ def page_hojas_picking():
         ot_id, ot_code, picker_name, created_at = ot_map[seleccion]
         ots_a_mostrar = [(ot_id, ot_code, picker_name, created_at)]
 
-    st.write(
-        "Estas son las hojas de picking que puedes imprimir o descargar en PDF."
-    )
+    st.write("Estas son las hojas de picking que puedes imprimir o descargar en PDF.")
 
     ot_data_list = []
 
