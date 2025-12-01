@@ -3,7 +3,7 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 from io import BytesIO
-import re  # para parsing PDF y normalizar SKUs
+import re  # parsing PDF y normalizar SKUs
 
 # ========= CÓDIGOS DE BARRAS =========
 HAS_BARCODE_LIB = False
@@ -28,8 +28,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 
 DB_NAME = "aurora_ml.db"
-ADMIN_PASSWORD = "aurora123"  # 🔐 cámbiala si quieres
-
+ADMIN_PASSWORD = "aurora123"  # cámbiala si quieres
 
 # ---------- NORMALIZAR SKU ----------
 def normalize_sku(value) -> str:
@@ -43,10 +42,8 @@ def normalize_sku(value) -> str:
     s = str(value).strip()
     if not s or s.lower() == "nan":
         return ""
-    # quitar .0 típico de floats
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
-    # notación científica (ej: 1.80201401001E11)
     if re.fullmatch(r"\d+(\.\d+)?[eE][+-]?\d+", s):
         try:
             s = str(int(float(s)))
@@ -64,7 +61,6 @@ def init_db():
     conn = get_conn()
     c = conn.cursor()
 
-    # Pedidos ML
     c.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +70,6 @@ def init_db():
     );
     """)
 
-    # Líneas de cada pedido
     c.execute("""
     CREATE TABLE IF NOT EXISTS order_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +82,6 @@ def init_db():
     );
     """)
 
-    # Picking global por SKU / MLC
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_global (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +96,6 @@ def init_db():
     );
     """)
 
-    # Escaneos finales (no usados ahora)
     c.execute("""
     CREATE TABLE IF NOT EXISTS packages_scan (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +104,6 @@ def init_db():
     );
     """)
 
-    # Piqueadores
     c.execute("""
     CREATE TABLE IF NOT EXISTS pickers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +111,6 @@ def init_db():
     );
     """)
 
-    # OTs
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_ots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +120,6 @@ def init_db():
     );
     """)
 
-    # Asegurar columnas nuevas
     c.execute("PRAGMA table_info(order_items);")
     cols_oi = [row[1] for row in c.fetchall()]
     if "mlc_id" not in cols_oi:
@@ -148,7 +138,6 @@ def init_db():
     if "ot_id" not in cols_pg:
         c.execute("ALTER TABLE picking_global ADD COLUMN ot_id INTEGER;")
 
-    # Tabla de imágenes por MLC
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_images (
         mlc_id TEXT PRIMARY KEY,
@@ -162,7 +151,6 @@ def init_db():
 
 # ---------- CÓDIGOS DE BARRAS ----------
 def generate_barcode_bytes(data: str):
-    """Genera un Code128 en memoria y devuelve los bytes de la imagen."""
     if not HAS_BARCODE_LIB:
         return None
     rv = BytesIO()
@@ -198,7 +186,6 @@ def build_picklist_pdf(ot_data_list):
         created_at = ot["created_at"]
         items = ot["items"]
 
-        # Encabezado
         c.setFont("Helvetica-Bold", 14)
         c.drawString(margin_left, height - margin_top, f"OT: {ot_code}")
         c.setFont("Helvetica-Bold", 11)
@@ -208,7 +195,6 @@ def build_picklist_pdf(ot_data_list):
 
         y = height - margin_top - 25 * mm
 
-        # Código de barras
         img_bytes = generate_barcode_bytes(ot_code)
         if img_bytes is not None:
             try:
@@ -256,17 +242,18 @@ def build_picklist_pdf(ot_data_list):
             c.line(col_prod, y_row_bottom, col_prod, y)
             c.line(col_qty, y_row_bottom, col_qty, y)
 
-            # Truncar producto para que no tape la cantidad
             prod_text = str(producto)
             max_len = 60
             if len(prod_text) > max_len:
-                prod_text = prod_text[:max_len - 3] + "..."
+                prod_text = prod_text[: max_len - 3] + "..."
 
             c.drawString(col_sku + 2 * mm, y_row_bottom + 2 * mm, str(sku)[:20])
             c.drawString(col_prod + 2 * mm, y_row_bottom + 2 * mm, prod_text)
-            c.drawRightString(col_qty + (margin_right - col_qty) - 2 * mm,
-                              y_row_bottom + 2 * mm,
-                              str(qty))
+            c.drawRightString(
+                col_qty + (margin_right - col_qty) - 2 * mm,
+                y_row_bottom + 2 * mm,
+                str(qty),
+            )
             y = y_row_bottom
 
     c.save()
@@ -309,7 +296,6 @@ def parse_manifest_pdf(uploaded_file):
                 buyer = ""
                 start = max(0, i - 10)
 
-                # Buscar hacia arriba SKU y Venta
                 for j in range(i - 1, start - 1, -1):
                     l = lines[j]
                     if sku is None and "SKU" in l:
@@ -324,7 +310,6 @@ def parse_manifest_pdf(uploaded_file):
                 if not (order and sku):
                     continue
 
-                # Buyer entre Venta y Cantidad
                 venta_idx = None
                 for k in range(start, i):
                     if "Venta" in lines[k]:
@@ -336,9 +321,13 @@ def parse_manifest_pdf(uploaded_file):
                         cand = lines[k].strip()
                         low = cand.lower()
                         if any(tok in low for tok in [
-                            "venta", "sku", "pack id", "cantidad",
-                            "código carrier", "firma carrier",
-                            "fecha y hora de retiro"
+                            "venta",
+                            "sku",
+                            "pack id",
+                            "cantidad",
+                            "código carrier",
+                            "firma carrier",
+                            "fecha y hora de retiro",
                         ]):
                             continue
                         if re.fullmatch(r"[0-9 .:/-]+", cand):
@@ -383,7 +372,9 @@ def page_admin():
     c.execute("SELECT COUNT(DISTINCT sku_ml) FROM order_items;")
     total_skus = c.fetchone()[0] or 0
 
-    c.execute("SELECT COALESCE(SUM(qty_total),0), COALESCE(SUM(qty_picked),0) FROM picking_global;")
+    c.execute(
+        "SELECT COALESCE(SUM(qty_total),0), COALESCE(SUM(qty_picked),0) FROM picking_global;"
+    )
     total_picking, total_picked = c.fetchone()
 
     col1, col2, col3 = st.columns(3)
@@ -392,7 +383,8 @@ def page_admin():
     col3.metric("Unidades picking vs pickeadas", f"{total_picked}/{total_picking}")
 
     st.subheader("OTs de picking y estado")
-    c.execute("""
+    c.execute(
+        """
         SELECT po.id,
                po.ot_code,
                COALESCE(pk.name, '—') AS picker,
@@ -404,14 +396,19 @@ def page_admin():
         LEFT JOIN picking_global pg ON pg.ot_id = po.id
         GROUP BY po.id, po.ot_code, pk.name, po.created_at
         ORDER BY po.ot_code;
-    """)
+    """
+    )
     rows = c.fetchall()
     if rows:
         df_ots = pd.DataFrame(
             rows,
             columns=[
-                "ID OT", "Código OT", "Piqueador",
-                "Creada", "SKUs totales", "SKUs completos"
+                "ID OT",
+                "Código OT",
+                "Piqueador",
+                "Creada",
+                "SKUs totales",
+                "SKUs completos",
             ],
         )
         st.dataframe(df_ots)
@@ -456,11 +453,11 @@ def page_import_ml():
     )
 
     st.markdown("### Archivo de imágenes por MLC (opcional)")
-    st.caption("Archivo de publicaciones de MELI con columna MLC (ID de publicación) y URL de imagen.")
+    st.caption(
+        "Archivo de publicaciones de MELI con columna MLC (ID de publicación) y URL de imagen."
+    )
     img_file = st.file_uploader(
-        "Archivo de imágenes (xlsx o csv)",
-        type=["xlsx", "csv"],
-        key="img_uploader",
+        "Archivo de imágenes (xlsx o csv)", type=["xlsx", "csv"], key="img_uploader"
     )
 
     img_df = None
@@ -487,7 +484,9 @@ def page_import_ml():
                     key="img_url_col",
                 )
             else:
-                st.warning("El archivo de imágenes debe tener al menos 2 columnas (MLC y URL).")
+                st.warning(
+                    "El archivo de imágenes debe tener al menos 2 columnas (MLC y URL)."
+                )
         except Exception as e:
             st.error(f"No se pudo leer el archivo de imágenes: {e}")
             img_df = None
@@ -496,10 +495,14 @@ def page_import_ml():
 
     sales_df = None
 
-    # ------- EXCEL ML -------
+    # ------- EXCEL MERCADO LIBRE -------
     if origen == "Excel Mercado Libre":
-        st.write("Sube el archivo de ventas del día exportado desde Mercado Libre (XLSX).")
-        file = st.file_uploader("Archivo de ventas ML (.xlsx)", type=["xlsx"], key="ventas_xlsx")
+        st.write(
+            "Sube el archivo de ventas del día exportado desde Mercado Libre (XLSX)."
+        )
+        file = st.file_uploader(
+            "Archivo de ventas ML (.xlsx)", type=["xlsx"], key="ventas_xlsx"
+        )
 
         if file is None:
             st.info("Esperando archivo de ventas de Mercado Libre...")
@@ -512,8 +515,7 @@ def page_import_ml():
             st.stop()
 
         df.columns = [
-            " | ".join([str(x) for x in col if str(x) != "nan"])
-            for col in df.columns
+            " | ".join([str(x) for x in col if str(x) != "nan"]) for col in df.columns
         ]
 
         COLUMN_ORDER_ID = "Ventas | # de venta"
@@ -522,7 +524,13 @@ def page_import_ml():
         COLUMN_TITLE = "Publicaciones | Título de la publicación"
         COLUMN_BUYER = "Compradores | Comprador"
 
-        required = [COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
+        required = [
+            COLUMN_ORDER_ID,
+            COLUMN_QTY,
+            COLUMN_SKU,
+            COLUMN_TITLE,
+            COLUMN_BUYER,
+        ]
         missing = [c for c in required if c not in df.columns]
         if missing:
             st.error(f"Faltan columnas en el archivo de Mercado Libre: {missing}")
@@ -542,7 +550,13 @@ def page_import_ml():
                 mlc_col_found = cand
                 break
 
-        cols_to_copy = [COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
+        cols_to_copy = [
+            COLUMN_ORDER_ID,
+            COLUMN_QTY,
+            COLUMN_SKU,
+            COLUMN_TITLE,
+            COLUMN_BUYER,
+        ]
         col_names = ["ml_order_id", "qty", "sku_ml", "title_ml", "buyer"]
 
         if mlc_col_found:
@@ -559,12 +573,517 @@ def page_import_ml():
             )
             work_df["mlc_id"] = None
 
-        work_df["qty"] = pd.to_numeric(work_df["qty"], errors="coerce").fillna(0).astype(int)
+        work_df["qty"] = (
+            pd.to_numeric(work_df["qty"], errors="coerce").fillna(0).astype(int)
+        )
         work_df = work_df[work_df["qty"] > 0]
 
         if work_df.empty:
-            st.error("Después de limpiar las cantidades, no quedó ninguna línea con qty > 0.")
-       
+            st.error(
+                "Después de limpiar las cantidades, no quedó ninguna línea con qty > 0."
+            )
+            st.stop()
 
-Let's continue the code (I got cut).
-::contentReference[oaicite:0]{index=0}
+        work_df["sku_ml"] = work_df["sku_ml"].apply(normalize_sku)
+
+        sales_df = work_df[
+            ["ml_order_id", "buyer", "sku_ml", "mlc_id", "title_ml", "qty"]
+        ].copy()
+        st.subheader("Vista previa (ventas procesadas)")
+        st.dataframe(sales_df.head())
+
+    # ------- MANIFIESTO PDF -------
+    else:
+        st.write("Sube el manifiesto PDF con las etiquetas.")
+        pdf_file = st.file_uploader("Manifiesto PDF", type=["pdf"], key="ventas_pdf")
+
+        if pdf_file is None:
+            st.info("Esperando archivo PDF de manifiesto...")
+            return
+
+        try:
+            sales_df = parse_manifest_pdf(pdf_file)
+        except Exception as e:
+            st.error(f"No se pudo procesar el PDF: {e}")
+            st.stop()
+
+        if sales_df.empty:
+            st.error("No se encontraron ventas válidas en el PDF.")
+            st.stop()
+
+        sales_df["sku_ml"] = sales_df["sku_ml"].apply(normalize_sku)
+
+        st.subheader("Vista previa de ventas detectadas en PDF")
+        st.dataframe(sales_df.head())
+
+    # ---- Maestro de inventario: mapa SKU -> nombre técnico/packs ----
+    inv_map = {}
+    if inv_file is not None:
+        try:
+            used_map = False
+
+            inv_df_h = pd.read_excel(inv_file, dtype=str)
+            cols = inv_df_h.columns.tolist()
+            lower = [str(c).strip().lower() for c in cols]
+
+            if "sku" in lower:
+                sku_col = cols[lower.index("sku")]
+                desc_col = None
+                for cand in [
+                    "artículo",
+                    "articulo",
+                    "descripcion",
+                    "descripción",
+                    "nombre",
+                    "producto",
+                    "detalle",
+                ]:
+                    if cand in lower:
+                        desc_col = cols[lower.index(cand)]
+                        break
+                if desc_col is not None:
+                    tmp = inv_df_h[[sku_col, desc_col]].dropna()
+                    for _, row in tmp.iterrows():
+                        sku_key = normalize_sku(row[sku_col])
+                        art = str(row[desc_col]).strip()
+                        if sku_key:
+                            inv_map[sku_key] = art
+                    used_map = True
+
+            if not used_map:
+                inv_df_raw = pd.read_excel(inv_file, header=None, dtype=str)
+                if inv_df_raw.shape[1] >= 2:
+                    colA, colB = inv_df_raw.columns[0], inv_df_raw.columns[1]
+                    sample = inv_df_raw.head(200)
+
+                    def numeric_score(series):
+                        score = 0
+                        for val in series:
+                            s = normalize_sku(val)
+                            if re.fullmatch(r"\d{4,}", s):
+                                score += 1
+                        return score
+
+                    scoreA = numeric_score(sample[colA])
+                    scoreB = numeric_score(sample[colB])
+
+                    if scoreA == 0 and scoreB == 0:
+                        raise ValueError(
+                            "No se detectó columna de SKU numérico en el maestro."
+                        )
+
+                    if scoreA >= scoreB:
+                        sku_col, desc_col = colA, colB
+                    else:
+                        sku_col, desc_col = colB, colA
+
+                    inv_df_raw = inv_df_raw.dropna(subset=[sku_col, desc_col])
+                    for _, row in inv_df_raw.iterrows():
+                        sku_key = normalize_sku(row[sku_col])
+                        art = str(row[desc_col]).strip()
+                        if sku_key:
+                            inv_map[sku_key] = art
+                    used_map = True
+
+            if used_map:
+                st.success(
+                    f"Maestro de inventario cargado ({len(inv_map)} SKUs con nombre técnico/packs)."
+                )
+            else:
+                st.warning(
+                    "No se pudo interpretar el maestro de SKUs. Se continuará sin nombres técnicos."
+                )
+        except Exception as e:
+            st.warning(f"No se pudo leer el maestro de inventario: {e}")
+
+    # ---- Cargar en DB y generar picking ----
+    if st.button("Cargar ventas en el sistema"):
+        conn = get_conn()
+        c = conn.cursor()
+
+        # Reiniciar solo picking actual
+        c.execute("DELETE FROM picking_global;")
+        c.execute("DELETE FROM packages_scan;")
+        c.execute("DELETE FROM pickers;")
+        c.execute("DELETE FROM sku_images;")
+        c.execute("DELETE FROM picking_ots;")
+
+        order_ids_tocados = []
+
+        # Upsert por ml_order_id
+        for ml_order_id, grupo in sales_df.groupby("ml_order_id"):
+            ml_order_id_str = str(ml_order_id)
+
+            c.execute(
+                "SELECT id FROM orders WHERE ml_order_id = ?;", (ml_order_id_str,)
+            )
+            row_exist = c.fetchone()
+
+            buyer = (
+                str(grupo["buyer"].iloc[0]) if "buyer" in grupo.columns else ""
+            )
+            created_at = datetime.now().isoformat()
+
+            if row_exist:
+                order_id = row_exist[0]
+                c.execute(
+                    "UPDATE orders SET buyer = ?, created_at = ? WHERE id = ?;",
+                    (buyer, created_at, order_id),
+                )
+                c.execute("DELETE FROM order_items WHERE order_id = ?;", (order_id,))
+            else:
+                c.execute(
+                    """
+                    INSERT INTO orders (ml_order_id, buyer, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (ml_order_id_str, buyer, created_at),
+                )
+                order_id = c.lastrowid
+
+            order_ids_tocados.append(order_id)
+
+            for _, row in grupo.iterrows():
+                sku = normalize_sku(row["sku_ml"])
+                title_ml_raw = (
+                    str(row["title_ml"])
+                    if "title_ml" in row and str(row["title_ml"]) not in ["nan"]
+                    else ""
+                )
+                mlc_id_raw = row.get("mlc_id", None)
+
+                mlc_id = None
+                if mlc_id_raw is not None and str(mlc_id_raw).lower() != "nan":
+                    mlc_id = str(mlc_id_raw).strip()
+
+                title_tec = inv_map.get(sku)
+                title_ml = title_tec if (not title_ml_raw and title_tec) else title_ml_raw
+
+                qty = int(row["qty"])
+                if qty <= 0:
+                    continue
+
+                c.execute(
+                    """
+                    INSERT INTO order_items (order_id, sku_ml, mlc_id, title_ml, title_tec, qty)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (order_id, sku, mlc_id, title_ml, title_tec, qty),
+                )
+
+        # Generar picking_global SOLO con los orders recién tocados
+        picking_rows = []
+        if order_ids_tocados:
+            placeholders = ",".join("?" * len(order_ids_tocados))
+            query = f"""
+                SELECT sku_ml, mlc_id, title_ml, title_tec, SUM(qty) as total
+                FROM order_items
+                WHERE order_id IN ({placeholders})
+                GROUP BY sku_ml, mlc_id, title_ml, title_tec
+            """
+            c.execute(query, order_ids_tocados)
+            picking_rows = c.fetchall()
+
+        for sku, mlc_id, title_ml, title_tec, total in picking_rows:
+            c.execute(
+                """
+                INSERT INTO picking_global (sku_ml, mlc_id, title_ml, title_tec, qty_total, qty_picked, picker_id, ot_id)
+                VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
+                """,
+                (sku, mlc_id, title_ml, title_tec, total),
+            )
+
+        # Crear piqueadores y repartir SKUs
+        num_pickers_int = int(num_pickers)
+        for i in range(num_pickers_int):
+            name = f"P{i+1}"
+            c.execute("INSERT INTO pickers (name) VALUES (?);", (name,))
+
+        c.execute("SELECT id, name FROM pickers ORDER BY id;")
+        pickers = c.fetchall()
+        total_pickers = len(pickers)
+
+        if total_pickers > 0:
+            c.execute(
+                """
+                SELECT id
+                FROM picking_global
+                ORDER BY 
+                    CASE WHEN sku_ml IS NULL OR sku_ml = '' THEN 1 ELSE 0 END,
+                    CAST(sku_ml AS INTEGER),
+                    sku_ml
+            """
+            )
+            skus_pg = c.fetchall()
+            for idx, (pg_id,) in enumerate(skus_pg):
+                picker_id = pickers[idx % total_pickers][0]
+                c.execute(
+                    "UPDATE picking_global SET picker_id = ? WHERE id = ?;",
+                    (picker_id, pg_id),
+                )
+
+            for pid, pname in pickers:
+                created_at = datetime.now().isoformat()
+                c.execute(
+                    """
+                    INSERT INTO picking_ots (picker_id, ot_code, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (pid, "", created_at),
+                )
+                ot_id = c.lastrowid
+                ot_code = f"OT{ot_id:06d}"
+                c.execute(
+                    "UPDATE picking_ots SET ot_code = ? WHERE id = ?;",
+                    (ot_code, ot_id),
+                )
+
+                c.execute(
+                    """
+                    UPDATE picking_global
+                    SET ot_id = ?
+                    WHERE picker_id = ?
+                    """,
+                    (ot_id, pid),
+                )
+
+        # Imágenes por MLC
+        if img_df is not None and img_mlc_col and img_url_col:
+            inserted = 0
+            for _, row in img_df.iterrows():
+                mlc_val = str(row[img_mlc_col]).strip()
+                url_val = str(row[img_url_col]).strip()
+                if mlc_val and url_val:
+                    c.execute(
+                        """
+                        INSERT OR REPLACE INTO sku_images (mlc_id, image_url)
+                        VALUES (?, ?)
+                        """,
+                        (mlc_val, url_val),
+                    )
+                    inserted += 1
+            st.success(
+                f"Se cargaron {inserted} imágenes en la tabla sku_images (por MLC)."
+            )
+
+        conn.commit()
+        conn.close()
+
+        st.success(
+            "Ventas cargadas, picking generado, OTs creadas y distribuidas entre piqueadores correctamente."
+        )
+        st.info(
+            "Las ventas anteriores se mantienen en la base de datos para trazabilidad. "
+            "El picking se generó solo con las ventas de esta importación."
+        )
+
+
+# ---------- PÁGINA HOJAS DE PICKING ----------
+def page_hojas_picking():
+    st.header("2) Hojas de picking (papel por OT)")
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute(
+        """
+        SELECT po.id, po.ot_code, pk.name, po.created_at
+        FROM picking_ots po
+        JOIN pickers pk ON pk.id = po.picker_id
+        ORDER BY po.ot_code
+    """
+    )
+    ot_rows = c.fetchall()
+
+    if not ot_rows:
+        st.info("No hay OTs generadas. Primero importa ventas en '1) Importar ventas'.")
+        conn.close()
+        return
+
+    opciones = ["Todas las OTs"]
+    ot_map = {}
+    for ot_id, ot_code, picker_name, created_at in ot_rows:
+        label = f"{ot_code} – {picker_name}"
+        opciones.append(label)
+        ot_map[label] = (ot_id, ot_code, picker_name, created_at)
+
+    seleccion = st.selectbox("Selecciona OT para ver/imprimir", opciones, index=0)
+
+    if seleccion == "Todas las OTs":
+        ots_a_mostrar = ot_rows
+    else:
+        ot_id, ot_code, picker_name, created_at = ot_map[seleccion]
+        ots_a_mostrar = [(ot_id, ot_code, picker_name, created_at)]
+
+    st.write(
+        "Estas son las hojas de picking que puedes imprimir o descargar en PDF."
+    )
+
+    ot_data_list = []
+
+    for ot_id, ot_code, picker_name, created_at in ots_a_mostrar:
+        st.markdown("---")
+        st.subheader(f"OT: {ot_code} – Piqueador: {picker_name}")
+        st.caption(f"Creada: {created_at}")
+
+        img_bytes = generate_barcode_bytes(ot_code)
+        if img_bytes is not None:
+            try:
+                st.image(
+                    img_bytes,
+                    caption=f"Código de barras OT {ot_code}",
+                    use_container_width=False,
+                )
+            except Exception as e:
+                st.write(f"Error generando código de barras para {ot_code}: {e}")
+        else:
+            st.markdown(f"**Código OT:** `{ot_code}`")
+
+        c.execute(
+            """
+            SELECT sku_ml,
+                   COALESCE(title_tec, title_ml) AS producto,
+                   qty_total
+            FROM picking_global
+            WHERE ot_id = ?
+            ORDER BY CAST(sku_ml AS INTEGER), sku_ml
+        """,
+            (ot_id,),
+        )
+        rows = c.fetchall()
+
+        if not rows:
+            st.write("No hay SKUs asignados a esta OT.")
+            continue
+
+        df = pd.DataFrame(rows, columns=["SKU", "Producto", "Cantidad a pickear"])
+        st.table(df)
+
+        items = [(r[0], r[1], r[2]) for r in rows]
+        ot_data_list.append(
+            {
+                "ot_code": ot_code,
+                "picker_name": picker_name,
+                "created_at": created_at,
+                "items": items,
+            }
+        )
+
+    conn.close()
+
+    if ot_data_list:
+        pdf_bytes = build_picklist_pdf(ot_data_list)
+        st.download_button(
+            "📄 Descargar PDF de hojas de picking",
+            data=pdf_bytes,
+            file_name="hojas_picking_aurora.pdf",
+            mime="application/pdf",
+        )
+
+
+# ---------- PÁGINA CERRAR OT ----------
+def page_cerrar_ot():
+    st.header("3) Cerrar OT (escaneo único por piqueador)")
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    st.write(
+        """
+    El piqueador termina su recorrido con la hoja en papel.
+    Aquí escanea el **código de barras de la OT** (o escribe el código OT)
+    para marcar como pickeados todos los productos asignados a esa OT.
+    """
+    )
+
+    code = st.text_input(
+        "Escanee o escriba el código de la OT (ej: OT000001)", key="scan_ot"
+    )
+
+    if st.button("Cerrar OT"):
+        if not code:
+            st.warning("Escanee o escriba un código de OT primero.")
+        else:
+            code = code.strip()
+
+            c.execute(
+                """
+                SELECT po.id, po.picker_id, pk.name
+                FROM picking_ots po
+                JOIN pickers pk ON pk.id = po.picker_id
+                WHERE po.ot_code = ?
+            """,
+                (code,),
+            )
+            ot_row = c.fetchone()
+
+            if not ot_row:
+                st.error("OT no encontrada.")
+            else:
+                ot_id, picker_id, picker_name = ot_row
+
+                c.execute(
+                    """
+                    SELECT COUNT(*),
+                           SUM(CASE WHEN qty_picked >= qty_total THEN 1 ELSE 0 END)
+                    FROM picking_global
+                    WHERE ot_id = ?
+                    """,
+                    (ot_id,),
+                )
+                total_skus, skus_completos = c.fetchone()
+                total_skus = total_skus or 0
+                skus_completos = skus_completos or 0
+
+                if total_skus == 0:
+                    st.warning("Esta OT no tiene SKUs asignados.")
+                elif skus_completos == total_skus:
+                    st.info(
+                        f"La OT {code} ya estaba completamente cerrada (todos los SKUs pickeados)."
+                    )
+                else:
+                    c.execute(
+                        """
+                        UPDATE picking_global
+                        SET qty_picked = qty_total
+                        WHERE ot_id = ?
+                        """,
+                        (ot_id,),
+                    )
+                    conn.commit()
+                    st.success(
+                        f"OT {code} cerrada para {picker_name}: "
+                        f"{total_skus} SKUs marcados como pickeados."
+                    )
+
+    conn.close()
+
+
+# ---------- MAIN ----------
+def main():
+    st.set_page_config(page_title="Aurora ML – Picking por OT", layout="wide")
+    init_db()
+
+    st.sidebar.title("Aurora ML – Picking OT")
+    page = st.sidebar.radio(
+        "Menú",
+        [
+            "1) Importar ventas",
+            "2) Hojas de picking (papel por OT)",
+            "3) Cerrar OT (escaneo)",
+            "4) Panel administrador",
+        ],
+    )
+
+    if page.startswith("1"):
+        page_import_ml()
+    elif page.startswith("2"):
+        page_hojas_picking()
+    elif page.startswith("3"):
+        page_cerrar_ot()
+    elif page.startswith("4"):
+        page_admin()
+
+
+if __name__ == "__main__":
+    main()
