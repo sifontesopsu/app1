@@ -3,50 +3,30 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 from io import BytesIO
-import re  # parsing PDF y normalizar SKUs
+import re
 
-# ========= CÓDIGOS DE BARRAS =========
-HAS_BARCODE_LIB = False
-try:
-    from barcode import Code128
-    from barcode.writer import ImageWriter
-    HAS_BARCODE_LIB = True
-except ImportError:
-    HAS_BARCODE_LIB = False
-
-# PDF desde manifiestos
+# PDF manifiestos
 try:
     import pdfplumber
     HAS_PDF_LIB = True
 except ImportError:
     HAS_PDF_LIB = False
 
-# PDF de hojas de picking (reportlab)
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader
-
 DB_NAME = "aurora_ml.db"
-ADMIN_PASSWORD = "aurora123"  # cámbiala si quieres
+ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 
 
-# ---------- NORMALIZAR SKU ----------
+# ----------------- UTILIDADES -----------------
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
 def normalize_sku(value) -> str:
-    """
-    Normaliza un SKU para que maestro y ventas calcen:
-      - Convierte a string
-      - Quita espacios
-      - Elimina sufijo '.0'
-      - Convierte notación científica a entero (si aplica)
-    """
     s = str(value).strip()
     if not s or s.lower() == "nan":
         return ""
-    # quitar .0 típico de floats
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
-    # notación científica (ej: 1.80201401001E11)
     if re.fullmatch(r"\d+(\.\d+)?[eE][+-]?\d+", s):
         try:
             s = str(int(float(s)))
@@ -55,104 +35,140 @@ def normalize_sku(value) -> str:
     return s
 
 
-# ---------- HELPERS DB ----------
+def only_digits(s: str) -> str:
+    return re.sub(r"\D", "", str(s or ""))
+
+
+def split_barcodes(cell_value) -> list[str]:
+    """Soporta múltiples códigos en una celda, separados por espacio/coma/; o saltos."""
+    if cell_value is None:
+        return []
+    s = str(cell_value).strip()
+    if not s or s.lower() == "nan":
+        return []
+    parts = re.split(r"[\s,;]+", s)
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        d = only_digits(p)
+        if d:
+            out.append(d)
+    # únicos preservando orden
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
 def get_conn():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
 
 
+# ----------------- BASE DE DATOS -----------------
 def init_db():
     conn = get_conn()
     c = conn.cursor()
 
-    # Pedidos ML
+    # Pedidos
     c.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ml_order_id TEXT,
+        ml_order_id TEXT UNIQUE,
         buyer TEXT,
         created_at TEXT
     );
     """)
 
-    # Líneas de cada pedido
+    # Líneas por pedido
     c.execute("""
     CREATE TABLE IF NOT EXISTS order_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER,
         sku_ml TEXT,
-        mlc_id TEXT,
         title_ml TEXT,
         title_tec TEXT,
         qty INTEGER
     );
     """)
 
-    # Picking global por SKU / MLC
+    # OTs por picker
     c.execute("""
-    CREATE TABLE IF NOT EXISTS picking_global (
+    CREATE TABLE IF NOT EXISTS pickers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS picking_ots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ot_code TEXT UNIQUE,
+        picker_id INTEGER,
+        status TEXT,              -- OPEN / PICKED
+        created_at TEXT,
+        closed_at TEXT
+    );
+    """)
+
+    # Productos (tareas) por OT, agrupados por SKU para ruta
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS picking_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ot_id INTEGER,
         sku_ml TEXT,
-        mlc_id TEXT,
         title_ml TEXT,
         title_tec TEXT,
         qty_total INTEGER,
         qty_picked INTEGER DEFAULT 0,
-        picker_id INTEGER,
-        ot_id INTEGER
+        status TEXT DEFAULT 'PENDING',   -- PENDING / DONE / INCIDENCE
+        decided_at TEXT
     );
     """)
 
-    # Escaneos finales (no usados ahora)
+    # Incidencias por OT+SKU
     c.execute("""
-    CREATE TABLE IF NOT EXISTS packages_scan (
+    CREATE TABLE IF NOT EXISTS picking_incidences (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tracking_code TEXT,
-        scanned_at TEXT
-    );
-    """)
-
-    # Piqueadores
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS pickers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT
-    );
-    """)
-
-    # OTs
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS picking_ots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        picker_id INTEGER,
-        ot_code TEXT UNIQUE,
+        ot_id INTEGER,
+        sku_ml TEXT,
+        qty_total INTEGER,
+        qty_picked INTEGER,
+        qty_missing INTEGER,
+        reason TEXT,             -- FALTANTE
         created_at TEXT
     );
     """)
 
-    # Asegurar columnas nuevas
-    c.execute("PRAGMA table_info(order_items);")
-    cols_oi = [row[1] for row in c.fetchall()]
-    if "mlc_id" not in cols_oi:
-        c.execute("ALTER TABLE order_items ADD COLUMN mlc_id TEXT;")
-    if "title_tec" not in cols_oi:
-        c.execute("ALTER TABLE order_items ADD COLUMN title_tec TEXT;")
-
-    c.execute("PRAGMA table_info(picking_global);")
-    cols_pg = [row[1] for row in c.fetchall()]
-    if "mlc_id" not in cols_pg:
-        c.execute("ALTER TABLE picking_global ADD COLUMN mlc_id TEXT;")
-    if "title_tec" not in cols_pg:
-        c.execute("ALTER TABLE picking_global ADD COLUMN title_tec TEXT;")
-    if "picker_id" not in cols_pg:
-        c.execute("ALTER TABLE picking_global ADD COLUMN picker_id INTEGER;")
-    if "ot_id" not in cols_pg:
-        c.execute("ALTER TABLE picking_global ADD COLUMN ot_id INTEGER;")
-
-    # De momento no usamos imágenes, pero la tabla puede quedar creada
+    # Relación OT -> ventas (para sorting rápido)
     c.execute("""
-    CREATE TABLE IF NOT EXISTS sku_images (
-        mlc_id TEXT PRIMARY KEY,
-        image_url TEXT
+    CREATE TABLE IF NOT EXISTS ot_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ot_id INTEGER,
+        order_id INTEGER
+    );
+    """)
+
+    # Estado de sorting por venta
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS sorting_status (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ot_id INTEGER,
+        order_id INTEGER,
+        status TEXT,           -- PENDING / READY
+        marked_at TEXT
+    );
+    """)
+
+    # Maestro barcode -> sku
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS sku_barcodes (
+        barcode TEXT PRIMARY KEY,
+        sku_ml TEXT
     );
     """)
 
@@ -160,174 +176,33 @@ def init_db():
     conn.close()
 
 
-# ---------- CÓDIGOS DE BARRAS ----------
-def generate_barcode_bytes(data: str):
-    """Genera un Code128 en memoria y devuelve los bytes de la imagen."""
-    if not HAS_BARCODE_LIB:
-        return None
-    rv = BytesIO()
-    Code128(data, writer=ImageWriter()).write(rv)
-    return rv.getvalue()
-
-
-# ---------- PDF HOJAS DE PICKING ----------
-def build_picklist_pdf(ot_data_list):
-    """
-    ot_data_list: lista de dicts:
-      {
-        "ot_code": str,
-        "picker_name": str,
-        "created_at": str,
-        "items": [(sku, producto, qty), ...]
-      }
-    """
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
-
-    margin_left = 20 * mm
-    margin_right = 190 * mm
-    margin_top = 20 * mm
-    margin_bottom = 20 * mm
-
-    col_sku = margin_left
-    col_prod = 60 * mm
-    col_qty = 170 * mm
-    table_width = margin_right - margin_left
-
-    header_height = 8 * mm
-    row_height = 6 * mm
-
-    for idx, ot in enumerate(ot_data_list):
-        if idx > 0:
-            c.showPage()
-
-        ot_code = ot["ot_code"]
-        picker_name = ot["picker_name"]
-        created_at = ot["created_at"]
-        items = ot["items"]
-
-        # Encabezado
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(margin_left, height - margin_top, f"OT: {ot_code}")
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin_left, height - margin_top - 6 * mm, f"Piqueador: {picker_name}")
-        c.setFont("Helvetica", 10)
-        c.drawString(margin_left, height - margin_top - 11 * mm, f"Creada: {created_at}")
-
-        y = height - margin_top - 25 * mm
-
-        # Código de barras
-        img_bytes = generate_barcode_bytes(ot_code)
-        if img_bytes is not None:
-            try:
-                img = ImageReader(BytesIO(img_bytes))
-                c.drawImage(
-                    img,
-                    margin_left,
-                    y - 20 * mm,
-                    width=60 * mm,
-                    preserveAspectRatio=True,
-                    mask='auto'
-                )
-                y -= 32 * mm
-            except Exception:
-                y -= 10 * mm
-        else:
-            y -= 5 * mm
-
-        def draw_header_row(y_top):
-            c.setFont("Helvetica-Bold", 9)
-            c.rect(margin_left, y_top - header_height, table_width, header_height, stroke=1, fill=0)
-            c.line(col_prod, y_top - header_height, col_prod, y_top)
-            c.line(col_qty, y_top - header_height, col_qty, y_top)
-            c.drawString(col_sku + 2 * mm, y_top - header_height + 2 * mm, "SKU")
-            c.drawString(col_prod + 2 * mm, y_top - header_height + 2 * mm, "Producto")
-            c.drawString(col_qty + 2 * mm, y_top - header_height + 2 * mm, "Cant.")
-            return y_top - header_height
-
-        y = draw_header_row(y)
-        c.setFont("Helvetica", 9)
-
-        for sku, producto, qty in items:
-            if y - row_height < margin_bottom:
-                c.showPage()
-                c.setFont("Helvetica-Bold", 12)
-                c.drawString(margin_left, height - margin_top, f"OT: {ot_code} (continuación)")
-                c.setFont("Helvetica", 10)
-                c.drawString(margin_left, height - margin_top - 6 * mm, f"Piqueador: {picker_name}")
-                y = height - margin_top - 12 * mm
-                y = draw_header_row(y)
-                c.setFont("Helvetica", 9)
-
-            y_row_bottom = y - row_height
-            c.rect(margin_left, y_row_bottom, table_width, row_height, stroke=1, fill=0)
-            c.line(col_prod, y_row_bottom, col_prod, y)
-            c.line(col_qty, y_row_bottom, col_qty, y)
-
-            # Truncar producto para que no tape la cantidad
-            prod_text = str(producto)
-            max_len = 60
-            if len(prod_text) > max_len:
-                prod_text = prod_text[: max_len - 3] + "..."
-
-            c.drawString(col_sku + 2 * mm, y_row_bottom + 2 * mm, str(sku)[:20])
-            c.drawString(col_prod + 2 * mm, y_row_bottom + 2 * mm, prod_text)
-            c.drawRightString(
-                col_qty + (margin_right - col_qty) - 2 * mm,
-                y_row_bottom + 2 * mm,
-                str(qty),
-            )
-            y = y_row_bottom
-
-    c.save()
-    pdf_bytes = buf.getvalue()
-    buf.close()
-    return pdf_bytes
-
-
-# ---------- PARSER MANIFIESTO PDF ----------
-def parse_manifest_pdf(uploaded_file):
-    """
-    Lee el manifiesto PDF y devuelve un DataFrame con:
-    ml_order_id, buyer, sku_ml, mlc_id, title_ml, qty
-    Ahora soporta casos donde Venta + SKU + Cantidad van en una misma línea.
-    """
+# ----------------- PARSER PDF MANIFIESTO -----------------
+def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
     if not HAS_PDF_LIB:
-        raise RuntimeError(
-            "La librería pdfplumber no está instalada. "
-            "Agrega 'pdfplumber' a requirements.txt en Streamlit."
-        )
+        raise RuntimeError("Falta pdfplumber. Agrega 'pdfplumber' a requirements.txt")
 
-    import pdfplumber as _pdfplumber
     records = []
-
-    with _pdfplumber.open(uploaded_file) as pdf:
+    with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             text = text.replace("\r", "\n")
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
             for i, line in enumerate(lines):
-                # Solo procesamos líneas que tengan 'Cantidad'
                 if "Cantidad" not in line:
                     continue
 
-                # Cantidad
                 m_qty = re.search(r"Cantidad\s*[:#]?\s*([0-9]+)", line)
                 if not m_qty:
                     continue
-                try:
-                    qty = int(m_qty.group(1))
-                except Exception:
-                    continue
+                qty = int(m_qty.group(1))
 
                 sku = None
                 order = None
                 buyer = ""
-                start = max(0, i - 10)
+                start = max(0, i - 12)
 
-                # 1) Buscar Venta y SKU en la misma línea de 'Cantidad'
+                # 1) buscar en la misma línea
                 m_sku_cur = re.search(r"SKU\s*[:#]?\s*([0-9A-Za-z.\-]+)", line)
                 if m_sku_cur:
                     sku = normalize_sku(m_sku_cur.group(1))
@@ -336,7 +211,7 @@ def parse_manifest_pdf(uploaded_file):
                 if m_ord_cur:
                     order = m_ord_cur.group(1).strip()
 
-                # 2) Si aún falta Venta o SKU, buscar hacia arriba
+                # 2) buscar hacia arriba si falta algo
                 if sku is None or order is None:
                     for j in range(i - 1, start - 1, -1):
                         l = lines[j]
@@ -349,720 +224,727 @@ def parse_manifest_pdf(uploaded_file):
                             if m_ord:
                                 order = m_ord.group(1).strip()
 
-                # Si no logramos tener ambos, descartamos esta línea
                 if not (order and sku):
                     continue
 
-                # 3) Buscar nombre del comprador entre la línea de Venta y la de Cantidad
+                # buyer entre Venta y Cantidad
                 venta_idx = None
                 for k in range(start, i):
                     if "Venta" in lines[k]:
                         venta_idx = k
                         break
-
                 if venta_idx is not None:
                     for k in range(venta_idx + 1, i):
                         cand = lines[k].strip()
                         low = cand.lower()
-                        if any(
-                            tok in low
-                            for tok in [
-                                "venta",
-                                "sku",
-                                "pack id",
-                                "cantidad",
-                                "código carrier",
-                                "firma carrier",
-                                "fecha y hora de retiro",
-                            ]
-                        ):
+                        if any(tok in low for tok in [
+                            "venta", "sku", "pack id", "cantidad",
+                            "código carrier", "firma carrier", "fecha y hora de retiro"
+                        ]):
                             continue
                         if re.fullmatch(r"[0-9 .:/-]+", cand):
                             continue
                         buyer = cand
                         break
 
-                records.append(
-                    {
-                        "ml_order_id": order,
-                        "buyer": buyer,
-                        "sku_ml": sku,
-                        "mlc_id": None,
-                        "title_ml": "",
-                        "qty": qty,
-                    }
-                )
+                records.append({
+                    "ml_order_id": order,
+                    "buyer": buyer,
+                    "sku_ml": sku,
+                    "title_ml": "",
+                    "qty": qty
+                })
 
-    if not records:
-        return pd.DataFrame(
-            columns=["ml_order_id", "buyer", "sku_ml", "mlc_id", "title_ml", "qty"]
-        )
-
-    return pd.DataFrame(records)
+    return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
 
 
-# ---------- PÁGINA ADMIN ----------
-def page_admin():
-    st.header("4) Panel administrador")
+# ----------------- CARGA MAESTRO (SKU + BARCODE) -----------------
+def load_master(inv_file) -> tuple[dict, dict, list]:
+    """
+    Retorna:
+      inv_map_sku: sku -> nombre técnico
+      barcode_to_sku: barcode -> sku
+      conflicts: lista de (barcode, sku_old, sku_new)
+    """
+    inv_map_sku = {}
+    barcode_to_sku = {}
+    conflicts = []
 
-    pwd = st.text_input("Contraseña de administrador", type="password")
-    if pwd != ADMIN_PASSWORD:
-        st.info("Ingresa la contraseña para ver las opciones de administración.")
-        return
+    if inv_file is None:
+        return inv_map_sku, barcode_to_sku, conflicts
 
+    df = pd.read_excel(inv_file, dtype=str)
+    cols = df.columns.tolist()
+    lower = [str(c).strip().lower() for c in cols]
+
+    # localizar columnas
+    sku_col = None
+    if "sku" in lower:
+        sku_col = cols[lower.index("sku")]
+
+    tech_col = None
+    for cand in ["artículo", "articulo", "descripcion", "descripción", "nombre", "producto", "detalle"]:
+        if cand in lower:
+            tech_col = cols[lower.index(cand)]
+            break
+
+    barcode_col = None
+    for cand in ["codigo de barras", "código de barras", "barcode"]:
+        if cand in lower:
+            barcode_col = cols[lower.index(cand)]
+            break
+
+    # fallback (si vienen sin headers)
+    if sku_col is None or tech_col is None:
+        df0 = pd.read_excel(inv_file, header=None, dtype=str)
+        if df0.shape[1] >= 2:
+            # asumimos col0=producto, col1=sku o viceversa por score numérico
+            a, b = df0.columns[0], df0.columns[1]
+            sample = df0.head(200)
+
+            def score(series):
+                s = 0
+                for v in series:
+                    if re.fullmatch(r"\d{4,}", normalize_sku(v)):
+                        s += 1
+                return s
+
+            sa, sb = score(sample[a]), score(sample[b])
+            if sb >= sa:
+                sku_col, tech_col = b, a
+            else:
+                sku_col, tech_col = a, b
+
+            df = df0
+            cols = df.columns.tolist()
+            barcode_col = None  # no podemos inferir barcode sin header
+
+    # construir mapas
+    for _, r in df.iterrows():
+        sku = normalize_sku(r.get(sku_col, ""))
+        if not sku:
+            continue
+        tech = str(r.get(tech_col, "")).strip() if tech_col is not None else ""
+        if tech and tech.lower() != "nan":
+            inv_map_sku[sku] = tech
+
+        if barcode_col is not None:
+            codes = split_barcodes(r.get(barcode_col, ""))
+            for code in codes:
+                if code in barcode_to_sku and barcode_to_sku[code] != sku:
+                    conflicts.append((code, barcode_to_sku[code], sku))
+                    continue
+                barcode_to_sku[code] = sku
+
+    return inv_map_sku, barcode_to_sku, conflicts
+
+
+def upsert_barcodes_to_db(barcode_to_sku: dict):
     conn = get_conn()
     c = conn.cursor()
-
-    c.execute("SELECT COUNT(*), COALESCE(SUM(qty),0) FROM order_items;")
-    total_lineas, total_unidades = c.fetchone()
-
-    c.execute("SELECT COUNT(DISTINCT sku_ml) FROM order_items;")
-    total_skus = c.fetchone()[0] or 0
-
-    c.execute(
-        "SELECT COALESCE(SUM(qty_total),0), COALESCE(SUM(qty_picked),0) FROM picking_global;"
-    )
-    total_picking, total_picked = c.fetchone()
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Órdenes / líneas", total_lineas)
-    col2.metric("SKUs distintos", total_skus)
-    col3.metric("Unidades picking vs pickeadas", f"{total_picked}/{total_picking}")
-
-    st.subheader("OTs de picking y estado")
-    c.execute(
-        """
-        SELECT po.id,
-               po.ot_code,
-               COALESCE(pk.name, '—') AS picker,
-               po.created_at,
-               COUNT(pg.id) AS skus_totales,
-               SUM(CASE WHEN pg.qty_picked >= pg.qty_total THEN 1 ELSE 0 END) AS skus_completos
-        FROM picking_ots po
-        LEFT JOIN pickers pk ON pk.id = po.picker_id
-        LEFT JOIN picking_global pg ON pg.ot_id = po.id
-        GROUP BY po.id, po.ot_code, pk.name, po.created_at
-        ORDER BY po.ot_code;
-    """
-    )
-    rows = c.fetchall()
-    if rows:
-        df_ots = pd.DataFrame(
-            rows,
-            columns=[
-                "ID OT",
-                "Código OT",
-                "Piqueador",
-                "Creada",
-                "SKUs totales",
-                "SKUs completos",
-            ],
-        )
-        st.dataframe(df_ots)
-    else:
-        st.info("No hay OTs generadas en esta base.")
-
-    st.subheader("Acciones sobre picking actual")
-    if st.button("Reiniciar picking actual (mantiene ventas históricas)"):
-        c.execute("DELETE FROM picking_global;")
-        c.execute("DELETE FROM packages_scan;")
-        c.execute("DELETE FROM pickers;")
-        c.execute("DELETE FROM sku_images;")
-        c.execute("DELETE FROM picking_ots;")
-        conn.commit()
-        st.success("Picking actual reiniciado. Las ventas (orders y order_items) se mantienen.")
+    for bc, sku in barcode_to_sku.items():
+        c.execute("INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)", (bc, sku))
+    conn.commit()
     conn.close()
 
 
-# ---------- PÁGINA IMPORTAR VENTAS ----------
-def page_import_ml():
+def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
+    """Acepta escaneo de barcode o de SKU."""
+    raw = str(scan).strip()
+    digits = only_digits(raw)
+    if digits and digits in barcode_to_sku:
+        return barcode_to_sku[digits]
+    # fallback: sku directo
+    return normalize_sku(raw)
+
+
+# ----------------- IMPORTAR VENTAS (EXCEL / PDF) -----------------
+def import_sales_excel(file) -> pd.DataFrame:
+    df = pd.read_excel(file, header=[4, 5])
+    df.columns = [" | ".join([str(x) for x in col if str(x) != "nan"]) for col in df.columns]
+
+    COLUMN_ORDER_ID = "Ventas | # de venta"
+    COLUMN_QTY = "Ventas | Unidades"
+    COLUMN_SKU = "Publicaciones | SKU"
+    COLUMN_TITLE = "Publicaciones | Título de la publicación"
+    COLUMN_BUYER = "Compradores | Comprador"
+
+    required = [COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas: {missing}")
+
+    work = df[[COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]].copy()
+    work.columns = ["ml_order_id", "qty", "sku_ml", "title_ml", "buyer"]
+    work["qty"] = pd.to_numeric(work["qty"], errors="coerce").fillna(0).astype(int)
+    work = work[work["qty"] > 0]
+    work["sku_ml"] = work["sku_ml"].apply(normalize_sku)
+    return work[["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"]]
+
+
+def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pickers: int):
+    """
+    Crea pickers, OTs, asigna ventas equitativamente por cantidad de ventas,
+    construye picking_tasks agrupado por SKU dentro de cada OT.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+
+    # limpiar “corrida operativa” (pero mantiene historial orders+items)
+    c.execute("DELETE FROM picking_tasks;")
+    c.execute("DELETE FROM picking_incidences;")
+    c.execute("DELETE FROM ot_orders;")
+    c.execute("DELETE FROM sorting_status;")
+    c.execute("DELETE FROM picking_ots;")
+    c.execute("DELETE FROM pickers;")
+
+    # upsert orders + rebuild items por order
+    order_id_by_ml = {}
+    touched_order_ids = []
+
+    for ml_order_id, g in sales_df.groupby("ml_order_id"):
+        ml_order_id = str(ml_order_id).strip()
+        buyer = str(g["buyer"].iloc[0]) if "buyer" in g.columns else ""
+        created = now_iso()
+
+        c.execute("SELECT id FROM orders WHERE ml_order_id = ?", (ml_order_id,))
+        row = c.fetchone()
+        if row:
+            order_id = row[0]
+            c.execute("UPDATE orders SET buyer=?, created_at=? WHERE id=?", (buyer, created, order_id))
+            c.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
+        else:
+            c.execute("INSERT INTO orders (ml_order_id, buyer, created_at) VALUES (?,?,?)", (ml_order_id, buyer, created))
+            order_id = c.lastrowid
+
+        order_id_by_ml[ml_order_id] = order_id
+        touched_order_ids.append(order_id)
+
+        for _, r in g.iterrows():
+            sku = normalize_sku(r["sku_ml"])
+            qty = int(r["qty"])
+            title_ml = str(r.get("title_ml", "") or "").strip()
+            title_tec = inv_map_sku.get(sku, "")
+            if title_tec:
+                # preferimos el técnico
+                title_ml_eff = title_tec
+            else:
+                title_ml_eff = title_ml
+
+            c.execute(
+                "INSERT INTO order_items (order_id, sku_ml, title_ml, title_tec, qty) VALUES (?,?,?,?,?)",
+                (order_id, sku, title_ml_eff, title_tec, qty)
+            )
+
+    # crear pickers
+    picker_ids = []
+    for i in range(int(num_pickers)):
+        name = f"P{i+1}"
+        c.execute("INSERT INTO pickers (name) VALUES (?)", (name,))
+        picker_ids.append(c.lastrowid)
+
+    # crear OTs
+    ot_ids = []
+    for pid in picker_ids:
+        c.execute(
+            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at) VALUES (?,?,?,?,?)",
+            ("", pid, "OPEN", now_iso(), None)
+        )
+        ot_id = c.lastrowid
+        ot_code = f"OT{ot_id:06d}"
+        c.execute("UPDATE picking_ots SET ot_code=? WHERE id=?", (ot_code, ot_id))
+        ot_ids.append(ot_id)
+
+    # repartir ventas equitativo por cantidad de ventas (no por SKUs)
+    unique_orders = sales_df[["ml_order_id"]].drop_duplicates().reset_index(drop=True)
+    assignments = {}
+    for idx, row in unique_orders.iterrows():
+        ot_id = ot_ids[idx % len(ot_ids)]
+        assignments[row["ml_order_id"]] = ot_id
+
+    # vincular ventas a OT y crear sorting_status
+    for ml_order_id, ot_id in assignments.items():
+        order_id = order_id_by_ml[str(ml_order_id)]
+        c.execute("INSERT INTO ot_orders (ot_id, order_id) VALUES (?,?)", (ot_id, order_id))
+        c.execute("INSERT INTO sorting_status (ot_id, order_id, status, marked_at) VALUES (?,?,?,?)",
+                  (ot_id, order_id, "PENDING", None))
+
+    # construir picking_tasks por OT agrupado por SKU (ruta)
+    # obtenemos items de orders asignadas a cada OT
+    for ot_id in ot_ids:
+        c.execute("""
+            SELECT oi.sku_ml,
+                   COALESCE(NULLIF(oi.title_tec,''), oi.title_ml) AS title,
+                   MAX(COALESCE(oi.title_tec,'')) AS title_tec_any,
+                   SUM(oi.qty) as total
+            FROM ot_orders oo
+            JOIN order_items oi ON oi.order_id = oo.order_id
+            WHERE oo.ot_id = ?
+            GROUP BY oi.sku_ml, title
+            ORDER BY CAST(oi.sku_ml AS INTEGER), oi.sku_ml
+        """, (ot_id,))
+        rows = c.fetchall()
+        for sku, title, title_tec_any, total in rows:
+            c.execute("""
+                INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None))
+
+    conn.commit()
+    conn.close()
+
+
+# ----------------- UI: IMPORTAR -----------------
+def page_import():
     st.header("1) Importar ventas")
 
-    origen = st.radio(
-        "Origen de datos de ventas",
-        ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"],
-        horizontal=True,
-    )
+    origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
+    num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
 
-    num_pickers = st.number_input(
-        "Cantidad de piqueadores para esta corrida",
-        min_value=1,
-        max_value=20,
-        value=1,
-        step=1,
-    )
+    st.subheader("Maestro de SKUs y nombres técnicos (opcional, recomendado)")
+    st.caption("Soporta columna SKU y (opcional) columna 'Codigo de barras' con múltiples códigos por celda.")
+    inv_file = st.file_uploader("Maestro SKU (xlsx)", type=["xlsx"], key="inv_master")
 
-    st.markdown("### Maestro de SKUs y nombres técnicos (opcional, recomendado)")
-    inv_file = st.file_uploader(
-        "Archivo maestro de inventario (.xlsx) (LibroInventario o maestro sku)",
-        type=["xlsx"],
-        key="inv_uploader",
-    )
-
-    # MODULO DE IMÁGENES OCULTO POR AHORA (no mostramos nada en UI)
+    inv_map_sku, barcode_to_sku, conflicts = load_master(inv_file)
+    if inv_file is not None:
+        st.success(f"Maestro cargado: {len(inv_map_sku)} SKUs con nombre técnico, {len(barcode_to_sku)} barcodes.")
+        if conflicts:
+            st.warning("Conflictos de barcode detectados (un barcode asignado a más de 1 SKU). Se usará el primero:")
+            st.dataframe(pd.DataFrame(conflicts, columns=["Barcode", "SKU existente", "SKU nuevo"]).head(50))
+        upsert_barcodes_to_db(barcode_to_sku)
+    else:
+        # si no hay maestro, cargar barcodes previos de DB para picking
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
+        barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
+        conn.close()
 
     sales_df = None
 
-    # ------- EXCEL MERCADO LIBRE -------
     if origen == "Excel Mercado Libre":
-        st.write("Sube el archivo de ventas del día exportado desde Mercado Libre (XLSX).")
-        file = st.file_uploader(
-            "Archivo de ventas ML (.xlsx)", type=["xlsx"], key="ventas_xlsx"
-        )
-
-        if file is None:
-            st.info("Esperando archivo de ventas de Mercado Libre...")
+        file = st.file_uploader("Ventas ML (xlsx)", type=["xlsx"], key="ml_excel")
+        if not file:
+            st.info("Sube el Excel de ventas.")
             return
-
         try:
-            df = pd.read_excel(file, header=[4, 5])
+            sales_df = import_sales_excel(file)
         except Exception as e:
-            st.error(f"Error leyendo el Excel de ML: {e}")
-            st.stop()
-
-        df.columns = [
-            " | ".join([str(x) for x in col if str(x) != "nan"]) for col in df.columns
-        ]
-
-        COLUMN_ORDER_ID = "Ventas | # de venta"
-        COLUMN_QTY = "Ventas | Unidades"
-        COLUMN_SKU = "Publicaciones | SKU"
-        COLUMN_TITLE = "Publicaciones | Título de la publicación"
-        COLUMN_BUYER = "Compradores | Comprador"
-
-        required = [
-            COLUMN_ORDER_ID,
-            COLUMN_QTY,
-            COLUMN_SKU,
-            COLUMN_TITLE,
-            COLUMN_BUYER,
-        ]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            st.error(f"Faltan columnas en el archivo de Mercado Libre: {missing}")
-            st.stop()
-
-        mlc_candidates = [
-            "Publicaciones | # de publicación",
-            "Publicaciones | ID de publicación",
-            "Publicaciones | # publicación",
-            "# de publicación",
-            "# publicación",
-            "ID de publicación",
-        ]
-        mlc_col_found = None
-        for cand in mlc_candidates:
-            if cand in df.columns:
-                mlc_col_found = cand
-                break
-
-        cols_to_copy = [
-            COLUMN_ORDER_ID,
-            COLUMN_QTY,
-            COLUMN_SKU,
-            COLUMN_TITLE,
-            COLUMN_BUYER,
-        ]
-        col_names = ["ml_order_id", "qty", "sku_ml", "title_ml", "buyer"]
-
-        if mlc_col_found:
-            cols_to_copy.append(mlc_col_found)
-            col_names.append("mlc_id")
-
-        work_df = df[cols_to_copy].copy()
-        work_df.columns = col_names
-
-        if "mlc_id" not in work_df.columns:
-            work_df["mlc_id"] = None
-
-        work_df["qty"] = (
-            pd.to_numeric(work_df["qty"], errors="coerce").fillna(0).astype(int)
-        )
-        work_df = work_df[work_df["qty"] > 0]
-
-        if work_df.empty:
-            st.error(
-                "Después de limpiar las cantidades, no quedó ninguna línea con qty > 0."
-            )
-            st.stop()
-
-        work_df["sku_ml"] = work_df["sku_ml"].apply(normalize_sku)
-
-        sales_df = work_df[
-            ["ml_order_id", "buyer", "sku_ml", "mlc_id", "title_ml", "qty"]
-        ].copy()
-        st.subheader("Vista previa (ventas procesadas)")
-        st.dataframe(sales_df.head())
-
-    # ------- MANIFIESTO PDF -------
-    else:
-        st.write("Sube el manifiesto PDF con las etiquetas.")
-        pdf_file = st.file_uploader("Manifiesto PDF", type=["pdf"], key="ventas_pdf")
-
-        if pdf_file is None:
-            st.info("Esperando archivo PDF de manifiesto...")
+            st.error(f"Error leyendo Excel: {e}")
             return
-
+    else:
+        pdf_file = st.file_uploader("Manifiesto PDF", type=["pdf"], key="ml_pdf")
+        if not pdf_file:
+            st.info("Sube el PDF manifiesto.")
+            return
         try:
             sales_df = parse_manifest_pdf(pdf_file)
         except Exception as e:
             st.error(f"No se pudo procesar el PDF: {e}")
-            st.stop()
+            return
 
-        if sales_df.empty:
-            st.error("No se encontraron ventas válidas en el PDF.")
-            st.stop()
+    if sales_df is not None:
+        st.subheader("Vista previa ventas")
+        st.dataframe(sales_df.head(30))
 
-        sales_df["sku_ml"] = sales_df["sku_ml"].apply(normalize_sku)
-
-        st.subheader("Vista previa de ventas detectadas en PDF")
-        st.dataframe(sales_df.head())
-
-    # ---- Maestro de inventario: mapa SKU -> nombre técnico/packs ----
-    inv_map = {}
-    if inv_file is not None:
-        try:
-            used_map = False
-
-            inv_df_h = pd.read_excel(inv_file, dtype=str)
-            cols = inv_df_h.columns.tolist()
-            lower = [str(c).strip().lower() for c in cols]
-
-            if "sku" in lower:
-                sku_col = cols[lower.index("sku")]
-                desc_col = None
-                for cand in [
-                    "artículo",
-                    "articulo",
-                    "descripcion",
-                    "descripción",
-                    "nombre",
-                    "producto",
-                    "detalle",
-                ]:
-                    if cand in lower:
-                        desc_col = cols[lower.index(cand)]
-                        break
-                if desc_col is not None:
-                    tmp = inv_df_h[[sku_col, desc_col]].dropna()
-                    for _, row in tmp.iterrows():
-                        sku_key = normalize_sku(row[sku_col])
-                        art = str(row[desc_col]).strip()
-                        if sku_key:
-                            inv_map[sku_key] = art
-                    used_map = True
-
-            if not used_map:
-                inv_df_raw = pd.read_excel(inv_file, header=None, dtype=str)
-                if inv_df_raw.shape[1] >= 2:
-                    colA, colB = inv_df_raw.columns[0], inv_df_raw.columns[1]
-                    sample = inv_df_raw.head(200)
-
-                    def numeric_score(series):
-                        score = 0
-                        for val in series:
-                            s = normalize_sku(val)
-                            if re.fullmatch(r"\d{4,}", s):
-                                score += 1
-                        return score
-
-                    scoreA = numeric_score(sample[colA])
-                    scoreB = numeric_score(sample[colB])
-
-                    if scoreA == 0 and scoreB == 0:
-                        raise ValueError(
-                            "No se detectó columna de SKU numérico en el maestro."
-                        )
-
-                    if scoreA >= scoreB:
-                        sku_col, desc_col = colA, colB
-                    else:
-                        sku_col, desc_col = colB, colA
-
-                    inv_df_raw = inv_df_raw.dropna(subset=[sku_col, desc_col])
-                    for _, row in inv_df_raw.iterrows():
-                        sku_key = normalize_sku(row[sku_col])
-                        art = str(row[desc_col]).strip()
-                        if sku_key:
-                            inv_map[sku_key] = art
-                    used_map = True
-
-            if used_map:
-                st.success(
-                    f"Maestro de inventario cargado ({len(inv_map)} SKUs con nombre técnico/packs)."
-                )
-            else:
-                st.warning(
-                    "No se pudo interpretar el maestro de SKUs. Se continuará sin nombres técnicos."
-                )
-        except Exception as e:
-            st.warning(f"No se pudo leer el maestro de inventario: {e}")
-
-    # ---- Cargar en DB y generar picking ----
-    if st.button("Cargar ventas en el sistema"):
-        conn = get_conn()
-        c = conn.cursor()
-
-        # Reiniciar solo picking actual
-        c.execute("DELETE FROM picking_global;")
-        c.execute("DELETE FROM packages_scan;")
-        c.execute("DELETE FROM pickers;")
-        c.execute("DELETE FROM sku_images;")
-        c.execute("DELETE FROM picking_ots;")
-
-        order_ids_tocados = []
-
-        # Upsert por ml_order_id
-        for ml_order_id, grupo in sales_df.groupby("ml_order_id"):
-            ml_order_id_str = str(ml_order_id)
-
-            c.execute(
-                "SELECT id FROM orders WHERE ml_order_id = ?;", (ml_order_id_str,)
-            )
-            row_exist = c.fetchone()
-
-            buyer = (
-                str(grupo["buyer"].iloc[0]) if "buyer" in grupo.columns else ""
-            )
-            created_at = datetime.now().isoformat()
-
-            if row_exist:
-                order_id = row_exist[0]
-                c.execute(
-                    "UPDATE orders SET buyer = ?, created_at = ? WHERE id = ?;",
-                    (buyer, created_at, order_id),
-                )
-                c.execute("DELETE FROM order_items WHERE order_id = ?;", (order_id,))
-            else:
-                c.execute(
-                    """
-                    INSERT INTO orders (ml_order_id, buyer, created_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (ml_order_id_str, buyer, created_at),
-                )
-                order_id = c.lastrowid
-
-            order_ids_tocados.append(order_id)
-
-            for _, row in grupo.iterrows():
-                sku = normalize_sku(row["sku_ml"])
-                title_ml_raw = (
-                    str(row["title_ml"])
-                    if "title_ml" in row and str(row["title_ml"]) not in ["nan"]
-                    else ""
-                )
-                mlc_id_raw = row.get("mlc_id", None)
-
-                mlc_id = None
-                if mlc_id_raw is not None and str(mlc_id_raw).lower() != "nan":
-                    mlc_id = str(mlc_id_raw).strip()
-
-                title_tec = inv_map.get(sku)
-                title_ml = title_tec if (not title_ml_raw and title_tec) else title_ml_raw
-
-                qty = int(row["qty"])
-                if qty <= 0:
-                    continue
-
-                c.execute(
-                    """
-                    INSERT INTO order_items (order_id, sku_ml, mlc_id, title_ml, title_tec, qty)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (order_id, sku, mlc_id, title_ml, title_tec, qty),
-                )
-
-        # Generar picking_global SOLO con los orders recién tocados
-        picking_rows = []
-        if order_ids_tocados:
-            placeholders = ",".join("?" * len(order_ids_tocados))
-            query = f"""
-                SELECT sku_ml, mlc_id, title_ml, title_tec, SUM(qty) as total
-                FROM order_items
-                WHERE order_id IN ({placeholders})
-                GROUP BY sku_ml, mlc_id, title_ml, title_tec
-            """
-            c.execute(query, order_ids_tocados)
-            picking_rows = c.fetchall()
-
-        for sku, mlc_id, title_ml, title_tec, total in picking_rows:
-            c.execute(
-                """
-                INSERT INTO picking_global (sku_ml, mlc_id, title_ml, title_tec, qty_total, qty_picked, picker_id, ot_id)
-                VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
-                """,
-                (sku, mlc_id, title_ml, title_tec, total),
-            )
-
-        # Crear piqueadores y repartir SKUs
-        num_pickers_int = int(num_pickers)
-        for i in range(num_pickers_int):
-            name = f"P{i+1}"
-            c.execute("INSERT INTO pickers (name) VALUES (?);", (name,))
-
-        c.execute("SELECT id, name FROM pickers ORDER BY id;")
-        pickers = c.fetchall()
-        total_pickers = len(pickers)
-
-        if total_pickers > 0:
-            c.execute(
-                """
-                SELECT id
-                FROM picking_global
-                ORDER BY 
-                    CASE WHEN sku_ml IS NULL OR sku_ml = '' THEN 1 ELSE 0 END,
-                    CAST(sku_ml AS INTEGER),
-                    sku_ml
-            """
-            )
-            skus_pg = c.fetchall()
-            for idx, (pg_id,) in enumerate(skus_pg):
-                picker_id = pickers[idx % total_pickers][0]
-                c.execute(
-                    "UPDATE picking_global SET picker_id = ? WHERE id = ?;",
-                    (picker_id, pg_id),
-                )
-
-            for pid, pname in pickers:
-                created_at = datetime.now().isoformat()
-                c.execute(
-                    """
-                    INSERT INTO picking_ots (picker_id, ot_code, created_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (pid, "", created_at),
-                )
-                ot_id = c.lastrowid
-                ot_code = f"OT{ot_id:06d}"
-                c.execute(
-                    "UPDATE picking_ots SET ot_code = ? WHERE id = ?;",
-                    (ot_code, ot_id),
-                )
-
-                c.execute(
-                    """
-                    UPDATE picking_global
-                    SET ot_id = ?
-                    WHERE picker_id = ?
-                    """,
-                    (ot_id, pid),
-                )
-
-        conn.commit()
-        conn.close()
-
-        st.success(
-            "Ventas cargadas, picking generado, OTs creadas y distribuidas entre piqueadores correctamente."
-        )
-        st.info(
-            "Las ventas anteriores se mantienen en la base de datos para trazabilidad. "
-            "El picking se generó solo con las ventas de esta importación."
-        )
+        if st.button("Cargar y generar OTs"):
+            save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers))
+            st.success("OTs creadas. Ya puedes ir a Picking y Sorting.")
 
 
-# ---------- PÁGINA HOJAS DE PICKING ----------
-def page_hojas_picking():
-    st.header("2) Hojas de picking (papel por OT)")
+# ----------------- UI: PICKING (PDA) -----------------
+def page_picking():
+    st.header("2) Picking PDA por OT (escaneo 1 vez + cantidad digitada)")
 
+    # cargar barcode map desde DB
     conn = get_conn()
     c = conn.cursor()
+    c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
+    barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
 
-    c.execute(
-        """
-        SELECT po.id, po.ot_code, pk.name, po.created_at
+    c.execute("""
+        SELECT po.id, po.ot_code, pk.name, po.status
         FROM picking_ots po
         JOIN pickers pk ON pk.id = po.picker_id
         ORDER BY po.ot_code
-    """
-    )
-    ot_rows = c.fetchall()
-
-    if not ot_rows:
-        st.info("No hay OTs generadas. Primero importa ventas en '1) Importar ventas'.")
+    """)
+    ots = c.fetchall()
+    if not ots:
+        st.info("No hay OTs. Importa ventas primero.")
         conn.close()
         return
 
-    opciones = ["Todas las OTs"]
-    ot_map = {}
-    for ot_id, ot_code, picker_name, created_at in ot_rows:
-        label = f"{ot_code} – {picker_name}"
-        opciones.append(label)
-        ot_map[label] = (ot_id, ot_code, picker_name, created_at)
+    labels = [f"{ot_code} – {picker} – {status}" for (ot_id, ot_code, picker, status) in ots]
+    sel = st.selectbox("Selecciona tu OT", labels, index=0)
+    ot_id = ots[labels.index(sel)][0]
 
-    seleccion = st.selectbox("Selecciona OT para ver/imprimir", opciones, index=0)
+    # estado OT
+    c.execute("SELECT ot_code, status FROM picking_ots WHERE id=?", (ot_id,))
+    ot_code, ot_status = c.fetchone()
 
-    if seleccion == "Todas las OTs":
-        ots_a_mostrar = ot_rows
-    else:
-        ot_id, ot_code, picker_name, created_at = ot_map[seleccion]
-        ots_a_mostrar = [(ot_id, ot_code, picker_name, created_at)]
+    if ot_status == "PICKED":
+        st.success("Esta OT ya está cerrada (PICKED).")
+        conn.close()
+        return
 
-    st.write("Estas son las hojas de picking que puedes imprimir o descargar en PDF.")
+    # lista tareas pendientes / completas
+    c.execute("""
+        SELECT id, sku_ml, COALESCE(NULLIF(title_tec,''), title_ml) AS producto,
+               qty_total, qty_picked, status
+        FROM picking_tasks
+        WHERE ot_id=?
+        ORDER BY CAST(sku_ml AS INTEGER), sku_ml
+    """, (ot_id,))
+    tasks = c.fetchall()
+    total_tasks = len(tasks)
+    done_tasks = sum(1 for t in tasks if t[5] in ("DONE", "INCIDENCE"))
 
-    ot_data_list = []
+    st.metric("Progreso", f"{done_tasks}/{total_tasks} SKUs resueltos (DONE/INCIDENCE)")
 
-    for ot_id, ot_code, picker_name, created_at in ots_a_mostrar:
-        st.markdown("---")
-        st.subheader(f"OT: {ot_code} – Piqueador: {picker_name}")
-        st.caption(f"Creada: {created_at}")
+    # escoger el "producto actual": el primer PENDING
+    current = next((t for t in tasks if t[5] == "PENDING"), None)
 
-        img_bytes = generate_barcode_bytes(ot_code)
-        if img_bytes is not None:
-            try:
-                st.image(
-                    img_bytes,
-                    caption=f"Código de barras OT {ot_code}",
-                    use_container_width=False,
-                )
-            except Exception as e:
-                st.write(f"Error generando código de barras para {ot_code}: {e}")
+    if current is None:
+        st.success("No quedan SKUs pendientes. Puedes cerrar la OT.")
+        if st.button("Cerrar OT"):
+            c.execute("UPDATE picking_ots SET status='PICKED', closed_at=? WHERE id=?", (now_iso(), ot_id))
+            conn.commit()
+            st.success("OT cerrada. Pasa a Sorting.")
+        conn.close()
+        return
+
+    task_id, sku_expected, producto, qty_total, qty_picked, status = current
+
+    st.subheader("Producto actual (ordenado por SKU)")
+    st.write(f"**OT:** {ot_code}")
+    st.write(f"**SKU:** `{sku_expected}`")
+    st.write(f"**Producto:** {producto}")
+    st.write(f"**Cantidad solicitada:** {qty_total}")
+
+    # Estado de UI en sesión: bloqueo avance hasta decisión
+    if "pick_state" not in st.session_state:
+        st.session_state.pick_state = {}
+    state = st.session_state.pick_state
+    if str(task_id) not in state:
+        state[str(task_id)] = {
+            "scanned_ok": False,
+            "scan_value": "",
+            "qty_input": "",
+            "needs_decision": False,
+            "missing": 0
+        }
+    s = state[str(task_id)]
+
+    st.divider()
+
+    # 1) Escaneo (barcode o sku)
+    scan = st.text_input("Escanea SKU / Código de barras", value=s["scan_value"], key=f"scan_{task_id}")
+    if st.button("Validar escaneo"):
+        sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
+        if not sku_detected:
+            st.error("No se pudo interpretar el escaneo.")
+            s["scanned_ok"] = False
+        elif sku_detected != sku_expected:
+            st.error(f"Escaneo corresponde a SKU `{sku_detected}`, pero el producto actual es `{sku_expected}`.")
+            s["scanned_ok"] = False
         else:
-            st.markdown(f"**Código OT:** `{ot_code}`")
+            st.success("SKU validado. Ingresa la cantidad pickeada.")
+            s["scanned_ok"] = True
+            s["scan_value"] = scan
 
-        c.execute(
-            """
-            SELECT sku_ml,
-                   COALESCE(title_tec, title_ml) AS producto,
-                   qty_total
-            FROM picking_global
-            WHERE ot_id = ?
-            ORDER BY CAST(sku_ml AS INTEGER), sku_ml
-        """,
-            (ot_id,),
-        )
-        rows = c.fetchall()
+    # 2) Cantidad digitada
+    qty_in = st.text_input("Cantidad pickeada (digitada)", value=s["qty_input"], disabled=not s["scanned_ok"], key=f"qty_{task_id}")
 
-        if not rows:
-            st.write("No hay SKUs asignados a esta OT.")
-            continue
+    # botón confirmar
+    can_confirm = s["scanned_ok"]
+    if st.button("Confirmar cantidad", disabled=not can_confirm):
+        try:
+            q = int(str(qty_in).strip())
+        except Exception:
+            st.error("Ingresa un número válido.")
+            q = None
 
-        df = pd.DataFrame(rows, columns=["SKU", "Producto", "Cantidad a pickear"])
-        st.table(df)
+        if q is not None:
+            if q > int(qty_total):
+                st.error(f"La cantidad ingresada ({q}) supera la solicitada ({qty_total}). Corrige el valor.")
+                s["needs_decision"] = False
+            elif q == int(qty_total):
+                # DONE
+                c.execute("""
+                    UPDATE picking_tasks
+                    SET qty_picked=?, status='DONE', decided_at=?
+                    WHERE id=?
+                """, (q, now_iso(), task_id))
+                conn.commit()
+                st.success("Producto completado. Puedes pasar al siguiente.")
+                # reset state para este task
+                state.pop(str(task_id), None)
+                st.rerun()
+            else:
+                missing = int(qty_total) - q
+                s["needs_decision"] = True
+                s["missing"] = missing
+                s["qty_input"] = str(q)
+                st.warning(f"Faltan {missing} unidades. Debes decidir: incidencias o reintentar. No puedes avanzar sin decisión.")
 
-        items = [(r[0], r[1], r[2]) for r in rows]
-        ot_data_list.append(
-            {
-                "ot_code": ot_code,
-                "picker_name": picker_name,
-                "created_at": created_at,
-                "items": items,
-            }
-        )
+    # 3) Decisión obligatoria si q < solicitado
+    if s["needs_decision"]:
+        st.error(f"DECISIÓN OBLIGATORIA: faltan {s['missing']} unidades.")
+        colA, colB = st.columns(2)
 
-    conn.close()
+        with colA:
+            if st.button("Enviar a incidencias y continuar"):
+                q = int(s["qty_input"])
+                missing = int(qty_total) - q
 
-    if ot_data_list:
-        pdf_bytes = build_picklist_pdf(ot_data_list)
-        st.download_button(
-            "📄 Descargar PDF de hojas de picking",
-            data=pdf_bytes,
-            file_name="hojas_picking_aurora.pdf",
-            mime="application/pdf",
-        )
+                # registrar incidencia
+                c.execute("""
+                    INSERT INTO picking_incidences (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, created_at)
+                    VALUES (?,?,?,?,?,?,?)
+                """, (ot_id, sku_expected, int(qty_total), q, missing, "FALTANTE", now_iso()))
+
+                # marcar tarea en incidencia (resuelta pero con falta)
+                c.execute("""
+                    UPDATE picking_tasks
+                    SET qty_picked=?, status='INCIDENCE', decided_at=?
+                    WHERE id=?
+                """, (q, now_iso(), task_id))
+
+                conn.commit()
+                st.success("Enviado a incidencias. Se permite continuar.")
+                state.pop(str(task_id), None)
+                st.rerun()
+
+        with colB:
+            if st.button("Reintentar (seguir buscando)"):
+                # vuelve al mismo producto: desbloquea decisión, mantiene scan ok
+                s["needs_decision"] = False
+                st.info("Reintentar: ajusta la cantidad y confirma nuevamente.")
+
+    st.divider()
+    st.caption("Tip: este módulo está diseñado para que el picker valide 1 vez y digite cantidad, con control estricto de faltantes.")
 
 
-# ---------- PÁGINA CERRAR OT ----------
-def page_cerrar_ot():
-    st.header("3) Cerrar OT (escaneo único por piqueador)")
+# ----------------- UI: SORTING RÁPIDO (CAMARERO) -----------------
+def page_sorting():
+    st.header("3) Sorting rápido por venta (camarero)")
 
     conn = get_conn()
     c = conn.cursor()
 
-    st.write(
-        """
-    El piqueador termina su recorrido con la hoja en papel.
-    Aquí escanea el **código de barras de la OT** (o escribe el código OT)
-    para marcar como pickeados todos los productos asignados a esa OT.
-    """
-    )
+    c.execute("""
+        SELECT po.id, po.ot_code, pk.name, po.status
+        FROM picking_ots po
+        JOIN pickers pk ON pk.id = po.picker_id
+        ORDER BY po.ot_code
+    """)
+    ots = c.fetchall()
+    if not ots:
+        st.info("No hay OTs.")
+        conn.close()
+        return
 
-    code = st.text_input(
-        "Escanee o escriba el código de la OT (ej: OT000001)", key="scan_ot"
-    )
+    labels = [f"{ot_code} – {picker} – {status}" for (ot_id, ot_code, picker, status) in ots]
+    sel = st.selectbox("Selecciona OT", labels, index=0)
+    ot_id = ots[labels.index(sel)][0]
 
-    if st.button("Cerrar OT"):
-        if not code:
-            st.warning("Escanee o escriba un código de OT primero.")
+    c.execute("SELECT ot_code, status FROM picking_ots WHERE id=?", (ot_id,))
+    ot_code, ot_status = c.fetchone()
+
+    if ot_status != "PICKED":
+        st.warning("Esta OT aún no está cerrada por el picker. Sorting debería empezar después del cierre.")
+        # igual lo dejamos ver
+
+    # resumen ventas de la OT
+    c.execute("""
+        SELECT o.id, o.ml_order_id, o.buyer, ss.status
+        FROM ot_orders oo
+        JOIN orders o ON o.id = oo.order_id
+        JOIN sorting_status ss ON ss.ot_id = oo.ot_id AND ss.order_id = oo.order_id
+        WHERE oo.ot_id = ?
+        ORDER BY o.ml_order_id
+    """, (ot_id,))
+    orders = c.fetchall()
+    if not orders:
+        st.info("No hay ventas asociadas a esta OT.")
+        conn.close()
+        return
+
+    df_orders = pd.DataFrame(orders, columns=["order_id", "Venta", "Cliente", "Estado"])
+    st.subheader(f"Ventas en {ot_code}")
+    st.dataframe(df_orders)
+
+    st.markdown("### Modo rápido")
+    st.caption("Escanea o pega el número de venta, arma la mesa con la lista y marca como lista.")
+
+    venta_input = st.text_input("Venta (número)", key="sorting_venta")
+    if st.button("Abrir venta"):
+        venta = str(venta_input).strip()
+        if not venta:
+            st.warning("Ingresa una venta.")
         else:
-            code = code.strip()
-
-            c.execute(
-                """
-                SELECT po.id, po.picker_id, pk.name
-                FROM picking_ots po
-                JOIN pickers pk ON pk.id = po.picker_id
-                WHERE po.ot_code = ?
-            """,
-                (code,),
-            )
-            ot_row = c.fetchone()
-
-            if not ot_row:
-                st.error("OT no encontrada.")
+            c.execute("""
+                SELECT o.id, o.buyer
+                FROM orders o
+                JOIN ot_orders oo ON oo.order_id = o.id
+                WHERE oo.ot_id=? AND o.ml_order_id=?
+            """, (ot_id, venta))
+            row = c.fetchone()
+            if not row:
+                st.error("Esa venta no pertenece a esta OT.")
             else:
-                ot_id, picker_id, picker_name = ot_row
+                order_id, buyer = row
+                st.session_state.sorting_current = {"ot_id": ot_id, "order_id": order_id, "venta": venta, "buyer": buyer}
+                st.rerun()
 
-                c.execute(
-                    """
-                    SELECT COUNT(*),
-                           SUM(CASE WHEN qty_picked >= qty_total THEN 1 ELSE 0 END)
-                    FROM picking_global
-                    WHERE ot_id = ?
-                    """,
-                    (ot_id,),
-                )
-                total_skus, skus_completos = c.fetchone()
-                total_skus = total_skus or 0
-                skus_completos = skus_completos or 0
+    cur = st.session_state.get("sorting_current")
+    if cur and cur.get("ot_id") == ot_id:
+        order_id = cur["order_id"]
+        venta = cur["venta"]
+        buyer = cur["buyer"]
 
-                if total_skus == 0:
-                    st.warning("Esta OT no tiene SKUs asignados.")
-                elif skus_completos == total_skus:
-                    st.info(
-                        f"La OT {code} ya estaba completamente cerrada (todos los SKUs pickeados)."
-                    )
-                else:
-                    c.execute(
-                        """
-                        UPDATE picking_global
-                        SET qty_picked = qty_total
-                        WHERE ot_id = ?
-                        """,
-                        (ot_id,),
-                    )
-                    conn.commit()
-                    st.success(
-                        f"OT {code} cerrada para {picker_name}: "
-                        f"{total_skus} SKUs marcados como pickeados."
-                    )
+        st.divider()
+        st.subheader(f"Venta {venta}")
+        st.write(f"**Cliente:** {buyer}")
+
+        c.execute("""
+            SELECT sku_ml, COALESCE(NULLIF(title_tec,''), title_ml) as producto, qty
+            FROM order_items
+            WHERE order_id=?
+            ORDER BY CAST(sku_ml AS INTEGER), sku_ml
+        """, (order_id,))
+        items = c.fetchall()
+        df_items = pd.DataFrame(items, columns=["SKU", "Producto", "Cantidad"])
+        st.table(df_items)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Marcar venta lista para embalar"):
+                c.execute("""
+                    UPDATE sorting_status
+                    SET status='READY', marked_at=?
+                    WHERE ot_id=? AND order_id=?
+                """, (now_iso(), ot_id, order_id))
+                conn.commit()
+                st.success("Venta marcada como READY.")
+                st.session_state.sorting_current = None
+                st.rerun()
+
+        with col2:
+            if st.button("Cerrar vista venta"):
+                st.session_state.sorting_current = None
+                st.rerun()
 
     conn.close()
 
 
-# ---------- MAIN ----------
+# ----------------- UI: ADMIN -----------------
+def page_admin():
+    st.header("4) Administrador")
+
+    pwd = st.text_input("Contraseña", type="password")
+    if pwd != ADMIN_PASSWORD:
+        st.info("Ingresa contraseña para administrar.")
+        return
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    st.subheader("Resumen general")
+    c.execute("SELECT COUNT(*) FROM orders")
+    n_orders = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM order_items")
+    n_items = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM picking_ots")
+    n_ots = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM picking_incidences")
+    n_inc = c.fetchone()[0]
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Ventas (histórico)", n_orders)
+    col2.metric("Líneas (histórico)", n_items)
+    col3.metric("OTs (corrida)", n_ots)
+    col4.metric("Incidencias (corrida)", n_inc)
+
+    st.subheader("Estado de OTs")
+    c.execute("""
+        SELECT po.ot_code, pk.name, po.status, po.created_at, po.closed_at,
+               SUM(CASE WHEN pt.status='PENDING' THEN 1 ELSE 0 END) as pendientes,
+               SUM(CASE WHEN pt.status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) as resueltas
+        FROM picking_ots po
+        JOIN pickers pk ON pk.id = po.picker_id
+        LEFT JOIN picking_tasks pt ON pt.ot_id = po.id
+        GROUP BY po.ot_code, pk.name, po.status, po.created_at, po.closed_at
+        ORDER BY po.ot_code
+    """)
+    df = pd.DataFrame(c.fetchall(), columns=["OT", "Picker", "Estado", "Creada", "Cerrada", "SKUs pendientes", "SKUs resueltos"])
+    st.dataframe(df)
+
+    st.subheader("Incidencias")
+    c.execute("""
+        SELECT po.ot_code, pk.name, pi.sku_ml, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.created_at
+        FROM picking_incidences pi
+        JOIN picking_ots po ON po.id = pi.ot_id
+        JOIN pickers pk ON pk.id = po.picker_id
+        ORDER BY pi.created_at DESC
+    """)
+    inc_rows = c.fetchall()
+    if inc_rows:
+        df_inc = pd.DataFrame(inc_rows, columns=["OT", "Picker", "SKU", "Solicitado", "Pickeado", "Faltante", "Motivo", "Hora"])
+        st.dataframe(df_inc)
+    else:
+        st.info("Sin incidencias registradas en la corrida actual.")
+
+    st.subheader("Sorting por venta")
+    c.execute("""
+        SELECT po.ot_code, pk.name, o.ml_order_id, o.buyer, ss.status, ss.marked_at
+        FROM sorting_status ss
+        JOIN picking_ots po ON po.id = ss.ot_id
+        JOIN pickers pk ON pk.id = po.picker_id
+        JOIN orders o ON o.id = ss.order_id
+        ORDER BY po.ot_code, o.ml_order_id
+    """)
+    rows = c.fetchall()
+    if rows:
+        df_sort = pd.DataFrame(rows, columns=["OT", "Picker", "Venta", "Cliente", "Estado", "Hora"])
+        st.dataframe(df_sort)
+
+    st.divider()
+    st.subheader("Acciones")
+    if st.button("Reiniciar corrida operativa (borra OTs, tasks, sorting, incidencias; mantiene histórico ventas)"):
+        c.execute("DELETE FROM picking_tasks;")
+        c.execute("DELETE FROM picking_incidences;")
+        c.execute("DELETE FROM sorting_status;")
+        c.execute("DELETE FROM ot_orders;")
+        c.execute("DELETE FROM picking_ots;")
+        c.execute("DELETE FROM pickers;")
+        conn.commit()
+        st.success("Corrida reiniciada.")
+        st.rerun()
+
+    conn.close()
+
+
+# ----------------- MAIN -----------------
 def main():
-    st.set_page_config(page_title="Aurora ML – Picking por OT", layout="wide")
+    st.set_page_config(page_title="Aurora ML – WMS Picking/Sorting", layout="wide")
     init_db()
 
-    st.sidebar.title("Aurora ML – Picking OT")
-    page = st.sidebar.radio(
-        "Menú",
-        [
-            "1) Importar ventas",
-            "2) Hojas de picking (papel por OT)",
-            "3) Cerrar OT (escaneo)",
-            "4) Panel administrador",
-        ],
-    )
+    st.sidebar.title("Ferretería Aurora – WMS")
+    page = st.sidebar.radio("Menú", [
+        "1) Importar ventas",
+        "2) Picking PDA (por OT)",
+        "3) Sorting rápido (camarero)",
+        "4) Administrador"
+    ])
 
     if page.startswith("1"):
-        page_import_ml()
+        page_import()
     elif page.startswith("2"):
-        page_hojas_picking()
+        page_picking()
     elif page.startswith("3"):
-        page_cerrar_ot()
-    elif page.startswith("4"):
+        page_sorting()
+    else:
         page_admin()
 
 
