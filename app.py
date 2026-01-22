@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_PDF_LIB = False
 
-# PDF (reportlab)
+# PDF (reportlab) - se mantiene por si lo reactivan más adelante
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
@@ -165,6 +165,7 @@ def init_db():
     );
     """)
 
+    # Se mantiene aunque sorting esté oculto
     c.execute("""
     CREATE TABLE IF NOT EXISTS sorting_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -298,6 +299,7 @@ def load_master(inv_file) -> tuple[dict, dict, list]:
             barcode_col = cols[lower.index(cand)]
             break
 
+    # fallback (sin headers)
     if sku_col is None or tech_col is None:
         df0 = pd.read_excel(inv_file, header=None, dtype=str)
         if df0.shape[1] >= 2:
@@ -383,6 +385,7 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
     conn = get_conn()
     c = conn.cursor()
 
+    # reinicia corrida operativa
     c.execute("DELETE FROM picking_tasks;")
     c.execute("DELETE FROM picking_incidences;")
     c.execute("DELETE FROM ot_orders;")
@@ -420,6 +423,7 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
                 (order_id, sku, title_eff, title_tec, qty)
             )
 
+    # pickers + ots
     picker_ids = []
     for i in range(int(num_pickers)):
         name = f"P{i+1}"
@@ -437,13 +441,14 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
         c.execute("UPDATE picking_ots SET ot_code=? WHERE id=?", (ot_code, ot_id))
         ot_ids.append(ot_id)
 
+    # repartir ventas equitativas por orden
     unique_orders = sales_df[["ml_order_id"]].drop_duplicates().reset_index(drop=True)
     assignments = {}
     for idx, row in unique_orders.iterrows():
         ot_id = ot_ids[idx % len(ot_ids)]
         assignments[str(row["ml_order_id"]).strip()] = ot_id
 
-    # Mesa round-robin 1..4 (por orden de asignación de ventas)
+    # mesa round robin (aunque sorting esté oculto)
     for idx, (ml_order_id, ot_id) in enumerate(assignments.items()):
         order_id = order_id_by_ml[ml_order_id]
         mesa = (idx % NUM_MESAS) + 1
@@ -453,6 +458,7 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
             VALUES (?,?,?,?,?,?)
         """, (ot_id, order_id, "PENDING", None, mesa, None))
 
+    # tasks por OT agrupado por SKU (ruta ordenada)
     for ot_id in ot_ids:
         c.execute("""
             SELECT oi.sku_ml,
@@ -474,150 +480,6 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
 
     conn.commit()
     conn.close()
-
-
-# ----------------- PDF SORTING (10 VENTAS POR HOJA, HOJA = MESA) -----------------
-def build_sorting_pdf(ot_id: int) -> bytes:
-    """
-    PDF:
-    - cada hoja corresponde a una MESA
-    - cada hoja contiene 10 ventas (VENTAS_POR_HOJA)
-    - si una mesa tiene >10, se generan varias hojas: Mesa X - Hoja a/b
-    - por venta se imprime: Venta, Cliente, y lista de SKUs (resumida) para trazabilidad
-    """
-    conn = get_conn()
-    c = conn.cursor()
-
-    c.execute("""
-        SELECT po.ot_code, pk.name, po.status, po.created_at, po.closed_at
-        FROM picking_ots po JOIN pickers pk ON pk.id=po.picker_id
-        WHERE po.id=?
-    """, (ot_id,))
-    ot_code, picker_name, ot_status, created_at, closed_at = c.fetchone()
-
-    c.execute("""
-        SELECT o.id, o.ml_order_id, o.buyer, ss.status, ss.mesa
-        FROM ot_orders oo
-        JOIN orders o ON o.id = oo.order_id
-        JOIN sorting_status ss ON ss.ot_id = oo.ot_id AND ss.order_id = oo.order_id
-        WHERE oo.ot_id=?
-        ORDER BY ss.mesa, o.ml_order_id
-    """, (ot_id,))
-    orders = c.fetchall()
-
-    # agrupar por mesa
-    by_mesa = {}
-    for order_id, venta, buyer, status, mesa in orders:
-        by_mesa.setdefault(int(mesa or 1), []).append((order_id, str(venta), str(buyer), str(status)))
-
-    buf = BytesIO()
-    canv = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-    left = 12 * mm
-    top = H - 12 * mm
-
-    def header(mesa: int, hoja_idx: int, hoja_total: int):
-        canv.setFont("Helvetica-Bold", 14)
-        canv.drawString(left, top, f"HOJA SORTING - {ot_code}")
-
-        canv.setFont("Helvetica", 10)
-        canv.drawString(left, top - 6*mm, f"Picker: {picker_name}   OT: {ot_status}")
-        canv.drawString(left, top - 11*mm, f"Creada: {created_at}   Cerrada: {closed_at or '—'}")
-
-        canv.setFont("Helvetica-Bold", 16)
-        canv.drawString(left, top - 22*mm, f"MESA {mesa}  |  HOJA {hoja_idx}/{hoja_total}")
-
-        canv.setFont("Helvetica", 9)
-        canv.drawString(left, top - 28*mm, f"Regla: esta hoja completa se trabaja en la MESA {mesa}.")
-        canv.line(left, top - 31*mm, W - left, top - 31*mm)
-
-    # layout por venta
-    # Para 10 ventas por hoja: usamos bloques verticales.
-    # Dentro de cada bloque: Venta+Cliente + 1-3 líneas de ítems resumidos.
-    block_top = top - 35 * mm
-    block_height = (H - (35*mm) - (12*mm)) / VENTAS_POR_HOJA  # área útil / 10
-    # Pero reportlab trabaja en puntos; mm ya convierte. OK.
-    # Asegurar mínimo legible:
-    block_height = max(block_height, 22*mm)
-
-    for mesa in range(1, NUM_MESAS + 1):
-        lst = by_mesa.get(mesa, [])
-        if not lst:
-            continue
-
-        # paginar en chunks de 10
-        chunks = [lst[i:i+VENTAS_POR_HOJA] for i in range(0, len(lst), VENTAS_POR_HOJA)]
-        hoja_total = len(chunks)
-
-        for hoja_idx, chunk in enumerate(chunks, start=1):
-            canv.showPage() if (mesa != 1 or hoja_idx != 1) else None
-            header(mesa, hoja_idx, hoja_total)
-
-            y = block_top
-            for (order_id, venta, buyer, status) in chunk:
-                # box
-                canv.setLineWidth(0.7)
-                canv.rect(left, y - block_height + 2*mm, W - 2*left, block_height - 2*mm, stroke=1, fill=0)
-
-                # Venta + Cliente
-                canv.setFont("Helvetica-Bold", 11)
-                canv.drawString(left + 2*mm, y - 5*mm, f"Venta: {venta}")
-                canv.setFont("Helvetica", 10)
-                buyer_short = buyer if len(buyer) <= 42 else buyer[:39] + "..."
-                canv.drawString(left + 65*mm, y - 5*mm, f"Cliente: {buyer_short}")
-
-                # Barcode venta pequeño (trazabilidad opcional)
-                try:
-                    bc = code128.Code128(str(venta), barHeight=7*mm, humanReadable=False)
-                    bc.drawOn(canv, W - left - 45*mm, y - 12*mm)
-                except Exception:
-                    pass
-
-                # Items (resumen)
-                c.execute("""
-                    SELECT sku_ml, COALESCE(NULLIF(title_tec,''), title_ml) as producto, qty
-                    FROM order_items
-                    WHERE order_id=?
-                    ORDER BY CAST(sku_ml AS INTEGER), sku_ml
-                """, (order_id,))
-                items = c.fetchall()
-
-                # convertir a 1-3 líneas resumidas
-                # formato: "SKU xqty - nombre"
-                lines = []
-                for sku, prod, qty in items:
-                    prod = str(prod)
-                    if len(prod) > 40:
-                        prod = prod[:37] + "..."
-                    lines.append(f"{sku} x{qty} - {prod}")
-
-                # mostrar hasta 3 líneas; si hay más, agrega "... (+n)"
-                canv.setFont("Helvetica", 9)
-                max_lines = 3
-                show = lines[:max_lines]
-                if len(lines) > max_lines:
-                    show.append(f"... (+{len(lines)-max_lines} items)")
-                yy = y - 12*mm
-                for ln in show:
-                    canv.drawString(left + 2*mm, yy, ln)
-                    yy -= 4.5*mm
-
-                # estado
-                canv.setFont("Helvetica-Bold", 9)
-                canv.drawRightString(W - left - 2*mm, y - 5*mm, f"Estado: {status}")
-
-                y -= block_height
-
-    canv.save()
-
-    # marcar printed_at
-    c.execute("UPDATE sorting_status SET printed_at=? WHERE ot_id=?", (now_iso(), ot_id))
-    conn.commit()
-    conn.close()
-
-    pdf_bytes = buf.getvalue()
-    buf.close()
-    return pdf_bytes
 
 
 # ----------------- UI: IMPORTAR -----------------
@@ -668,7 +530,7 @@ def page_import():
 
         if st.button("Cargar y generar OTs"):
             save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers))
-            st.success("OTs creadas. Ya puedes ir a Picking y Sorting.")
+            st.success("OTs creadas. Ya puedes ir a Picking.")
 
 
 # ----------------- UI: PICKING (PDA) -----------------
@@ -723,7 +585,7 @@ def page_picking():
         if st.button("Cerrar OT"):
             c.execute("UPDATE picking_ots SET status='PICKED', closed_at=? WHERE id=?", (now_iso(), ot_id))
             conn.commit()
-            st.success("OT cerrada. Pasa a Sorting.")
+            st.success("OT cerrada.")
         conn.close()
         return
 
@@ -764,15 +626,18 @@ def page_picking():
             "scan_value": "",
             "qty_input": "",
             "needs_decision": False,
-            "missing": 0
+            "missing": 0,
+            "show_manual_confirm": False
         }
     s = state[str(task_id)]
 
     st.divider()
+
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
         scan = st.text_input("Escanea SKU / Código de barras", value=s["scan_value"], key=f"scan_{task_id}")
+
     with col2:
         if st.button("Validar escaneo"):
             sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
@@ -785,19 +650,28 @@ def page_picking():
                 s["confirmed"] = False
                 s["confirm_mode"] = None
             else:
-                st.success("Producto validado por escaneo. Ingresa la cantidad pickeada.")
                 s["confirmed"] = True
                 s["confirm_mode"] = "SCAN"
                 s["scan_value"] = scan
+                s["show_manual_confirm"] = False
+                st.success("Producto validado por escaneo. Ingresa la cantidad pickeada.")
+                st.rerun()
 
     with col3:
         if st.button("Producto sin EAN"):
-            st.info("Confirmación manual (sin EAN):")
-            st.write(f"✅ **Producto:** {producto}")
-            if st.button("Confirmar manual", key=f"confirm_manual_{task_id}"):
-                s["confirmed"] = True
-                s["confirm_mode"] = "MANUAL_NO_EAN"
-                st.success("Producto confirmado manualmente. Ingresa la cantidad.")
+            # muestra confirmación manual en pantalla
+            s["show_manual_confirm"] = True
+
+    if s.get("show_manual_confirm", False) and not s["confirmed"]:
+        st.info("Confirmación manual (sin EAN)")
+        st.write(f"✅ **Producto:** {producto}")
+        if st.button("Confirmar manual", key=f"confirm_manual_{task_id}"):
+            s["confirmed"] = True
+            s["confirm_mode"] = "MANUAL_NO_EAN"
+            s["show_manual_confirm"] = False
+            st.success("Producto confirmado manualmente. Ingresa la cantidad.")
+            # IMPORTANTE: rerun para que el input de cantidad aparezca habilitado
+            st.rerun()
 
     qty_in = st.text_input(
         "Cantidad pickeada (digitada)",
@@ -814,10 +688,12 @@ def page_picking():
             q = None
 
         if q is not None:
+            s["qty_input"] = str(q)
+
             if q > int(qty_total):
                 st.error(f"La cantidad ingresada ({q}) supera la solicitada ({qty_total}). Corrige el valor.")
                 s["needs_decision"] = False
-                s["qty_input"] = str(q)
+
             elif q == int(qty_total):
                 c.execute("""
                     UPDATE picking_tasks
@@ -828,11 +704,11 @@ def page_picking():
                 state.pop(str(task_id), None)
                 st.success("Producto completado. Pasando al siguiente…")
                 st.rerun()
+
             else:
                 missing = int(qty_total) - q
                 s["needs_decision"] = True
                 s["missing"] = missing
-                s["qty_input"] = str(q)
                 st.warning(f"Faltan {missing} unidades. Debes decidir: incidencias o reintentar. No puedes avanzar sin decisión.")
 
     if s["needs_decision"]:
@@ -868,85 +744,9 @@ def page_picking():
     conn.close()
 
 
-# ----------------- UI: SORTING -----------------
-def page_sorting():
-    st.header("3) Sorting (4 mesas) + Hoja por mesa (10 ventas por hoja)")
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    c.execute("""
-        SELECT po.id, po.ot_code, pk.name, po.status
-        FROM picking_ots po
-        JOIN pickers pk ON pk.id = po.picker_id
-        ORDER BY po.ot_code
-    """)
-    ots = c.fetchall()
-    if not ots:
-        st.info("No hay OTs.")
-        conn.close()
-        return
-
-    labels = [f"{ot_code} – {picker} – {status}" for (ot_id, ot_code, picker, status) in ots]
-    sel = st.selectbox("Selecciona OT", labels, index=0)
-    ot_id = ots[labels.index(sel)][0]
-
-    c.execute("SELECT ot_code, status FROM picking_ots WHERE id=?", (ot_id,))
-    ot_code, ot_status = c.fetchone()
-
-    st.caption("Se imprime una hoja por mesa. Cada hoja trae 10 ventas. El camarero asigna la hoja completa a la mesa.")
-
-    if st.button("Generar PDF hojas de sorting (por mesa, 10 ventas)"):
-        pdf_bytes = build_sorting_pdf(ot_id)
-        st.download_button(
-            "📄 Descargar PDF Sorting",
-            data=pdf_bytes,
-            file_name=f"sorting_{ot_code}_por_mesa.pdf",
-            mime="application/pdf"
-        )
-
-    c.execute("""
-        SELECT o.ml_order_id, o.buyer, ss.status, ss.mesa, ss.printed_at
-        FROM sorting_status ss
-        JOIN orders o ON o.id = ss.order_id
-        WHERE ss.ot_id=?
-        ORDER BY ss.mesa, o.ml_order_id
-    """, (ot_id,))
-    rows = c.fetchall()
-    if not rows:
-        st.info("No hay ventas asociadas a esta OT.")
-        conn.close()
-        return
-
-    df = pd.DataFrame(rows, columns=["Venta", "Cliente", "Estado", "Mesa", "Impreso"])
-    st.subheader(f"Tablero OT {ot_code} (4 mesas)")
-    st.dataframe(df)
-
-    st.markdown("### Marcar READY (sin escaneo)")
-    mesa_sel = st.selectbox("Mesa", [1, 2, 3, 4], index=0)
-    df_m = df[df["Mesa"] == mesa_sel].copy()
-    pendientes = df_m[df_m["Estado"] != "READY"]["Venta"].tolist()
-
-    if not pendientes:
-        st.success("No hay pendientes en esta mesa.")
-    else:
-        venta_sel = st.selectbox("Venta para marcar READY", pendientes)
-        if st.button("✅ Marcar READY"):
-            c.execute("""
-                UPDATE sorting_status
-                SET status='READY', marked_at=?
-                WHERE ot_id=? AND order_id=(SELECT id FROM orders WHERE ml_order_id=?)
-            """, (now_iso(), ot_id, str(venta_sel)))
-            conn.commit()
-            st.success(f"Venta {venta_sel} marcada READY en mesa {mesa_sel}.")
-            st.rerun()
-
-    conn.close()
-
-
 # ----------------- UI: ADMIN -----------------
 def page_admin():
-    st.header("4) Administrador")
+    st.header("3) Administrador")
 
     pwd = st.text_input("Contraseña", type="password")
     if pwd != ADMIN_PASSWORD:
@@ -1005,20 +805,6 @@ def page_admin():
     else:
         st.info("Sin incidencias registradas en la corrida actual.")
 
-    st.subheader("Sorting por mesa")
-    c.execute("""
-        SELECT po.ot_code, pk.name, o.ml_order_id, o.buyer, ss.status, ss.mesa, ss.printed_at, ss.marked_at
-        FROM sorting_status ss
-        JOIN picking_ots po ON po.id = ss.ot_id
-        JOIN pickers pk ON pk.id = po.picker_id
-        JOIN orders o ON o.id = ss.order_id
-        ORDER BY po.ot_code, ss.mesa, o.ml_order_id
-    """)
-    rows = c.fetchall()
-    if rows:
-        df_sort = pd.DataFrame(rows, columns=["OT", "Picker", "Venta", "Cliente", "Estado", "Mesa", "Impreso", "READY hora"])
-        st.dataframe(df_sort)
-
     st.divider()
     st.subheader("Acciones")
     if st.button("Reiniciar corrida operativa (borra OTs, tasks, sorting, incidencias; mantiene histórico ventas)"):
@@ -1037,23 +823,22 @@ def page_admin():
 
 # ----------------- MAIN -----------------
 def main():
-    st.set_page_config(page_title="Aurora ML – WMS Picking/Sorting", layout="wide")
+    st.set_page_config(page_title="Aurora ML – WMS Picking", layout="wide")
     init_db()
 
     st.sidebar.title("Ferretería Aurora – WMS")
+
+    # Sorting oculto por ahora
     page = st.sidebar.radio("Menú", [
         "1) Importar ventas",
         "2) Picking PDA (por OT)",
-        "3) Sorting + PDF (por mesa, 10 ventas)",
-        "4) Administrador"
+        "3) Administrador"
     ])
 
     if page.startswith("1"):
         page_import()
     elif page.startswith("2"):
         page_picking()
-    elif page.startswith("3"):
-        page_sorting()
     else:
         page_admin()
 
