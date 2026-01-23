@@ -1,10 +1,9 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import sqlite3
 from datetime import datetime
-from io import BytesIO
 import re
-import math
 
 # PDF manifiestos
 try:
@@ -13,16 +12,9 @@ try:
 except ImportError:
     HAS_PDF_LIB = False
 
-# PDF (reportlab) - se mantiene por si lo reactivan más adelante
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
-from reportlab.graphics.barcode import code128
-
 DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
-VENTAS_POR_HOJA = 10
 
 
 # ----------------- UTILIDADES -----------------
@@ -76,6 +68,48 @@ def split_barcodes(cell_value) -> list[str]:
 
 def get_conn():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
+
+
+def force_tel_keyboard(label: str):
+    """
+    Fuerza teclado numérico tipo "teléfono" en Android para el input cuyo aria-label coincide con `label`.
+    Funciona porque Streamlit pone aria-label=label en el <input>.
+    """
+    safe = label.replace("\\", "\\\\").replace('"', '\\"')
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          const label = "{safe}";
+          let tries = 0;
+
+          function apply() {{
+            const inputs = window.parent.document.querySelectorAll('input[aria-label="' + label + '"]');
+            if (!inputs || inputs.length === 0) {{
+              tries++;
+              if (tries < 30) setTimeout(apply, 200);
+              return;
+            }}
+            inputs.forEach((el) => {{
+              try {{
+                el.setAttribute('type', 'tel');
+                el.setAttribute('inputmode', 'numeric');
+                el.setAttribute('pattern', '[0-9]*');
+                el.setAttribute('autocomplete', 'off');
+              }} catch (e) {{}}
+            }});
+          }}
+
+          apply();
+
+          // Re-aplica en caso de rerender (Streamlit cambia el DOM a veces)
+          setTimeout(apply, 500);
+          setTimeout(apply, 1200);
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 # ----------------- BASE DE DATOS -----------------
@@ -165,13 +199,13 @@ def init_db():
     );
     """)
 
-    # Se mantiene aunque sorting esté oculto
+    # (sorting oculto por ahora, pero mantenemos tabla)
     c.execute("""
     CREATE TABLE IF NOT EXISTS sorting_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ot_id INTEGER,
         order_id INTEGER,
-        status TEXT,           -- PENDING / READY
+        status TEXT,
         marked_at TEXT,
         mesa INTEGER,
         printed_at TEXT
@@ -636,7 +670,10 @@ def page_picking():
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
-        scan = st.text_input("Escanea SKU / Código de barras", value=s["scan_value"], key=f"scan_{task_id}")
+        # SCAN: sigue siendo text_input para NO perder ceros a la izquierda
+        scan_label = "Escanea SKU / Código de barras"
+        scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
+        force_tel_keyboard(scan_label)
 
     with col2:
         if st.button("Validar escaneo"):
@@ -659,7 +696,6 @@ def page_picking():
 
     with col3:
         if st.button("Producto sin EAN"):
-            # muestra confirmación manual en pantalla
             s["show_manual_confirm"] = True
 
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
@@ -670,15 +706,16 @@ def page_picking():
             s["confirm_mode"] = "MANUAL_NO_EAN"
             s["show_manual_confirm"] = False
             st.success("Producto confirmado manualmente. Ingresa la cantidad.")
-            # IMPORTANTE: rerun para que el input de cantidad aparezca habilitado
             st.rerun()
 
+    qty_label = "Cantidad pickeada (digitada)"
     qty_in = st.text_input(
-        "Cantidad pickeada (digitada)",
+        qty_label,
         value=s["qty_input"],
         disabled=not s["confirmed"],
         key=f"qty_{task_id}"
     )
+    force_tel_keyboard(qty_label)
 
     if st.button("Confirmar cantidad", disabled=not s["confirmed"]):
         try:
