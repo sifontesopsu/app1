@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -5,7 +6,20 @@ import sqlite3
 from datetime import datetime
 import re
 
-# Timezone Chile
+# =========================
+# CONFIG
+# =========================
+DB_NAME = "aurora_ml.db"
+ADMIN_PASSWORD = "aurora123"  # cambia si quieres
+NUM_MESAS = 4
+
+# Maestro SKU/EAN en la misma carpeta que app.py
+MASTER_FILE = "maestro_sku_ean.xlsx"
+
+
+# =========================
+# TIMEZONE CHILE
+# =========================
 try:
     from zoneinfo import ZoneInfo  # py3.9+
     CL_TZ = ZoneInfo("America/Santiago")
@@ -14,6 +28,7 @@ except Exception:
     CL_TZ = None
     UTC_TZ = None
 
+
 # PDF manifiestos
 try:
     import pdfplumber
@@ -21,12 +36,10 @@ try:
 except ImportError:
     HAS_PDF_LIB = False
 
-DB_NAME = "aurora_ml.db"
-ADMIN_PASSWORD = "aurora123"  # cambia si quieres
-NUM_MESAS = 4
 
-
-# ----------------- UTILIDADES -----------------
+# =========================
+# UTILIDADES
+# =========================
 def now_iso():
     # Guardamos naive ISO (server suele ser UTC en Streamlit Cloud)
     return datetime.now().isoformat(timespec="seconds")
@@ -159,7 +172,9 @@ def autofocus_input(label: str):
     )
 
 
-# ----------------- BASE DE DATOS -----------------
+# =========================
+# DB INIT
+# =========================
 def init_db():
     conn = get_conn()
     c = conn.cursor()
@@ -261,7 +276,112 @@ def init_db():
     conn.close()
 
 
-# ----------------- PARSER PDF MANIFIESTO -----------------
+# =========================
+# MAESTRO SKU/EAN (AUTO)
+# =========================
+def load_master_from_path(path: str) -> tuple[dict, dict, list]:
+    inv_map_sku = {}
+    barcode_to_sku = {}
+    conflicts = []
+
+    if not path or not os.path.exists(path):
+        return inv_map_sku, barcode_to_sku, conflicts
+
+    df = pd.read_excel(path, dtype=str)
+    cols = df.columns.tolist()
+    lower = [str(c).strip().lower() for c in cols]
+
+    sku_col = None
+    if "sku" in lower:
+        sku_col = cols[lower.index("sku")]
+
+    tech_col = None
+    for cand in ["artículo", "articulo", "descripcion", "descripción", "nombre", "producto", "detalle"]:
+        if cand in lower:
+            tech_col = cols[lower.index(cand)]
+            break
+
+    barcode_col = None
+    for cand in ["codigo de barras", "código de barras", "barcode", "ean", "eans"]:
+        if cand in lower:
+            barcode_col = cols[lower.index(cand)]
+            break
+
+    # Fallback por si el archivo no trae headers claros
+    if sku_col is None or tech_col is None:
+        df0 = pd.read_excel(path, header=None, dtype=str)
+        if df0.shape[1] >= 2:
+            a, b = df0.columns[0], df0.columns[1]
+            sample = df0.head(200)
+
+            def score(series):
+                s = 0
+                for v in series:
+                    if re.fullmatch(r"\d{4,}", normalize_sku(v)):
+                        s += 1
+                return s
+
+            sa, sb = score(sample[a]), score(sample[b])
+            if sb >= sa:
+                sku_col, tech_col = b, a
+            else:
+                sku_col, tech_col = a, b
+            df = df0
+            barcode_col = None  # sin header no asumimos dónde está EAN
+
+    for _, r in df.iterrows():
+        sku = normalize_sku(r.get(sku_col, ""))
+        if not sku:
+            continue
+
+        tech = str(r.get(tech_col, "")).strip() if tech_col is not None else ""
+        if tech and tech.lower() != "nan":
+            inv_map_sku[sku] = tech
+
+        if barcode_col is not None:
+            codes = split_barcodes(r.get(barcode_col, ""))
+            for code in codes:
+                if code in barcode_to_sku and barcode_to_sku[code] != sku:
+                    conflicts.append((code, barcode_to_sku[code], sku))
+                    continue
+                barcode_to_sku[code] = sku
+
+    return inv_map_sku, barcode_to_sku, conflicts
+
+
+def upsert_barcodes_to_db(barcode_to_sku: dict):
+    if not barcode_to_sku:
+        return
+    conn = get_conn()
+    c = conn.cursor()
+    for bc, sku in barcode_to_sku.items():
+        c.execute("INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)", (bc, sku))
+    conn.commit()
+    conn.close()
+
+
+def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
+    raw = str(scan).strip()
+    digits = only_digits(raw)
+    if digits and digits in barcode_to_sku:
+        return barcode_to_sku[digits]
+    return normalize_sku(raw)
+
+
+@st.cache_data(show_spinner=False)
+def get_master_cached(master_path: str) -> tuple[dict, dict, list]:
+    return load_master_from_path(master_path)
+
+
+def master_bootstrap(master_path: str):
+    inv_map_sku, barcode_to_sku, conflicts = get_master_cached(master_path)
+    upsert_barcodes_to_db(barcode_to_sku)
+    return inv_map_sku, barcode_to_sku, conflicts
+
+
+# =========================
+# PARSER PDF MANIFIESTO
+# =========================
 def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
     if not HAS_PDF_LIB:
         raise RuntimeError("Falta pdfplumber. Agrega 'pdfplumber' a requirements.txt")
@@ -340,93 +460,9 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
     return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
 
 
-# ----------------- MAESTRO SKU -----------------
-def load_master(inv_file) -> tuple[dict, dict, list]:
-    inv_map_sku = {}
-    barcode_to_sku = {}
-    conflicts = []
-
-    if inv_file is None:
-        return inv_map_sku, barcode_to_sku, conflicts
-
-    df = pd.read_excel(inv_file, dtype=str)
-    cols = df.columns.tolist()
-    lower = [str(c).strip().lower() for c in cols]
-
-    sku_col = None
-    if "sku" in lower:
-        sku_col = cols[lower.index("sku")]
-
-    tech_col = None
-    for cand in ["artículo", "articulo", "descripcion", "descripción", "nombre", "producto", "detalle"]:
-        if cand in lower:
-            tech_col = cols[lower.index(cand)]
-            break
-
-    barcode_col = None
-    for cand in ["codigo de barras", "código de barras", "barcode"]:
-        if cand in lower:
-            barcode_col = cols[lower.index(cand)]
-            break
-
-    if sku_col is None or tech_col is None:
-        df0 = pd.read_excel(inv_file, header=None, dtype=str)
-        if df0.shape[1] >= 2:
-            a, b = df0.columns[0], df0.columns[1]
-            sample = df0.head(200)
-
-            def score(series):
-                s = 0
-                for v in series:
-                    if re.fullmatch(r"\d{4,}", normalize_sku(v)):
-                        s += 1
-                return s
-
-            sa, sb = score(sample[a]), score(sample[b])
-            if sb >= sa:
-                sku_col, tech_col = b, a
-            else:
-                sku_col, tech_col = a, b
-            df = df0
-            barcode_col = None
-
-    for _, r in df.iterrows():
-        sku = normalize_sku(r.get(sku_col, ""))
-        if not sku:
-            continue
-        tech = str(r.get(tech_col, "")).strip() if tech_col is not None else ""
-        if tech and tech.lower() != "nan":
-            inv_map_sku[sku] = tech
-
-        if barcode_col is not None:
-            codes = split_barcodes(r.get(barcode_col, ""))
-            for code in codes:
-                if code in barcode_to_sku and barcode_to_sku[code] != sku:
-                    conflicts.append((code, barcode_to_sku[code], sku))
-                    continue
-                barcode_to_sku[code] = sku
-
-    return inv_map_sku, barcode_to_sku, conflicts
-
-
-def upsert_barcodes_to_db(barcode_to_sku: dict):
-    conn = get_conn()
-    c = conn.cursor()
-    for bc, sku in barcode_to_sku.items():
-        c.execute("INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)", (bc, sku))
-    conn.commit()
-    conn.close()
-
-
-def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
-    raw = str(scan).strip()
-    digits = only_digits(raw)
-    if digits and digits in barcode_to_sku:
-        return barcode_to_sku[digits]
-    return normalize_sku(raw)
-
-
-# ----------------- IMPORTAR VENTAS -----------------
+# =========================
+# IMPORTAR VENTAS
+# =========================
 def import_sales_excel(file) -> pd.DataFrame:
     df = pd.read_excel(file, header=[4, 5])
     df.columns = [" | ".join([str(x) for x in col if str(x) != "nan"]) for col in df.columns]
@@ -454,7 +490,7 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
     conn = get_conn()
     c = conn.cursor()
 
-    # Reset corrida (pero NO borra orders históricos aquí; eso lo hace admin reset total)
+    # Reset corrida (no borra histórico; eso lo hace admin reset total)
     c.execute("DELETE FROM picking_tasks;")
     c.execute("DELETE FROM picking_incidences;")
     c.execute("DELETE FROM ot_orders;")
@@ -547,22 +583,13 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
     conn.close()
 
 
-# ----------------- UI: IMPORTAR -----------------
-def page_import():
+# =========================
+# UI: IMPORTAR
+# =========================
+def page_import(inv_map_sku: dict):
     st.header("Importar ventas")
     origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
     num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
-
-    st.subheader("Maestro de SKUs (opcional)")
-    inv_file = st.file_uploader("Maestro SKU (xlsx)", type=["xlsx"], key="inv_master")
-
-    inv_map_sku, barcode_to_sku, conflicts = load_master(inv_file)
-    if inv_file is not None:
-        st.success(f"Maestro: {len(inv_map_sku)} SKUs, {len(barcode_to_sku)} barcodes.")
-        if conflicts:
-            st.warning("Conflictos de barcode detectados. Se usará el primero:")
-            st.dataframe(pd.DataFrame(conflicts, columns=["Barcode", "SKU existente", "SKU nuevo"]).head(50))
-        upsert_barcodes_to_db(barcode_to_sku)
 
     if origen == "Excel Mercado Libre":
         file = st.file_uploader("Ventas ML (xlsx)", type=["xlsx"], key="ml_excel")
@@ -582,10 +609,12 @@ def page_import():
 
     if st.button("Cargar y generar OTs"):
         save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers))
-        st.success("OTs creadas. Anda a Picking y elige P1, P2, ...")
+        st.success("OTs creadas. Anda a Picking y selecciona P1, P2, ...")
 
 
-# ----------------- UI: PICKING (LOBBY + PDA) -----------------
+# =========================
+# UI: PICKING (LOBBY + PDA)
+# =========================
 def picking_lobby():
     st.markdown("### Picking")
     st.caption("Selecciona tu pickeador")
@@ -602,7 +631,6 @@ def picking_lobby():
 
     pickers = [r[0] for r in rows]
 
-    # Botones grandes en grilla
     st.markdown(
         """
         <style>
@@ -635,7 +663,6 @@ def picking_lobby():
 
 
 def page_picking():
-    # Si no hay picker seleccionado, mostrar lobby
     if "selected_picker" not in st.session_state:
         ok = picking_lobby()
         if not ok:
@@ -646,7 +673,6 @@ def page_picking():
         st.session_state.pop("selected_picker", None)
         st.rerun()
 
-    # Botón para cambiar pickeador
     topA, topB = st.columns([2, 1])
     with topA:
         st.markdown(f"### Picking (PDA) — {picker_name}")
@@ -678,7 +704,6 @@ def page_picking():
     c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
     barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
 
-    # Buscar OT del pickeador
     c.execute("""
         SELECT po.id, po.ot_code, po.status
         FROM picking_ots po
@@ -692,7 +717,6 @@ def page_picking():
         conn.close()
         return
 
-    # Si existieran múltiples OTs para el mismo pickeador (raro), elegimos la primera OPEN
     ot_row = None
     for r in ots:
         if r[2] != "PICKED":
@@ -780,7 +804,7 @@ def page_picking():
     elif s["scan_status"] == "bad":
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
-    # ✅ Mantener versión anterior compacta (col1 input, col2 validar, col3 sin ean)
+    # Compacto: input + validar + sin ean
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
@@ -899,7 +923,9 @@ def page_picking():
     conn.close()
 
 
-# ----------------- UI: ADMIN -----------------
+# =========================
+# UI: ADMIN
+# =========================
 def page_admin():
     st.header("Administrador")
     pwd = st.text_input("Contraseña", type="password")
@@ -989,6 +1015,7 @@ def page_admin():
                 conn.commit()
                 st.session_state.confirm_reset = False
                 st.success("Sistema reiniciado (todo borrado).")
+                st.session_state.pop("selected_picker", None)
                 st.rerun()
         with colB:
             if st.button("Cancelar"):
@@ -999,14 +1026,26 @@ def page_admin():
     conn.close()
 
 
-# ----------------- MAIN -----------------
+# =========================
+# MAIN
+# =========================
 def main():
     st.set_page_config(page_title="Aurora ML – WMS Picking", layout="wide")
     init_db()
 
+    # Auto-carga maestro desde repo
+    inv_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
+
+    # Banner de estado del maestro (solo info, sin estorbar)
+    if os.path.exists(MASTER_FILE):
+        st.sidebar.success(f"Maestro cargado: {MASTER_FILE} ({len(inv_map_sku)} SKUs / {len(barcode_to_sku)} EAN)")
+        if conflicts:
+            st.sidebar.warning(f"Conflictos EAN: {len(conflicts)} (se usa el primero)")
+    else:
+        st.sidebar.warning(f"No se encontró {MASTER_FILE}. (La app funciona, pero sin maestro)")
+
     st.sidebar.title("Ferretería Aurora – WMS")
 
-    # Primer módulo: Picking
     pages = [
         "1) Picking",
         "2) Importar ventas",
@@ -1017,7 +1056,7 @@ def main():
     if page.startswith("1"):
         page_picking()
     elif page.startswith("2"):
-        page_import()
+        page_import(inv_map_sku)
     else:
         page_admin()
 
