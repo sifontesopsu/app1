@@ -5,6 +5,13 @@ import sqlite3
 from datetime import datetime
 import re
 
+# Timezone Chile
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+    CL_TZ = ZoneInfo("America/Santiago")
+except Exception:
+    CL_TZ = None  # fallback
+
 # PDF manifiestos
 try:
     import pdfplumber
@@ -19,7 +26,26 @@ NUM_MESAS = 4
 
 # ----------------- UTILIDADES -----------------
 def now_iso():
+    # Guardamos naive ISO (como venías haciendo) para compatibilidad
     return datetime.now().isoformat(timespec="seconds")
+
+
+def to_chile_display(iso_str: str) -> str:
+    """Convierte ISO guardado a hora Chile para mostrar (America/Santiago)."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_str))
+        if CL_TZ is None:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        # asumimos dt naive como UTC? o local server? -> lo más estable: tratar como UTC si viene naive
+        # PERO como se guardó con datetime.now() del server, en cloud suele ser UTC.
+        # Convertimos: dt naive -> UTC -> Chile
+        dt_utc = dt.replace(tzinfo=ZoneInfo("UTC"))
+        dt_cl = dt_utc.astimezone(CL_TZ)
+        return dt_cl.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(iso_str)
 
 
 def normalize_sku(value) -> str:
@@ -69,7 +95,7 @@ def get_conn():
 
 
 def force_tel_keyboard(label: str):
-    """Fuerza teclado numérico tipo 'teléfono' en iOS/Android para el input con aria-label=label."""
+    """Fuerza teclado numérico tipo 'teléfono' para el input con aria-label=label."""
     safe = label.replace("\\", "\\\\").replace('"', '\\"')
     components.html(
         f"""
@@ -108,7 +134,7 @@ def _add_column_if_missing(c, table, col_name, col_def):
     c.execute(f"PRAGMA table_info({table});")
     cols = [r[1] for r in c.fetchall()]
     if col_name not in cols:
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def};")
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {col_def and col_name} {col_def};")
 
 
 def init_db():
@@ -147,7 +173,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ot_code TEXT UNIQUE,
         picker_id INTEGER,
-        status TEXT,              -- OPEN / PICKED
+        status TEXT,
         created_at TEXT,
         closed_at TEXT
     );
@@ -162,12 +188,11 @@ def init_db():
         title_tec TEXT,
         qty_total INTEGER,
         qty_picked INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'PENDING',   -- PENDING / DONE / INCIDENCE
+        status TEXT DEFAULT 'PENDING',
         decided_at TEXT,
-        confirm_mode TEXT              -- SCAN / MANUAL_NO_EAN
+        confirm_mode TEXT
     );
     """)
-    _add_column_if_missing(c, "picking_tasks", "confirm_mode", "TEXT")
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS picking_incidences (
@@ -177,7 +202,7 @@ def init_db():
         qty_total INTEGER,
         qty_picked INTEGER,
         qty_missing INTEGER,
-        reason TEXT,             -- FALTANTE
+        reason TEXT,
         created_at TEXT
     );
     """)
@@ -201,8 +226,6 @@ def init_db():
         printed_at TEXT
     );
     """)
-    _add_column_if_missing(c, "sorting_status", "mesa", "INTEGER")
-    _add_column_if_missing(c, "sorting_status", "printed_at", "TEXT")
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_barcodes (
@@ -294,7 +317,7 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
     return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
 
 
-# ----------------- CARGA MAESTRO (SKU + BARCODE) -----------------
+# ----------------- MAESTRO SKU -----------------
 def load_master(inv_file) -> tuple[dict, dict, list]:
     inv_map_sku = {}
     barcode_to_sku = {}
@@ -503,60 +526,45 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
 # ----------------- UI: IMPORTAR -----------------
 def page_import():
     st.header("Importar ventas")
-
     origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
     num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
 
     st.subheader("Maestro de SKUs (opcional)")
-    st.caption("Columna SKU y opcional 'Codigo de barras' con múltiples EAN por celda.")
     inv_file = st.file_uploader("Maestro SKU (xlsx)", type=["xlsx"], key="inv_master")
 
     inv_map_sku, barcode_to_sku, conflicts = load_master(inv_file)
     if inv_file is not None:
-        st.success(f"Maestro cargado: {len(inv_map_sku)} SKUs con nombre técnico, {len(barcode_to_sku)} barcodes.")
+        st.success(f"Maestro: {len(inv_map_sku)} SKUs, {len(barcode_to_sku)} barcodes.")
         if conflicts:
-            st.warning("Conflictos de barcode detectados (barcode asignado a más de 1 SKU). Se usará el primero:")
+            st.warning("Conflictos de barcode detectados. Se usará el primero:")
             st.dataframe(pd.DataFrame(conflicts, columns=["Barcode", "SKU existente", "SKU nuevo"]).head(50))
         upsert_barcodes_to_db(barcode_to_sku)
-
-    sales_df = None
 
     if origen == "Excel Mercado Libre":
         file = st.file_uploader("Ventas ML (xlsx)", type=["xlsx"], key="ml_excel")
         if not file:
             st.info("Sube el Excel de ventas.")
             return
-        try:
-            sales_df = import_sales_excel(file)
-        except Exception as e:
-            st.error(f"Error leyendo Excel: {e}")
-            return
+        sales_df = import_sales_excel(file)
     else:
         pdf_file = st.file_uploader("Manifiesto PDF", type=["pdf"], key="ml_pdf")
         if not pdf_file:
-            st.info("Sube el PDF manifiesto.")
+            st.info("Sube el PDF.")
             return
-        try:
-            sales_df = parse_manifest_pdf(pdf_file)
-        except Exception as e:
-            st.error(f"No se pudo procesar el PDF: {e}")
-            return
+        sales_df = parse_manifest_pdf(pdf_file)
 
-    if sales_df is not None:
-        st.subheader("Vista previa")
-        st.dataframe(sales_df.head(30))
+    st.subheader("Vista previa")
+    st.dataframe(sales_df.head(30))
 
-        if st.button("Cargar y generar OTs"):
-            save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers))
-            st.success("OTs creadas. Ya puedes ir a Picking.")
+    if st.button("Cargar y generar OTs"):
+        save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers))
+        st.success("OTs creadas.")
 
 
 # ----------------- UI: PICKING (PDA) -----------------
 def page_picking():
-    # ✅ Compacto: sin header gigante
     st.markdown("### Picking (PDA)")
 
-    # ✅ CSS para compactar espacios y mostrar estado de validación
     st.markdown(
         """
         <style>
@@ -640,13 +648,12 @@ def page_picking():
             "needs_decision": False,
             "missing": 0,
             "show_manual_confirm": False,
-            "scan_status": "idle",      # idle / ok / bad
-            "scan_msg": ""
+            "scan_status": "idle",
+            "scan_msg": "",
+            "last_sku_expected": None
         }
     s = state[str(task_id)]
 
-    # ✅ Si cambió el SKU (nuevo task), reset estado de scan
-    # (clave: cuando el picker avanza, no arrastrar un OK anterior)
     if s.get("last_sku_expected") != sku_expected:
         s["last_sku_expected"] = sku_expected
         s["confirmed"] = False
@@ -656,8 +663,9 @@ def page_picking():
         s["show_manual_confirm"] = False
         s["scan_status"] = "idle"
         s["scan_msg"] = ""
+        s["qty_input"] = ""
+        s["scan_value"] = ""
 
-    # Card producto compacto
     st.markdown(
         f"""
         <div class="hero">
@@ -670,44 +678,44 @@ def page_picking():
         unsafe_allow_html=True
     )
 
-    # ✅ Indicador fijo de validación (check/x) justo arriba del input
     if s["scan_status"] == "ok":
         st.markdown(f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}', unsafe_allow_html=True)
     elif s["scan_status"] == "bad":
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([2, 1, 1])
-
-    with col1:
+    # ✅ Layout compacto: input a la izquierda y dos botones en la derecha (uno al lado del otro)
+    left, right = st.columns([2.2, 1.2])
+    with left:
         scan_label = "Escaneo"
         scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
         force_tel_keyboard(scan_label)
 
-    with col2:
-        if st.button("Validar"):
-            sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
-            if not sku_detected:
-                s["scan_status"] = "bad"
-                s["scan_msg"] = "No se pudo leer el código."
-                s["confirmed"] = False
-                s["confirm_mode"] = None
-            elif sku_detected != sku_expected:
-                s["scan_status"] = "bad"
-                s["scan_msg"] = f"Leído: {sku_detected}"
-                s["confirmed"] = False
-                s["confirm_mode"] = None
-            else:
-                s["scan_status"] = "ok"
-                s["scan_msg"] = "Producto correcto."
-                s["confirmed"] = True
-                s["confirm_mode"] = "SCAN"
-                s["scan_value"] = scan
-            st.rerun()
-
-    with col3:
-        if st.button("Sin EAN"):
-            s["show_manual_confirm"] = True
-            st.rerun()
+    with right:
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Validar"):
+                sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
+                if not sku_detected:
+                    s["scan_status"] = "bad"
+                    s["scan_msg"] = "No se pudo leer el código."
+                    s["confirmed"] = False
+                    s["confirm_mode"] = None
+                elif sku_detected != sku_expected:
+                    s["scan_status"] = "bad"
+                    s["scan_msg"] = f"Leído: {sku_detected}"
+                    s["confirmed"] = False
+                    s["confirm_mode"] = None
+                else:
+                    s["scan_status"] = "ok"
+                    s["scan_msg"] = "Producto correcto."
+                    s["confirmed"] = True
+                    s["confirm_mode"] = "SCAN"
+                    s["scan_value"] = scan
+                st.rerun()
+        with b2:
+            if st.button("Sin EAN"):
+                s["show_manual_confirm"] = True
+                st.rerun()
 
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
         st.info("Confirmación manual")
@@ -763,28 +771,23 @@ def page_picking():
     if s["needs_decision"]:
         st.error(f"DECISIÓN: faltan {s['missing']} unidades.")
         colA, colB = st.columns(2)
-
         with colA:
             if st.button("A incidencias y seguir"):
                 q = int(s["qty_input"])
                 missing = int(qty_total) - q
-
                 c.execute("""
                     INSERT INTO picking_incidences (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, created_at)
                     VALUES (?,?,?,?,?,?,?)
                 """, (ot_id, sku_expected, int(qty_total), q, missing, "FALTANTE", now_iso()))
-
                 c.execute("""
                     UPDATE picking_tasks
                     SET qty_picked=?, status='INCIDENCE', decided_at=?, confirm_mode=?
                     WHERE id=?
                 """, (q, now_iso(), s["confirm_mode"], task_id))
-
                 conn.commit()
                 state.pop(str(task_id), None)
                 st.success("Enviado a incidencias. Siguiente…")
                 st.rerun()
-
         with colB:
             if st.button("Reintentar"):
                 s["needs_decision"] = False
@@ -796,7 +799,6 @@ def page_picking():
 # ----------------- UI: ADMIN -----------------
 def page_admin():
     st.header("Administrador")
-
     pwd = st.text_input("Contraseña", type="password")
     if pwd != ADMIN_PASSWORD:
         st.info("Ingresa contraseña para administrar.")
@@ -821,7 +823,7 @@ def page_admin():
     col3.metric("OTs", n_ots)
     col4.metric("Incidencias", n_inc)
 
-    st.subheader("Estado OTs")
+    st.subheader("Estado OTs (hora Chile)")
     c.execute("""
         SELECT po.ot_code, pk.name, po.status, po.created_at, po.closed_at,
                SUM(CASE WHEN pt.status='PENDING' THEN 1 ELSE 0 END) as pendientes,
@@ -833,13 +835,16 @@ def page_admin():
         GROUP BY po.ot_code, pk.name, po.status, po.created_at, po.closed_at
         ORDER BY po.ot_code
     """)
-    df = pd.DataFrame(c.fetchall(), columns=[
+    rows = c.fetchall()
+    df = pd.DataFrame(rows, columns=[
         "OT", "Picker", "Estado", "Creada", "Cerrada",
         "Pendientes", "Resueltas", "Sin EAN"
     ])
+    df["Creada"] = df["Creada"].apply(to_chile_display)
+    df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
     st.dataframe(df)
 
-    st.subheader("Incidencias")
+    st.subheader("Incidencias (hora Chile)")
     c.execute("""
         SELECT po.ot_code, pk.name, pi.sku_ml, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.created_at
         FROM picking_incidences pi
@@ -850,6 +855,7 @@ def page_admin():
     inc_rows = c.fetchall()
     if inc_rows:
         df_inc = pd.DataFrame(inc_rows, columns=["OT", "Picker", "SKU", "Solicitado", "Pickeado", "Faltante", "Motivo", "Hora"])
+        df_inc["Hora"] = df_inc["Hora"].apply(to_chile_display)
         st.dataframe(df_inc)
     else:
         st.info("Sin incidencias en la corrida actual.")
@@ -876,7 +882,6 @@ def main():
     init_db()
 
     st.sidebar.title("Ferretería Aurora – WMS")
-
     page = st.sidebar.radio("Menú", [
         "1) Importar ventas",
         "2) Picking PDA (por OT)",
