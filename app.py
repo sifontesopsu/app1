@@ -454,6 +454,7 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
     conn = get_conn()
     c = conn.cursor()
 
+    # Reset corrida (pero NO borra orders históricos aquí; eso lo hace admin reset total)
     c.execute("DELETE FROM picking_tasks;")
     c.execute("DELETE FROM picking_incidences;")
     c.execute("DELETE FROM ot_orders;")
@@ -581,12 +582,78 @@ def page_import():
 
     if st.button("Cargar y generar OTs"):
         save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers))
-        st.success("OTs creadas.")
+        st.success("OTs creadas. Anda a Picking y elige P1, P2, ...")
 
 
-# ----------------- UI: PICKING (PDA) -----------------
+# ----------------- UI: PICKING (LOBBY + PDA) -----------------
+def picking_lobby():
+    st.markdown("### Picking")
+    st.caption("Selecciona tu pickeador")
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT name FROM pickers ORDER BY name")
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        st.info("Aún no hay pickeadores. Primero importa ventas y genera OTs.")
+        return False
+
+    pickers = [r[0] for r in rows]
+
+    # Botones grandes en grilla
+    st.markdown(
+        """
+        <style>
+        .bigbtn button {
+            width: 100% !important;
+            padding: 18px 10px !important;
+            font-size: 22px !important;
+            font-weight: 900 !important;
+            border-radius: 16px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    cols = st.columns(3)
+    chosen = None
+    for i, p in enumerate(pickers):
+        with cols[i % 3]:
+            st.markdown('<div class="bigbtn">', unsafe_allow_html=True)
+            if st.button(p, key=f"pick_{p}"):
+                chosen = p
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    if chosen:
+        st.session_state.selected_picker = chosen
+        st.rerun()
+
+    return "selected_picker" in st.session_state
+
+
 def page_picking():
-    st.markdown("### Picking (PDA)")
+    # Si no hay picker seleccionado, mostrar lobby
+    if "selected_picker" not in st.session_state:
+        ok = picking_lobby()
+        if not ok:
+            return
+
+    picker_name = st.session_state.get("selected_picker", "")
+    if not picker_name:
+        st.session_state.pop("selected_picker", None)
+        st.rerun()
+
+    # Botón para cambiar pickeador
+    topA, topB = st.columns([2, 1])
+    with topA:
+        st.markdown(f"### Picking (PDA) — {picker_name}")
+    with topB:
+        if st.button("Cambiar pickeador"):
+            st.session_state.pop("selected_picker", None)
+            st.rerun()
 
     st.markdown(
         """
@@ -605,36 +672,36 @@ def page_picking():
         unsafe_allow_html=True
     )
 
-    # ✅ Paso 1: pedir número de pickeador
-    picker_num = st.number_input("Nº pickeador", min_value=1, max_value=50, value=1, step=1)
-    picker_name = f"P{int(picker_num)}"
-
     conn = get_conn()
     c = conn.cursor()
+
     c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
     barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
 
     # Buscar OT del pickeador
     c.execute("""
-        SELECT po.id, po.ot_code, pk.name, po.status
+        SELECT po.id, po.ot_code, po.status
         FROM picking_ots po
         JOIN pickers pk ON pk.id = po.picker_id
         WHERE pk.name = ?
         ORDER BY po.ot_code
     """, (picker_name,))
     ots = c.fetchall()
-
     if not ots:
         st.error(f"No existe OT para {picker_name}. Importa ventas y genera OTs.")
         conn.close()
         return
 
-    labels = [f"{ot_code} – {picker} – {status}" for (ot_id, ot_code, picker, status) in ots]
-    sel = st.selectbox("OT asignada", labels, index=0)
-    ot_id = ots[labels.index(sel)][0]
+    # Si existieran múltiples OTs para el mismo pickeador (raro), elegimos la primera OPEN
+    ot_row = None
+    for r in ots:
+        if r[2] != "PICKED":
+            ot_row = r
+            break
+    if ot_row is None:
+        ot_row = ots[0]
 
-    c.execute("SELECT ot_code, status FROM picking_ots WHERE id=?", (ot_id,))
-    ot_code, ot_status = c.fetchone()
+    ot_id, ot_code, ot_status = ot_row
 
     if ot_status == "PICKED":
         st.success("OT cerrada (PICKED).")
@@ -699,7 +766,7 @@ def page_picking():
     st.markdown(
         f"""
         <div class="hero">
-            <div class="smallcap">OT: {ot_code} — Picker: {picker_name}</div>
+            <div class="smallcap">OT: {ot_code}</div>
             <div class="sku">SKU: {sku_expected}</div>
             <div class="prod">{producto}</div>
             <div class="qty">Solicitado: {qty_total}</div>
@@ -713,43 +780,40 @@ def page_picking():
     elif s["scan_status"] == "bad":
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
-    # ✅ Layout: input + (validar | sin ean) en la MISMA fila garantizado
-    left, right = st.columns([2.4, 1.0], vertical_alignment="bottom")
+    # ✅ Mantener versión anterior compacta (col1 input, col2 validar, col3 sin ean)
+    col1, col2, col3 = st.columns([2, 1, 1])
 
-    with left:
+    with col1:
         scan_label = "Escaneo"
         scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
         force_tel_keyboard(scan_label)
-        # ✅ Autofocus real al entrar al módulo y al pasar al siguiente producto
         autofocus_input(scan_label)
 
-    with right:
-        # ✅ Botones en línea (misma fila)
-        b1, b2 = st.columns([1, 1])
-        with b1:
-            if st.button("Validar", use_container_width=True):
-                sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
-                if not sku_detected:
-                    s["scan_status"] = "bad"
-                    s["scan_msg"] = "No se pudo leer."
-                    s["confirmed"] = False
-                    s["confirm_mode"] = None
-                elif sku_detected != sku_expected:
-                    s["scan_status"] = "bad"
-                    s["scan_msg"] = f"Leído: {sku_detected}"
-                    s["confirmed"] = False
-                    s["confirm_mode"] = None
-                else:
-                    s["scan_status"] = "ok"
-                    s["scan_msg"] = "Producto correcto."
-                    s["confirmed"] = True
-                    s["confirm_mode"] = "SCAN"
-                    s["scan_value"] = scan
-                st.rerun()
-        with b2:
-            if st.button("Sin EAN", use_container_width=True):
-                s["show_manual_confirm"] = True
-                st.rerun()
+    with col2:
+        if st.button("Validar"):
+            sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
+            if not sku_detected:
+                s["scan_status"] = "bad"
+                s["scan_msg"] = "No se pudo leer el código."
+                s["confirmed"] = False
+                s["confirm_mode"] = None
+            elif sku_detected != sku_expected:
+                s["scan_status"] = "bad"
+                s["scan_msg"] = f"Leído: {sku_detected}"
+                s["confirmed"] = False
+                s["confirm_mode"] = None
+            else:
+                s["scan_status"] = "ok"
+                s["scan_msg"] = "Producto correcto."
+                s["confirmed"] = True
+                s["confirm_mode"] = "SCAN"
+                s["scan_value"] = scan
+            st.rerun()
+
+    with col3:
+        if st.button("Sin EAN"):
+            s["show_manual_confirm"] = True
+            st.rerun()
 
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
         st.info("Confirmación manual")
@@ -805,23 +869,28 @@ def page_picking():
     if s["needs_decision"]:
         st.error(f"DECISIÓN: faltan {s['missing']} unidades.")
         colA, colB = st.columns(2)
+
         with colA:
             if st.button("A incidencias y seguir"):
                 q = int(s["qty_input"])
                 missing = int(qty_total) - q
+
                 c.execute("""
                     INSERT INTO picking_incidences (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, created_at)
                     VALUES (?,?,?,?,?,?,?)
                 """, (ot_id, sku_expected, int(qty_total), q, missing, "FALTANTE", now_iso()))
+
                 c.execute("""
                     UPDATE picking_tasks
                     SET qty_picked=?, status='INCIDENCE', decided_at=?, confirm_mode=?
                     WHERE id=?
                 """, (q, now_iso(), s["confirm_mode"], task_id))
+
                 conn.commit()
                 state.pop(str(task_id), None)
                 st.success("Enviado a incidencias. Siguiente…")
                 st.rerun()
+
         with colB:
             if st.button("Reintentar"):
                 s["needs_decision"] = False
@@ -896,21 +965,19 @@ def page_admin():
     st.divider()
     st.subheader("Acciones")
 
-    # ✅ Confirmación obligatoria antes de borrar TODO
     if "confirm_reset" not in st.session_state:
         st.session_state.confirm_reset = False
 
     if not st.session_state.confirm_reset:
         if st.button("Reiniciar corrida (BORRA TODO)"):
             st.session_state.confirm_reset = True
-            st.warning("⚠️ Esto borrará OTs, tareas, incidencias y TAMBIÉN el histórico de ventas (orders). Confirma abajo.")
+            st.warning("⚠️ Esto borrará TODA la información (OTs, tareas, incidencias y ventas). Confirma abajo.")
             st.rerun()
     else:
         st.error("CONFIRMACIÓN: se borrarán TODOS los datos del sistema.")
         colA, colB = st.columns(2)
         with colA:
             if st.button("✅ Sí, borrar todo y reiniciar"):
-                # Borra corrida + histórico
                 c.execute("DELETE FROM picking_tasks;")
                 c.execute("DELETE FROM picking_incidences;")
                 c.execute("DELETE FROM sorting_status;")
@@ -939,9 +1006,9 @@ def main():
 
     st.sidebar.title("Ferretería Aurora – WMS")
 
-    # ✅ El primer módulo es Picking y queda por defecto
+    # Primer módulo: Picking
     pages = [
-        "1) Picking PDA (por OT)",
+        "1) Picking",
         "2) Importar ventas",
         "3) Administrador",
     ]
