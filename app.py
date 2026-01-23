@@ -9,8 +9,10 @@ import re
 try:
     from zoneinfo import ZoneInfo  # py3.9+
     CL_TZ = ZoneInfo("America/Santiago")
+    UTC_TZ = ZoneInfo("UTC")
 except Exception:
-    CL_TZ = None  # fallback
+    CL_TZ = None
+    UTC_TZ = None
 
 # PDF manifiestos
 try:
@@ -26,22 +28,19 @@ NUM_MESAS = 4
 
 # ----------------- UTILIDADES -----------------
 def now_iso():
-    # Guardamos naive ISO (como venías haciendo) para compatibilidad
+    # Guardamos naive ISO (server suele ser UTC en Streamlit Cloud)
     return datetime.now().isoformat(timespec="seconds")
 
 
 def to_chile_display(iso_str: str) -> str:
-    """Convierte ISO guardado a hora Chile para mostrar (America/Santiago)."""
+    """Convierte ISO guardado (asumido UTC server) a hora Chile para mostrar."""
     if not iso_str:
         return ""
     try:
         dt = datetime.fromisoformat(str(iso_str))
-        if CL_TZ is None:
+        if CL_TZ is None or UTC_TZ is None:
             return dt.strftime("%Y-%m-%d %H:%M:%S")
-        # asumimos dt naive como UTC? o local server? -> lo más estable: tratar como UTC si viene naive
-        # PERO como se guardó con datetime.now() del server, en cloud suele ser UTC.
-        # Convertimos: dt naive -> UTC -> Chile
-        dt_utc = dt.replace(tzinfo=ZoneInfo("UTC"))
+        dt_utc = dt.replace(tzinfo=UTC_TZ)
         dt_cl = dt_utc.astimezone(CL_TZ)
         return dt_cl.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -129,14 +128,38 @@ def force_tel_keyboard(label: str):
     )
 
 
+def autofocus_input(label: str):
+    """Pone foco inmediato en un input por aria-label."""
+    safe = label.replace("\\", "\\\\").replace('"', '\\"')
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          const label = "{safe}";
+          let tries = 0;
+          function focusIt() {{
+            const el = window.parent.document.querySelector('input[aria-label="' + label + '"]');
+            if (!el) {{
+              tries++;
+              if (tries < 40) setTimeout(focusIt, 120);
+              return;
+            }}
+            try {{
+              el.focus();
+              el.select();
+            }} catch (e) {{}}
+          }}
+          focusIt();
+          setTimeout(focusIt, 300);
+          setTimeout(focusIt, 900);
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
 # ----------------- BASE DE DATOS -----------------
-def _add_column_if_missing(c, table, col_name, col_def):
-    c.execute(f"PRAGMA table_info({table});")
-    cols = [r[1] for r in c.fetchall()]
-    if col_name not in cols:
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {col_def and col_name} {col_def};")
-
-
 def init_db():
     conn = get_conn()
     c = conn.cursor()
@@ -568,7 +591,7 @@ def page_picking():
     st.markdown(
         """
         <style>
-        div.block-container { padding-top: 0.8rem; padding-bottom: 1rem; }
+        div.block-container { padding-top: 0.6rem; padding-bottom: 1rem; }
         .hero { padding: 10px 12px; border-radius: 12px; background: rgba(0,0,0,0.04); margin: 6px 0 8px 0; }
         .hero .sku { font-size: 26px; font-weight: 900; margin: 0; }
         .hero .prod { font-size: 22px; font-weight: 800; margin: 6px 0 0 0; line-height: 1.15; }
@@ -582,25 +605,32 @@ def page_picking():
         unsafe_allow_html=True
     )
 
+    # ✅ Paso 1: pedir número de pickeador
+    picker_num = st.number_input("Nº pickeador", min_value=1, max_value=50, value=1, step=1)
+    picker_name = f"P{int(picker_num)}"
+
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
     barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
 
+    # Buscar OT del pickeador
     c.execute("""
         SELECT po.id, po.ot_code, pk.name, po.status
         FROM picking_ots po
         JOIN pickers pk ON pk.id = po.picker_id
+        WHERE pk.name = ?
         ORDER BY po.ot_code
-    """)
+    """, (picker_name,))
     ots = c.fetchall()
+
     if not ots:
-        st.info("No hay OTs. Importa ventas primero.")
+        st.error(f"No existe OT para {picker_name}. Importa ventas y genera OTs.")
         conn.close()
         return
 
     labels = [f"{ot_code} – {picker} – {status}" for (ot_id, ot_code, picker, status) in ots]
-    sel = st.selectbox("OT", labels, index=0)
+    sel = st.selectbox("OT asignada", labels, index=0)
     ot_id = ots[labels.index(sel)][0]
 
     c.execute("SELECT ot_code, status FROM picking_ots WHERE id=?", (ot_id,))
@@ -669,7 +699,7 @@ def page_picking():
     st.markdown(
         f"""
         <div class="hero">
-            <div class="smallcap">OT: {ot_code}</div>
+            <div class="smallcap">OT: {ot_code} — Picker: {picker_name}</div>
             <div class="sku">SKU: {sku_expected}</div>
             <div class="prod">{producto}</div>
             <div class="qty">Solicitado: {qty_total}</div>
@@ -683,21 +713,25 @@ def page_picking():
     elif s["scan_status"] == "bad":
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
-    # ✅ Layout compacto: input a la izquierda y dos botones en la derecha (uno al lado del otro)
-    left, right = st.columns([2.2, 1.2])
+    # ✅ Layout: input + (validar | sin ean) en la MISMA fila garantizado
+    left, right = st.columns([2.4, 1.0], vertical_alignment="bottom")
+
     with left:
         scan_label = "Escaneo"
         scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
         force_tel_keyboard(scan_label)
+        # ✅ Autofocus real al entrar al módulo y al pasar al siguiente producto
+        autofocus_input(scan_label)
 
     with right:
-        b1, b2 = st.columns(2)
+        # ✅ Botones en línea (misma fila)
+        b1, b2 = st.columns([1, 1])
         with b1:
-            if st.button("Validar"):
+            if st.button("Validar", use_container_width=True):
                 sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
                 if not sku_detected:
                     s["scan_status"] = "bad"
-                    s["scan_msg"] = "No se pudo leer el código."
+                    s["scan_msg"] = "No se pudo leer."
                     s["confirmed"] = False
                     s["confirm_mode"] = None
                 elif sku_detected != sku_expected:
@@ -713,7 +747,7 @@ def page_picking():
                     s["scan_value"] = scan
                 st.rerun()
         with b2:
-            if st.button("Sin EAN"):
+            if st.button("Sin EAN", use_container_width=True):
                 s["show_manual_confirm"] = True
                 st.rerun()
 
@@ -823,7 +857,7 @@ def page_admin():
     col3.metric("OTs", n_ots)
     col4.metric("Incidencias", n_inc)
 
-    st.subheader("Estado OTs (hora Chile)")
+    st.subheader("Estado OTs")
     c.execute("""
         SELECT po.ot_code, pk.name, po.status, po.created_at, po.closed_at,
                SUM(CASE WHEN pt.status='PENDING' THEN 1 ELSE 0 END) as pendientes,
@@ -835,8 +869,7 @@ def page_admin():
         GROUP BY po.ot_code, pk.name, po.status, po.created_at, po.closed_at
         ORDER BY po.ot_code
     """)
-    rows = c.fetchall()
-    df = pd.DataFrame(rows, columns=[
+    df = pd.DataFrame(c.fetchall(), columns=[
         "OT", "Picker", "Estado", "Creada", "Cerrada",
         "Pendientes", "Resueltas", "Sin EAN"
     ])
@@ -844,7 +877,7 @@ def page_admin():
     df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
     st.dataframe(df)
 
-    st.subheader("Incidencias (hora Chile)")
+    st.subheader("Incidencias")
     c.execute("""
         SELECT po.ot_code, pk.name, pi.sku_ml, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.created_at
         FROM picking_incidences pi
@@ -862,16 +895,39 @@ def page_admin():
 
     st.divider()
     st.subheader("Acciones")
-    if st.button("Reiniciar corrida (borra OTs/tasks/incidencias; mantiene histórico ventas)"):
-        c.execute("DELETE FROM picking_tasks;")
-        c.execute("DELETE FROM picking_incidences;")
-        c.execute("DELETE FROM sorting_status;")
-        c.execute("DELETE FROM ot_orders;")
-        c.execute("DELETE FROM picking_ots;")
-        c.execute("DELETE FROM pickers;")
-        conn.commit()
-        st.success("Corrida reiniciada.")
-        st.rerun()
+
+    # ✅ Confirmación obligatoria antes de borrar TODO
+    if "confirm_reset" not in st.session_state:
+        st.session_state.confirm_reset = False
+
+    if not st.session_state.confirm_reset:
+        if st.button("Reiniciar corrida (BORRA TODO)"):
+            st.session_state.confirm_reset = True
+            st.warning("⚠️ Esto borrará OTs, tareas, incidencias y TAMBIÉN el histórico de ventas (orders). Confirma abajo.")
+            st.rerun()
+    else:
+        st.error("CONFIRMACIÓN: se borrarán TODOS los datos del sistema.")
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("✅ Sí, borrar todo y reiniciar"):
+                # Borra corrida + histórico
+                c.execute("DELETE FROM picking_tasks;")
+                c.execute("DELETE FROM picking_incidences;")
+                c.execute("DELETE FROM sorting_status;")
+                c.execute("DELETE FROM ot_orders;")
+                c.execute("DELETE FROM picking_ots;")
+                c.execute("DELETE FROM pickers;")
+                c.execute("DELETE FROM order_items;")
+                c.execute("DELETE FROM orders;")
+                conn.commit()
+                st.session_state.confirm_reset = False
+                st.success("Sistema reiniciado (todo borrado).")
+                st.rerun()
+        with colB:
+            if st.button("Cancelar"):
+                st.session_state.confirm_reset = False
+                st.info("Reinicio cancelado.")
+                st.rerun()
 
     conn.close()
 
@@ -882,16 +938,19 @@ def main():
     init_db()
 
     st.sidebar.title("Ferretería Aurora – WMS")
-    page = st.sidebar.radio("Menú", [
-        "1) Importar ventas",
-        "2) Picking PDA (por OT)",
-        "3) Administrador"
-    ])
+
+    # ✅ El primer módulo es Picking y queda por defecto
+    pages = [
+        "1) Picking PDA (por OT)",
+        "2) Importar ventas",
+        "3) Administrador",
+    ]
+    page = st.sidebar.radio("Menú", pages, index=0)
 
     if page.startswith("1"):
-        page_import()
-    elif page.startswith("2"):
         page_picking()
+    elif page.startswith("2"):
+        page_import()
     else:
         page_admin()
 
