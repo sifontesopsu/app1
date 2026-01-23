@@ -41,7 +41,6 @@ def only_digits(s: str) -> str:
 
 
 def split_barcodes(cell_value) -> list[str]:
-    """Soporta múltiples códigos en una celda, separados por espacio/coma/; o saltos."""
     if cell_value is None:
         return []
     s = str(cell_value).strip()
@@ -56,7 +55,6 @@ def split_barcodes(cell_value) -> list[str]:
         d = only_digits(p)
         if d:
             out.append(d)
-    # únicos preservando orden
     seen = set()
     uniq = []
     for x in out:
@@ -71,10 +69,7 @@ def get_conn():
 
 
 def force_tel_keyboard(label: str):
-    """
-    Fuerza teclado numérico tipo "teléfono" en Android para el input cuyo aria-label coincide con `label`.
-    Funciona porque Streamlit pone aria-label=label en el <input>.
-    """
+    """Fuerza teclado numérico tipo 'teléfono' en iOS/Android para el input con aria-label=label."""
     safe = label.replace("\\", "\\\\").replace('"', '\\"')
     components.html(
         f"""
@@ -82,7 +77,6 @@ def force_tel_keyboard(label: str):
         (function() {{
           const label = "{safe}";
           let tries = 0;
-
           function apply() {{
             const inputs = window.parent.document.querySelectorAll('input[aria-label="' + label + '"]');
             if (!inputs || inputs.length === 0) {{
@@ -99,10 +93,7 @@ def force_tel_keyboard(label: str):
               }} catch (e) {{}}
             }});
           }}
-
           apply();
-
-          // Re-aplica en caso de rerender (Streamlit cambia el DOM a veces)
           setTimeout(apply, 500);
           setTimeout(apply, 1200);
         }})();
@@ -199,7 +190,6 @@ def init_db():
     );
     """)
 
-    # (sorting oculto por ahora, pero mantenemos tabla)
     c.execute("""
     CREATE TABLE IF NOT EXISTS sorting_status (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -333,7 +323,6 @@ def load_master(inv_file) -> tuple[dict, dict, list]:
             barcode_col = cols[lower.index(cand)]
             break
 
-    # fallback (sin headers)
     if sku_col is None or tech_col is None:
         df0 = pd.read_excel(inv_file, header=None, dtype=str)
         if df0.shape[1] >= 2:
@@ -419,7 +408,6 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
     conn = get_conn()
     c = conn.cursor()
 
-    # reinicia corrida operativa
     c.execute("DELETE FROM picking_tasks;")
     c.execute("DELETE FROM picking_incidences;")
     c.execute("DELETE FROM ot_orders;")
@@ -457,7 +445,6 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
                 (order_id, sku, title_eff, title_tec, qty)
             )
 
-    # pickers + ots
     picker_ids = []
     for i in range(int(num_pickers)):
         name = f"P{i+1}"
@@ -475,14 +462,12 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
         c.execute("UPDATE picking_ots SET ot_code=? WHERE id=?", (ot_code, ot_id))
         ot_ids.append(ot_id)
 
-    # repartir ventas equitativas por orden
     unique_orders = sales_df[["ml_order_id"]].drop_duplicates().reset_index(drop=True)
     assignments = {}
     for idx, row in unique_orders.iterrows():
         ot_id = ot_ids[idx % len(ot_ids)]
         assignments[str(row["ml_order_id"]).strip()] = ot_id
 
-    # mesa round robin (aunque sorting esté oculto)
     for idx, (ml_order_id, ot_id) in enumerate(assignments.items()):
         order_id = order_id_by_ml[ml_order_id]
         mesa = (idx % NUM_MESAS) + 1
@@ -492,7 +477,6 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
             VALUES (?,?,?,?,?,?)
         """, (ot_id, order_id, "PENDING", None, mesa, None))
 
-    # tasks por OT agrupado por SKU (ruta ordenada)
     for ot_id in ot_ids:
         c.execute("""
             SELECT oi.sku_ml,
@@ -518,13 +502,13 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
 
 # ----------------- UI: IMPORTAR -----------------
 def page_import():
-    st.header("1) Importar ventas")
+    st.header("Importar ventas")
 
     origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
     num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
 
-    st.subheader("Maestro de SKUs y nombres técnicos (opcional, recomendado)")
-    st.caption("Soporta columna SKU y (opcional) columna 'Codigo de barras' con múltiples códigos por celda.")
+    st.subheader("Maestro de SKUs (opcional)")
+    st.caption("Columna SKU y opcional 'Codigo de barras' con múltiples EAN por celda.")
     inv_file = st.file_uploader("Maestro SKU (xlsx)", type=["xlsx"], key="inv_master")
 
     inv_map_sku, barcode_to_sku, conflicts = load_master(inv_file)
@@ -559,7 +543,7 @@ def page_import():
             return
 
     if sales_df is not None:
-        st.subheader("Vista previa ventas")
+        st.subheader("Vista previa")
         st.dataframe(sales_df.head(30))
 
         if st.button("Cargar y generar OTs"):
@@ -569,7 +553,26 @@ def page_import():
 
 # ----------------- UI: PICKING (PDA) -----------------
 def page_picking():
-    st.header("2) Picking PDA por OT (1 escaneo + cantidad digitada + decisión)")
+    # ✅ Compacto: sin header gigante
+    st.markdown("### Picking (PDA)")
+
+    # ✅ CSS para compactar espacios y mostrar estado de validación
+    st.markdown(
+        """
+        <style>
+        div.block-container { padding-top: 0.8rem; padding-bottom: 1rem; }
+        .hero { padding: 10px 12px; border-radius: 12px; background: rgba(0,0,0,0.04); margin: 6px 0 8px 0; }
+        .hero .sku { font-size: 26px; font-weight: 900; margin: 0; }
+        .hero .prod { font-size: 22px; font-weight: 800; margin: 6px 0 0 0; line-height: 1.15; }
+        .hero .qty { font-size: 26px; font-weight: 900; margin: 8px 0 0 0; }
+        .smallcap { font-size: 12px; opacity: 0.75; margin: 0 0 4px 0; }
+        .scanok { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
+        .ok { background: rgba(0, 200, 0, 0.15); }
+        .bad { background: rgba(255, 0, 0, 0.12); }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
     conn = get_conn()
     c = conn.cursor()
@@ -589,14 +592,14 @@ def page_picking():
         return
 
     labels = [f"{ot_code} – {picker} – {status}" for (ot_id, ot_code, picker, status) in ots]
-    sel = st.selectbox("Selecciona tu OT", labels, index=0)
+    sel = st.selectbox("OT", labels, index=0)
     ot_id = ots[labels.index(sel)][0]
 
     c.execute("SELECT ot_code, status FROM picking_ots WHERE id=?", (ot_id,))
     ot_code, ot_status = c.fetchone()
 
     if ot_status == "PICKED":
-        st.success("Esta OT ya está cerrada (PICKED).")
+        st.success("OT cerrada (PICKED).")
         conn.close()
         return
 
@@ -611,11 +614,11 @@ def page_picking():
 
     total_tasks = len(tasks)
     done_small = sum(1 for t in tasks if t[5] in ("DONE", "INCIDENCE"))
-    st.caption(f"Resueltos (DONE/INCIDENCE): {done_small}/{total_tasks}")
+    st.caption(f"Resueltos: {done_small}/{total_tasks}")
 
     current = next((t for t in tasks if t[5] == "PENDING"), None)
     if current is None:
-        st.success("No quedan SKUs pendientes. Puedes cerrar la OT.")
+        st.success("No quedan SKUs pendientes.")
         if st.button("Cerrar OT"):
             c.execute("UPDATE picking_ots SET status='PICKED', closed_at=? WHERE id=?", (now_iso(), ot_id))
             conn.commit()
@@ -624,31 +627,6 @@ def page_picking():
         return
 
     task_id, sku_expected, producto, qty_total, qty_picked, status = current
-
-    st.markdown(
-        """
-        <style>
-        .hero { padding: 12px 14px; border-radius: 12px; background: rgba(0,0,0,0.04); margin-bottom: 12px; }
-        .hero .sku { font-size: 30px; font-weight: 900; }
-        .hero .prod { font-size: 28px; font-weight: 800; margin-top: 4px; }
-        .hero .qty { font-size: 34px; font-weight: 900; margin-top: 8px; }
-        .smallcap { font-size: 12px; opacity: 0.75; }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        f"""
-        <div class="hero">
-            <div class="smallcap">OT: {ot_code}</div>
-            <div class="sku">SKU: {sku_expected}</div>
-            <div class="prod">{producto}</div>
-            <div class="qty">Solicitado: {qty_total}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
 
     if "pick_state" not in st.session_state:
         st.session_state.pick_state = {}
@@ -661,54 +639,88 @@ def page_picking():
             "qty_input": "",
             "needs_decision": False,
             "missing": 0,
-            "show_manual_confirm": False
+            "show_manual_confirm": False,
+            "scan_status": "idle",      # idle / ok / bad
+            "scan_msg": ""
         }
     s = state[str(task_id)]
 
-    st.divider()
+    # ✅ Si cambió el SKU (nuevo task), reset estado de scan
+    # (clave: cuando el picker avanza, no arrastrar un OK anterior)
+    if s.get("last_sku_expected") != sku_expected:
+        s["last_sku_expected"] = sku_expected
+        s["confirmed"] = False
+        s["confirm_mode"] = None
+        s["needs_decision"] = False
+        s["missing"] = 0
+        s["show_manual_confirm"] = False
+        s["scan_status"] = "idle"
+        s["scan_msg"] = ""
+
+    # Card producto compacto
+    st.markdown(
+        f"""
+        <div class="hero">
+            <div class="smallcap">OT: {ot_code}</div>
+            <div class="sku">SKU: {sku_expected}</div>
+            <div class="prod">{producto}</div>
+            <div class="qty">Solicitado: {qty_total}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # ✅ Indicador fijo de validación (check/x) justo arriba del input
+    if s["scan_status"] == "ok":
+        st.markdown(f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}', unsafe_allow_html=True)
+    elif s["scan_status"] == "bad":
+        st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
-        # SCAN: sigue siendo text_input para NO perder ceros a la izquierda
-        scan_label = "Escanea SKU / Código de barras"
+        scan_label = "Escaneo"
         scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
         force_tel_keyboard(scan_label)
 
     with col2:
-        if st.button("Validar escaneo"):
+        if st.button("Validar"):
             sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
             if not sku_detected:
-                st.error("No se pudo interpretar el escaneo.")
+                s["scan_status"] = "bad"
+                s["scan_msg"] = "No se pudo leer el código."
                 s["confirmed"] = False
                 s["confirm_mode"] = None
             elif sku_detected != sku_expected:
-                st.error(f"Escaneo corresponde a SKU {sku_detected}, pero el producto actual es {sku_expected}.")
+                s["scan_status"] = "bad"
+                s["scan_msg"] = f"Leído: {sku_detected}"
                 s["confirmed"] = False
                 s["confirm_mode"] = None
             else:
+                s["scan_status"] = "ok"
+                s["scan_msg"] = "Producto correcto."
                 s["confirmed"] = True
                 s["confirm_mode"] = "SCAN"
                 s["scan_value"] = scan
-                s["show_manual_confirm"] = False
-                st.success("Producto validado por escaneo. Ingresa la cantidad pickeada.")
-                st.rerun()
+            st.rerun()
 
     with col3:
-        if st.button("Producto sin EAN"):
+        if st.button("Sin EAN"):
             s["show_manual_confirm"] = True
+            st.rerun()
 
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
-        st.info("Confirmación manual (sin EAN)")
-        st.write(f"✅ **Producto:** {producto}")
-        if st.button("Confirmar manual", key=f"confirm_manual_{task_id}"):
+        st.info("Confirmación manual")
+        st.write(f"✅ {producto}")
+        if st.button("Confirmar", key=f"confirm_manual_{task_id}"):
             s["confirmed"] = True
             s["confirm_mode"] = "MANUAL_NO_EAN"
             s["show_manual_confirm"] = False
-            st.success("Producto confirmado manualmente. Ingresa la cantidad.")
+            s["scan_status"] = "ok"
+            s["scan_msg"] = "Confirmado manual."
             st.rerun()
 
-    qty_label = "Cantidad pickeada (digitada)"
+    qty_label = "Cantidad"
     qty_in = st.text_input(
         qty_label,
         value=s["qty_input"],
@@ -728,7 +740,7 @@ def page_picking():
             s["qty_input"] = str(q)
 
             if q > int(qty_total):
-                st.error(f"La cantidad ingresada ({q}) supera la solicitada ({qty_total}). Corrige el valor.")
+                st.error(f"La cantidad ({q}) supera solicitado ({qty_total}).")
                 s["needs_decision"] = False
 
             elif q == int(qty_total):
@@ -739,21 +751,21 @@ def page_picking():
                 """, (q, now_iso(), s["confirm_mode"], task_id))
                 conn.commit()
                 state.pop(str(task_id), None)
-                st.success("Producto completado. Pasando al siguiente…")
+                st.success("OK. Siguiente…")
                 st.rerun()
 
             else:
                 missing = int(qty_total) - q
                 s["needs_decision"] = True
                 s["missing"] = missing
-                st.warning(f"Faltan {missing} unidades. Debes decidir: incidencias o reintentar. No puedes avanzar sin decisión.")
+                st.warning(f"Faltan {missing}. Debes decidir (incidencias o reintentar).")
 
     if s["needs_decision"]:
-        st.error(f"DECISIÓN OBLIGATORIA: faltan {s['missing']} unidades.")
+        st.error(f"DECISIÓN: faltan {s['missing']} unidades.")
         colA, colB = st.columns(2)
 
         with colA:
-            if st.button("Enviar a incidencias y continuar"):
+            if st.button("A incidencias y seguir"):
                 q = int(s["qty_input"])
                 missing = int(qty_total) - q
 
@@ -770,20 +782,20 @@ def page_picking():
 
                 conn.commit()
                 state.pop(str(task_id), None)
-                st.success("Enviado a incidencias. Continuando…")
+                st.success("Enviado a incidencias. Siguiente…")
                 st.rerun()
 
         with colB:
-            if st.button("Reintentar (seguir buscando)"):
+            if st.button("Reintentar"):
                 s["needs_decision"] = False
-                st.info("Reintentar: ajusta la cantidad y vuelve a confirmar.")
+                st.info("Ajusta cantidad y confirma nuevamente.")
 
     conn.close()
 
 
 # ----------------- UI: ADMIN -----------------
 def page_admin():
-    st.header("3) Administrador")
+    st.header("Administrador")
 
     pwd = st.text_input("Contraseña", type="password")
     if pwd != ADMIN_PASSWORD:
@@ -793,7 +805,7 @@ def page_admin():
     conn = get_conn()
     c = conn.cursor()
 
-    st.subheader("Resumen general")
+    st.subheader("Resumen")
     c.execute("SELECT COUNT(*) FROM orders")
     n_orders = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM order_items")
@@ -804,12 +816,12 @@ def page_admin():
     n_inc = c.fetchone()[0]
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Ventas (histórico)", n_orders)
-    col2.metric("Líneas (histórico)", n_items)
-    col3.metric("OTs (corrida)", n_ots)
-    col4.metric("Incidencias (corrida)", n_inc)
+    col1.metric("Ventas", n_orders)
+    col2.metric("Líneas", n_items)
+    col3.metric("OTs", n_ots)
+    col4.metric("Incidencias", n_inc)
 
-    st.subheader("Estado de OTs")
+    st.subheader("Estado OTs")
     c.execute("""
         SELECT po.ot_code, pk.name, po.status, po.created_at, po.closed_at,
                SUM(CASE WHEN pt.status='PENDING' THEN 1 ELSE 0 END) as pendientes,
@@ -823,7 +835,7 @@ def page_admin():
     """)
     df = pd.DataFrame(c.fetchall(), columns=[
         "OT", "Picker", "Estado", "Creada", "Cerrada",
-        "SKUs pendientes", "SKUs resueltos", "Confirmaciones sin EAN"
+        "Pendientes", "Resueltas", "Sin EAN"
     ])
     st.dataframe(df)
 
@@ -840,11 +852,11 @@ def page_admin():
         df_inc = pd.DataFrame(inc_rows, columns=["OT", "Picker", "SKU", "Solicitado", "Pickeado", "Faltante", "Motivo", "Hora"])
         st.dataframe(df_inc)
     else:
-        st.info("Sin incidencias registradas en la corrida actual.")
+        st.info("Sin incidencias en la corrida actual.")
 
     st.divider()
     st.subheader("Acciones")
-    if st.button("Reiniciar corrida operativa (borra OTs, tasks, sorting, incidencias; mantiene histórico ventas)"):
+    if st.button("Reiniciar corrida (borra OTs/tasks/incidencias; mantiene histórico ventas)"):
         c.execute("DELETE FROM picking_tasks;")
         c.execute("DELETE FROM picking_incidences;")
         c.execute("DELETE FROM sorting_status;")
@@ -865,7 +877,6 @@ def main():
 
     st.sidebar.title("Ferretería Aurora – WMS")
 
-    # Sorting oculto por ahora
     page = st.sidebar.radio("Menú", [
         "1) Importar ventas",
         "2) Picking PDA (por OT)",
