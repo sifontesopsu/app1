@@ -1140,7 +1140,7 @@ def compute_full_status(qty_required: int, qty_checked: int, has_incidence: bool
 def get_open_full_batches():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, batch_name, status, created_at FROM full_batches ORDER BY id DESC")
+    c.execute("SELECT id, batch_name, status, created_at FROM full_batches WHERE status='OPEN' ORDER BY id DESC")
     rows = c.fetchall()
     conn.close()
     return rows
@@ -1317,48 +1317,57 @@ def page_full_upload(inv_map_sku: dict):
 
 
 
-# =========================
-# UI: FULL - SUPERVISOR ACOPIO (ESCANEO)
-# =========================
+
+def page_full_supervisor(inv_map_sku: dict):
+    st.header("Full – Supervisor de acopio")
+
+    # Resolver lote activo: debe existir un lote OPEN (solo trabajamos con 1 a la vez)
+    open_batches = get_open_full_batches()
+    if not open_batches:
+        st.info("No hay un lote Full en curso. Ve a **Full – Cargar Excel** para crear la corrida.")
+        return
+
+    batch_id, _batch_name, _status, _created_at = open_batches[0]
+
+    # Map barcode->sku desde DB (maestro ya lo cargó)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
+    barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
+    conn.close()
+
     st.markdown(
         """
         <style>
         .hero2 { padding: 10px 12px; border-radius: 12px; background: rgba(0,0,0,0.04); margin: 8px 0; }
         .hero2 .sku { font-size: 26px; font-weight: 900; margin: 0; }
         .hero2 .prod { font-size: 22px; font-weight: 800; margin: 6px 0 0 0; line-height: 1.15; }
-        .hero2 .qty { font-size: 22px; font-weight: 900; margin: 8px 0 0 0; }
+        .hero2 .qty { font-size: 20px; font-weight: 900; margin: 8px 0 0 0; }
         .tag { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
         .ok { background: rgba(0, 200, 0, 0.15); }
-        .warn { background: rgba(255, 165, 0, 0.15); }
         .bad { background: rgba(255, 0, 0, 0.12); }
         </style>
         """,
         unsafe_allow_html=True
     )
 
+    # Estado UI supervisor (por lote)
     if "full_sup_state" not in st.session_state:
         st.session_state.full_sup_state = {}
 
     state = st.session_state.full_sup_state
     if str(batch_id) not in state:
-        state[str(batch_id)] = {
-            "scan_value": "",
-            "sku_current": "",
-            "msg": "",
-            "msg_kind": "idle",
-            "qty_input": ""
-        }
+        state[str(batch_id)] = {"scan_value": "", "sku_current": "", "qty_input": "", "msg": "", "msg_kind": "idle"}
 
     sst = state[str(batch_id)]
 
-    # Input escaneo
     scan_label = "Escaneo"
-    scan = st.text_input(scan_label, value=sst["scan_value"], key=f"full_scan_{batch_id}")
+    scan = st.text_input(scan_label, value=sst.get("scan_value", ""), key=f"full_scan_{batch_id}")
     force_tel_keyboard(scan_label)
     autofocus_input(scan_label)
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
+    colA, colB = st.columns([1, 1])
+    with colA:
         if st.button("🔎 Buscar / Validar", key=f"full_find_{batch_id}"):
             sku = resolve_scan_to_sku(scan, barcode_to_sku)
             sst["scan_value"] = scan
@@ -1370,10 +1379,11 @@ def page_full_upload(inv_map_sku: dict):
                 sst["msg"] = "No se pudo leer el código."
                 st.rerun()
 
+            # Validar si existe en el lote
             conn = get_conn()
             c = conn.cursor()
             c.execute("""
-                SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked, status, areas, nros, instruccion, etiquetar, es_pack, vence
+                SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked
                 FROM full_batch_items
                 WHERE batch_id=? AND sku_ml=?
             """, (batch_id, sku))
@@ -1383,20 +1393,19 @@ def page_full_upload(inv_map_sku: dict):
             if not row:
                 sst["msg_kind"] = "bad"
                 sst["msg"] = f"{sku} no pertenece a este lote."
+                sst["sku_current"] = ""
             else:
                 sst["msg_kind"] = "ok"
                 sst["msg"] = "SKU encontrado."
             st.rerun()
 
-    with col2:
+    with colB:
         if st.button("🧹 Limpiar", key=f"full_clear_{batch_id}"):
-            # Limpia estado + campos visibles
-            if str(batch_id) in state:
-                state[str(batch_id)]["scan_value"] = ""
-                state[str(batch_id)]["sku_current"] = ""
-                state[str(batch_id)]["qty_input"] = ""
-                state[str(batch_id)]["msg_kind"] = "idle"
-                state[str(batch_id)]["msg"] = ""
+            sst["scan_value"] = ""
+            sst["sku_current"] = ""
+            sst["qty_input"] = ""
+            sst["msg_kind"] = "idle"
+            sst["msg"] = ""
             try:
                 st.session_state[f"full_scan_{batch_id}"] = ""
                 st.session_state[f"full_qty_{batch_id}"] = ""
@@ -1404,80 +1413,112 @@ def page_full_upload(inv_map_sku: dict):
                 pass
             st.rerun()
 
-    if sst["msg_kind"] == "ok":
-        st.markdown(f'<span class="tag ok">✅ OK</span> {sst["msg"]}', unsafe_allow_html=True)
-    elif sst["msg_kind"] == "bad":
-        st.markdown(f'<span class="tag bad">❌ ERROR</span> {sst["msg"]}', unsafe_allow_html=True)
+    if sst.get("msg_kind") == "ok":
+        st.markdown(f'<span class="tag ok">✅ OK</span> {sst.get("msg","")}', unsafe_allow_html=True)
+    elif sst.get("msg_kind") == "bad":
+        st.markdown(f'<span class="tag bad">❌ ERROR</span> {sst.get("msg","")}', unsafe_allow_html=True)
 
     sku_cur = normalize_sku(sst.get("sku_current", ""))
     if not sku_cur:
-        st.info("Escanea un producto para ver datos y confirmar cantidad acopiada.")
+        st.info("Escanea un producto para ver datos.")
         return
 
+    # Traer datos del SKU desde el lote
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT id, sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked, status, areas, nros, instruccion, etiquetar, es_pack, vence
+        SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked
         FROM full_batch_items
         WHERE batch_id=? AND sku_ml=?
     """, (batch_id, sku_cur))
-    item = c.fetchone()
+    row = c.fetchone()
     conn.close()
 
-    if not item:
-        st.warning("Este código no está en el lote seleccionado.")
+    if not row:
+        st.warning("El SKU no está en el lote (vuelve a validar).")
         return
 
-    item_id, sku_ml, title, qty_required, qty_checked, status, areas, nros, instruccion, etiquetar, es_pack, vence = item
-    qty_required = int(qty_required or 0)
-    qty_checked = int(qty_checked or 0)
+    sku_db, title_db, qty_req, qty_chk = row
+    title_clean = str(title_db or "").strip()
+    # Seguro por si por algún motivo llega como Series u otro objeto raro
+    if hasattr(title_db, "iloc"):
+        try:
+            title_clean = str(title_db.iloc[0]).strip()
+        except Exception:
+            title_clean = str(title_db).strip()
+    if not title_clean:
+        title_clean = inv_map_sku.get(sku_db, "")
 
-    title_eff = title if title else inv_map_sku.get(sku_ml, "")
-    pending = max(qty_required - qty_checked, 0)
+    pending = int(qty_req) - int(qty_chk)
+    if pending < 0:
+        pending = 0
 
     st.markdown(
         f"""
         <div class="hero2">
-            <div class="sku">SKU: {sku_ml}</div>
-            <div class="prod">{title_eff}</div>
-            <div class="qty">Solicitado: {qty_required} • Acopiado: {qty_checked} • Pendiente: {pending}</div>
+            <div class="sku">SKU: {sku_db}</div>
+            <div class="prod">{title_clean}</div>
+            <div class="qty">Solicitado: {int(qty_req)} • Acopiado: {int(qty_chk)} • Pendiente: {pending}</div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    meta_cols = st.columns(4)
-    meta_cols[0].caption(f"Áreas: {areas or '-'}")
-    meta_cols[1].caption(f"N°: {nros or '-'}")
-    meta_cols[2].caption(f"Instrucción: {instruccion or '-'}")
-    meta_cols[3].caption(f"Etiqueta/Pack/Vence: {(etiquetar or '-')}/{(es_pack or '-')}/{(vence or '-')}")
-
-    qty_label = "Cantidad acopiada"
-    qty_in = st.text_input(qty_label, value=sst["qty_input"], key=f"full_qty_{batch_id}")
+    qty_label = "Cantidad a acopiar"
+    qty_in = st.text_input(qty_label, value=sst.get("qty_input",""), key=f"full_qty_{batch_id}")
     force_tel_keyboard(qty_label)
 
-    # Confirmación
-    if st.button("✅ Confirmar acopio", key=f"full_confirm_{batch_id}"):
-        try:
-            q = int(str(qty_in).strip())
-        except Exception:
-            st.error("Ingresa un número válido.")
-            q = None
+    colC, colD = st.columns([1, 1])
+    with colC:
+        if st.button("✅ Confirmar acopio", key=f"full_confirm_{batch_id}"):
+            try:
+                q = int(str(qty_in).strip())
+            except Exception:
+                st.error("Ingresa un número válido.")
+                return
 
-        if q is None or q <= 0:
-            st.error("La cantidad debe ser mayor a 0.")
-            return
+            if q <= 0:
+                st.error("La cantidad debe ser mayor a 0.")
+                return
 
-        # No registramos faltantes ni sobrantes en este módulo:
-        # solo acumulamos acopio, sin permitir superar lo solicitado.
-        if pending <= 0:
-            st.warning("Este SKU ya está completo (pendiente 0).")
-            # limpiar para siguiente escaneo
+            # No permitimos sobrantes: no puede superar el pendiente
+            if q > pending:
+                st.error(f"No puedes acopiar {q}. Pendiente actual: {pending}.")
+                return
+
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("""
+                UPDATE full_batch_items
+                SET qty_checked = COALESCE(qty_checked,0) + ?
+                WHERE batch_id=? AND sku_ml=?
+            """, (q, batch_id, sku_db))
+            conn.commit()
+            conn.close()
+
+            # Limpiar para siguiente escaneo
+            sst["scan_value"] = ""
             sst["sku_current"] = ""
             sst["qty_input"] = ""
-            sst["msg_kind"] = "ok"
-            sst["msg"] = "SKU completo. Escanea el siguiente."
+            sst["msg_kind"] = "idle"
+            sst["msg"] = ""
+            try:
+                st.session_state[f"full_scan_{batch_id}"] = ""
+                st.session_state[f"full_qty_{batch_id}"] = ""
+            except Exception:
+                pass
+
+            st.success(f"Acopiado: {q} unidades.")
+            st.rerun()
+
+    with colD:
+        # Duplicamos "Limpiar" abajo por ergonomía
+        if st.button("🧹 Limpiar campos", key=f"full_clear2_{batch_id}"):
             sst["scan_value"] = ""
+            sst["sku_current"] = ""
+            sst["qty_input"] = ""
+            sst["msg_kind"] = "idle"
+            sst["msg"] = ""
             try:
                 st.session_state[f"full_scan_{batch_id}"] = ""
                 st.session_state[f"full_qty_{batch_id}"] = ""
@@ -1485,41 +1526,7 @@ def page_full_upload(inv_map_sku: dict):
                 pass
             st.rerun()
 
-        if q > pending:
-            st.error(f"No puedes acopiar {q} porque el pendiente es {pending}.")
-            return
 
-        new_checked = qty_checked + q
-
-        conn = get_conn()
-        c = conn.cursor()
-        new_status = compute_full_status(qty_required, new_checked, False)
-        c.execute("""
-            UPDATE full_batch_items
-            SET qty_checked=?, status=?, updated_at=?
-            WHERE id=?
-        """, (int(new_checked), new_status, now_iso(), item_id))
-        conn.commit()
-        conn.close()
-
-        # Reset para dejar listo el escáner
-        sst["scan_value"] = ""
-        sst["sku_current"] = ""
-        sst["qty_input"] = ""
-        sst["msg_kind"] = "ok"
-        sst["msg"] = "Acopio confirmado. Escanea el siguiente."
-
-        try:
-            st.session_state[f"full_scan_{batch_id}"] = ""
-            st.session_state[f"full_qty_{batch_id}"] = ""
-        except Exception:
-            pass
-
-        st.rerun()
-
-# =========================
-# UI: FULL - ADMIN (progreso)
-# =========================
 def page_full_admin():
     st.header("Full – Administrador (progreso)")
 
