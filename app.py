@@ -1374,6 +1374,7 @@ def page_full_supervisor(inv_map_sku: dict):
             "qty_input": ""
         }
 
+    sst = state[str(batch_id)]
 
     # Input escaneo
     scan_label = "Escaneo"
@@ -1530,36 +1531,6 @@ def page_full_supervisor(inv_map_sku: dict):
 
         st.rerun()
 
-        # Caso FALTANTE (no completa lo pendiente)
-        if q < remaining and qty_required > 0:
-            sst["needs_decision"] = True
-            sst["missing"] = remaining - q
-            sst["over"] = 0
-            sst["qty_input"] = str(q)
-            st.warning(f"Quedan {sst['missing']} pendientes. Decide si registrar FALTANTE.")
-            st.rerun()
-
-        # Caso exacto o requerido 0 (raro)
-        conn = get_conn()
-        c = conn.cursor()
-        # Ver si ya hay incidencias para este SKU en este batch
-        c.execute("SELECT COUNT(*) FROM full_incidences WHERE batch_id=? AND sku_ml=?", (batch_id, sku_ml))
-        has_inc = c.fetchone()[0] > 0
-
-        new_status = compute_full_status(qty_required, new_checked, has_inc)
-        c.execute("""
-            UPDATE full_batch_items
-            SET qty_checked=?, status=?, updated_at=?
-            WHERE id=?
-        """, (int(new_checked), new_status, now_iso(), item_id))
-        conn.commit()
-        conn.close()
-
-        sst["qty_input"] = ""
-        sst["msg_kind"] = "ok"
-        sst["msg"] = "Acopio confirmado."
-        st.rerun()
-
 # =========================
 # UI: FULL - ADMIN (progreso)
 # =========================
@@ -1640,18 +1611,53 @@ def page_full_admin():
         st.info("Sin incidencias registradas para este lote.")
 
     st.divider()
-    st.subheader("Acciones")
+    
+st.subheader("Acciones")
 
-    if bstatus == "OPEN":
-        if st.button("✅ Cerrar lote (LOCK)"):
-            c.execute("UPDATE full_batches SET status='CLOSED', closed_at=? WHERE id=?", (now_iso(), batch_id))
+if "full_confirm_reset" not in st.session_state:
+    st.session_state.full_confirm_reset = False
+
+if not st.session_state.full_confirm_reset:
+    if st.button("🔄 Reiniciar corrida (poner todo en 0)"):
+        st.session_state.full_confirm_reset = True
+        st.warning("⚠️ Esto reinicia el lote seleccionado: acopiado vuelve a 0 y se borran incidencias. Confirma abajo.")
+        st.rerun()
+else:
+    st.error("CONFIRMACIÓN: se reiniciará la corrida del lote (todo vuelve a 0).")
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("✅ Sí, reiniciar ahora"):
+            # Reset items
+            c.execute("""
+                UPDATE full_batch_items
+                SET qty_checked=0, status='PENDING', updated_at=NULL
+                WHERE batch_id=?
+            """, (batch_id,))
+            # Delete incidences
+            c.execute("DELETE FROM full_incidences WHERE batch_id=?", (batch_id,))
+            # Keep batch OPEN
+            c.execute("UPDATE full_batches SET status='OPEN', closed_at=NULL WHERE id=?", (batch_id,))
             conn.commit()
-            st.success("Lote cerrado.")
-            st.rerun()
-    else:
-        st.info("Este lote está cerrado.")
 
-    conn.close()
+            # Limpia estado UI del supervisor para este lote
+            try:
+                if "full_sup_state" in st.session_state and str(batch_id) in st.session_state.full_sup_state:
+                    st.session_state.full_sup_state.pop(str(batch_id), None)
+                st.session_state.pop(f"full_scan_{batch_id}", None)
+                st.session_state.pop(f"full_qty_{batch_id}", None)
+            except Exception:
+                pass
+
+            st.session_state.full_confirm_reset = False
+            st.success("Corrida reiniciada. Todo quedó en 0 para procesar nuevamente.")
+            st.rerun()
+    with colB:
+        if st.button("Cancelar"):
+            st.session_state.full_confirm_reset = False
+            st.info("Reinicio cancelado.")
+            st.rerun()
+
+conn.close()
 
 
 # =========================
