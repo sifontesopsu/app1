@@ -1657,7 +1657,7 @@ else:
             st.info("Reinicio cancelado.")
             st.rerun()
 
-conn.close()
+    conn.close()
 
 
 # =========================
