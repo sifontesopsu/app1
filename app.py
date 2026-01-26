@@ -179,6 +179,7 @@ def init_db():
     conn = get_conn()
     c = conn.cursor()
 
+    # --- FLEX/COLECTA ---
     c.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -265,10 +266,55 @@ def init_db():
     );
     """)
 
+    # Maestro EAN/SKU (común)
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_barcodes (
         barcode TEXT PRIMARY KEY,
         sku_ml TEXT
+    );
+    """)
+
+    # --- FULL: Acopio ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS full_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_name TEXT,
+        status TEXT DEFAULT 'OPEN',
+        created_at TEXT,
+        closed_at TEXT
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS full_batch_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id INTEGER,
+        sku_ml TEXT,
+        title TEXT,
+        areas TEXT,
+        nros TEXT,
+        etiquetar TEXT,
+        es_pack TEXT,
+        instruccion TEXT,
+        vence TEXT,
+        qty_required INTEGER DEFAULT 0,
+        qty_checked INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'PENDING',
+        updated_at TEXT,
+        UNIQUE(batch_id, sku_ml)
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS full_incidences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id INTEGER,
+        sku_ml TEXT,
+        qty_required INTEGER,
+        qty_checked INTEGER,
+        diff INTEGER,
+        reason TEXT,
+        created_at TEXT
     );
     """)
 
@@ -461,7 +507,7 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
 
 
 # =========================
-# IMPORTAR VENTAS
+# IMPORTAR VENTAS (FLEX)
 # =========================
 def import_sales_excel(file) -> pd.DataFrame:
     df = pd.read_excel(file, header=[4, 5])
@@ -584,7 +630,7 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
 
 
 # =========================
-# UI: LOBBY APP (NUEVO)
+# UI: LOBBY APP (MODO)
 # =========================
 def page_app_lobby():
     st.markdown("## Ferretería Aurora – WMS")
@@ -600,7 +646,7 @@ def page_app_lobby():
             font-weight: 900 !important;
             border-radius: 18px !important;
         }
-        .lobbywrap { max-width: 860px; margin: 0 auto; }
+        .lobbywrap { max-width: 980px; margin: 0 auto; }
         </style>
         """,
         unsafe_allow_html=True
@@ -613,6 +659,7 @@ def page_app_lobby():
         st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
         if st.button("📦 Preparación pedidos Flex y Colecta", key="mode_flex"):
             st.session_state.app_mode = "FLEX"
+            st.session_state.pop("selected_picker", None)
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
         st.caption("Picking por OT, incidencias, admin, etc.")
@@ -623,13 +670,13 @@ def page_app_lobby():
             st.session_state.app_mode = "FULL"
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
-        st.caption("Nuevo módulo (control de acopio Full).")
+        st.caption("Control de acopio Full (escaneo + chequeo vs Excel).")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 # =========================
-# UI: IMPORTAR
+# UI: IMPORTAR (FLEX)
 # =========================
 def page_import(inv_map_sku: dict):
     st.header("Importar ventas")
@@ -658,7 +705,7 @@ def page_import(inv_map_sku: dict):
 
 
 # =========================
-# UI: PICKING (LOBBY + PDA)
+# UI: PICKING (FLEX)
 # =========================
 def picking_lobby():
     st.markdown("### Picking")
@@ -968,16 +1015,730 @@ def page_picking():
 
 
 # =========================
-# UI: FULL (placeholder por ahora)
+# FULL: Importar Excel -> Batch
 # =========================
-def page_full_placeholder():
-    st.header("Preparación productos Full")
-    st.info("Módulo en desarrollo: Control de acopio Full (escaneo + chequeo vs Excel).")
-    st.write("Siguiente paso: aquí agregamos carga del Excel Full + pantalla supervisor.")
+def _pick_col(cols_lower: list[str], cols_orig: list[str], candidates: list[str]):
+    for cand in candidates:
+        if cand in cols_lower:
+            return cols_orig[cols_lower.index(cand)]
+    return None
+
+
+def _safe_str(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
+def read_full_excel(file) -> pd.DataFrame:
+    """
+    Lee todas las hojas y devuelve un DF normalizado:
+    sku_ml, title, qty_required, area, nro, etiquetar, es_pack, instruccion, vence, sheet
+    """
+    xls = pd.ExcelFile(file)
+    all_rows = []
+    for sh in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sh, dtype=str)
+        if df is None or df.empty:
+            continue
+
+        cols_orig = df.columns.tolist()
+        cols_lower = [str(c).strip().lower() for c in cols_orig]
+
+        sku_col = _pick_col(cols_lower, cols_orig, ["sku", "sku_ml", "codigo", "código", "cod", "ubc", "cod sku"])
+        qty_col = _pick_col(cols_lower, cols_orig, ["cantidad", "qty", "unidades", "cant", "cant.", "cantidad total"])
+        title_col = _pick_col(cols_lower, cols_orig, ["articulo", "artículo", "descripcion", "descripción", "producto", "detalle", "artículo / producto"])
+
+        area_col = _pick_col(cols_lower, cols_orig, ["area", "área", "zona", "ubicacion", "ubicación"])
+        nro_col = _pick_col(cols_lower, cols_orig, ["nro", "n°", "numero", "número", "num", "#", "n"])
+
+        etiquetar_col = _pick_col(cols_lower, cols_orig, ["etiquetar", "etiqueta"])
+        pack_col = _pick_col(cols_lower, cols_orig, ["es pack", "pack", "es_pack", "espack"])
+        instr_col = _pick_col(cols_lower, cols_orig, ["instruccion", "instrucción", "obs", "observacion", "observación", "nota", "notas"])
+        vence_col = _pick_col(cols_lower, cols_orig, ["vence", "vencimiento", "fecha vence", "fecha_vencimiento"])
+
+        # Fallback mínimo: si no hay columnas clave, intentar por posición
+        if sku_col is None or qty_col is None:
+            if df.shape[1] >= 3:
+                # intento: col0 area, col1 nro, col2 sku, col3 desc, col4 qty
+                sku_col = sku_col or cols_orig[min(2, len(cols_orig) - 1)]
+                qty_col = qty_col or cols_orig[min(4, len(cols_orig) - 1)]
+                title_col = title_col or cols_orig[min(3, len(cols_orig) - 1)]
+                area_col = area_col or cols_orig[0]
+                nro_col = nro_col or cols_orig[min(1, len(cols_orig) - 1)]
+
+        for _, r in df.iterrows():
+            sku = normalize_sku(r.get(sku_col, "")) if sku_col else ""
+            if not sku:
+                continue
+
+            qty_raw = r.get(qty_col, "") if qty_col else ""
+            try:
+                qty = int(float(str(qty_raw).strip())) if str(qty_raw).strip() else 0
+            except Exception:
+                qty = 0
+            if qty <= 0:
+                continue
+
+            title = _safe_str(r.get(title_col, "")) if title_col else ""
+            area = _safe_str(r.get(area_col, "")) if area_col else ""
+            nro = _safe_str(r.get(nro_col, "")) if nro_col else ""
+            etiquetar = _safe_str(r.get(etiquetar_col, "")) if etiquetar_col else ""
+            es_pack = _safe_str(r.get(pack_col, "")) if pack_col else ""
+            instruccion = _safe_str(r.get(instr_col, "")) if instr_col else ""
+            vence = _safe_str(r.get(vence_col, "")) if vence_col else ""
+
+            all_rows.append({
+                "sheet": sh,
+                "sku_ml": sku,
+                "title": title,
+                "qty_required": qty,
+                "area": area,
+                "nro": nro,
+                "etiquetar": etiquetar,
+                "es_pack": es_pack,
+                "instruccion": instruccion,
+                "vence": vence,
+            })
+
+    return pd.DataFrame(all_rows)
+
+
+def compute_full_status(qty_required: int, qty_checked: int, has_incidence: bool = False) -> str:
+    if qty_checked <= 0:
+        return "PENDING"
+    if qty_checked == qty_required and not has_incidence:
+        return "OK"
+    if qty_checked == qty_required and has_incidence:
+        return "OK_WITH_ISSUES"
+    if qty_checked < qty_required and has_incidence:
+        return "INCIDENCE"
+    if qty_checked < qty_required:
+        return "PARTIAL"
+    if qty_checked > qty_required:
+        return "OVER"
+    return "PENDING"
+
+
+def get_open_full_batches():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, batch_name, status, created_at FROM full_batches ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def upsert_full_batch_from_df(df: pd.DataFrame, batch_name: str):
+    """
+    Crea un batch y carga items agregados por SKU.
+    """
+    if df is None or df.empty:
+        raise ValueError("El Excel no tiene filas válidas (SKU/Cantidad).")
+
+    # Agregar por SKU
+    agg = {}
+    for _, r in df.iterrows():
+        sku = normalize_sku(r.get("sku_ml", ""))
+        if not sku:
+            continue
+
+        qty = int(r.get("qty_required", 0) or 0)
+        if qty <= 0:
+            continue
+
+        if sku not in agg:
+            agg[sku] = {
+                "sku_ml": sku,
+                "title": _safe_str(r.get("title", "")),
+                "qty_required": 0,
+                "areas": set(),
+                "nros": set(),
+                "etiquetar": "",
+                "es_pack": "",
+                "instruccion": "",
+                "vence": "",
+            }
+
+        a = agg[sku]
+        a["qty_required"] += qty
+
+        area = _safe_str(r.get("area", ""))
+        nro = _safe_str(r.get("nro", ""))
+        if area:
+            a["areas"].add(area)
+        if nro:
+            a["nros"].add(nro)
+
+        # En campos opcionales, guardamos el primero no vacío (si hay)
+        for k in ["etiquetar", "es_pack", "instruccion", "vence"]:
+            v = _safe_str(r.get(k, ""))
+            if v and not a.get(k):
+                a[k] = v
+
+        # si no hay título, intentar completar después con maestro (en UI)
+        if not a["title"]:
+            a["title"] = _safe_str(r.get("title", ""))
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    created = now_iso()
+    c.execute(
+        "INSERT INTO full_batches (batch_name, status, created_at, closed_at) VALUES (?,?,?,?)",
+        (batch_name, "OPEN", created, None)
+    )
+    batch_id = c.lastrowid
+
+    for sku, a in agg.items():
+        areas_txt = " / ".join(sorted(a["areas"])) if a["areas"] else ""
+        nros_txt = " / ".join(sorted(a["nros"])) if a["nros"] else ""
+        c.execute("""
+            INSERT INTO full_batch_items
+            (batch_id, sku_ml, title, areas, nros, etiquetar, es_pack, instruccion, vence, qty_required, qty_checked, status, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            batch_id, sku, a["title"], areas_txt, nros_txt,
+            a.get("etiquetar", ""), a.get("es_pack", ""), a.get("instruccion", ""), a.get("vence", ""),
+            int(a["qty_required"]), 0, "PENDING", now_iso()
+        ))
+
+    conn.commit()
+    conn.close()
+    return batch_id
+
+
+def get_full_batch_summary(batch_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("SELECT batch_name, status, created_at, closed_at FROM full_batches WHERE id=?", (batch_id,))
+    b = c.fetchone()
+
+    c.execute("""
+        SELECT
+            COUNT(*) as n_skus,
+            SUM(qty_required) as req_units,
+            SUM(qty_checked) as chk_units,
+            SUM(CASE WHEN status='OK' THEN 1 ELSE 0 END) as ok_skus,
+            SUM(CASE WHEN status IN ('PARTIAL','INCIDENCE','OVER','OK_WITH_ISSUES') THEN 1 ELSE 0 END) as touched_skus,
+            SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END) as pending_skus
+        FROM full_batch_items
+        WHERE batch_id=?
+    """, (batch_id,))
+    s = c.fetchone()
+
+    conn.close()
+    return b, s
 
 
 # =========================
-# UI: ADMIN
+# UI: FULL - CARGA EXCEL
+# =========================
+def page_full_upload(inv_map_sku: dict):
+    st.header("Full – Cargar Excel")
+
+    colA, colB = st.columns([2, 1])
+    with colA:
+        default_name = f"FULL_{datetime.now().strftime('%Y-%m-%d_%H%M')}"
+        batch_name = st.text_input("Nombre del lote", value=default_name)
+    with colB:
+        st.caption("Crea un lote nuevo cada vez que armes una preparación Full.")
+
+    file = st.file_uploader("Excel de preparación Full (xlsx)", type=["xlsx"], key="full_excel")
+    if not file:
+        st.info("Sube el Excel que usan para enviar hojas a auxiliares.")
+        return
+
+    try:
+        df = read_full_excel(file)
+    except Exception as e:
+        st.error(f"No pude leer el Excel: {e}")
+        return
+
+    if df.empty:
+        st.warning("El archivo se leyó, pero no encontré filas válidas (SKU/Cantidad).")
+        return
+
+    # Completar título desde maestro si está vacío
+    df2 = df.copy()
+    df2["title_eff"] = df2.apply(lambda r: r["title"] if str(r["title"]).strip() else inv_map_sku.get(r["sku_ml"], ""), axis=1)
+
+    st.subheader("Vista previa (primeras 50 filas)")
+    st.dataframe(df2.head(50))
+
+    st.caption("Se agregará por SKU (sumando cantidades de todas las hojas).")
+
+    if st.button("✅ Crear lote y cargar"):
+        try:
+            batch_id = upsert_full_batch_from_df(df2.rename(columns={"title_eff": "title"}), batch_name.strip())
+            st.success(f"Lote creado: #{batch_id} – {batch_name}")
+            st.session_state.full_selected_batch = batch_id
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+
+# =========================
+# UI: FULL - SUPERVISOR ACOPIO (ESCANEO)
+# =========================
+def page_full_supervisor(inv_map_sku: dict):
+    st.header("Full – Supervisor de acopio")
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
+    barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
+    conn.close()
+
+    batches = get_open_full_batches()
+    if not batches:
+        st.info("No hay lotes Full cargados. Ve a 'Cargar Excel Full' primero.")
+        return
+
+    # Selector de lote
+    options = [f"#{bid} — {name} ({status})" for bid, name, status, _ in batches]
+    default_idx = 0
+    if "full_selected_batch" in st.session_state:
+        for i, (bid, *_rest) in enumerate(batches):
+            if bid == st.session_state.full_selected_batch:
+                default_idx = i
+                break
+
+    sel = st.selectbox("Lote activo", options, index=default_idx)
+    batch_id = batches[options.index(sel)][0]
+    st.session_state.full_selected_batch = batch_id
+
+    b, s = get_full_batch_summary(batch_id)
+    if b:
+        batch_name, bstatus, created_at, closed_at = b
+        n_skus, req_units, chk_units, ok_skus, touched_skus, pending_skus = s
+        req_units = int(req_units or 0)
+        chk_units = int(chk_units or 0)
+        prog = (chk_units / req_units) if req_units else 0.0
+
+        st.caption(f"Lote: {batch_name} • Creado: {to_chile_display(created_at)} • Estado: {bstatus}")
+        st.progress(min(max(prog, 0.0), 1.0))
+        st.caption(f"Progreso unidades: {chk_units}/{req_units} ({prog*100:.1f}%) • SKUs OK: {ok_skus}/{n_skus}")
+
+    st.markdown(
+        """
+        <style>
+        .hero2 { padding: 10px 12px; border-radius: 12px; background: rgba(0,0,0,0.04); margin: 8px 0; }
+        .hero2 .sku { font-size: 26px; font-weight: 900; margin: 0; }
+        .hero2 .prod { font-size: 22px; font-weight: 800; margin: 6px 0 0 0; line-height: 1.15; }
+        .hero2 .qty { font-size: 22px; font-weight: 900; margin: 8px 0 0 0; }
+        .tag { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
+        .ok { background: rgba(0, 200, 0, 0.15); }
+        .warn { background: rgba(255, 165, 0, 0.15); }
+        .bad { background: rgba(255, 0, 0, 0.12); }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    if "full_sup_state" not in st.session_state:
+        st.session_state.full_sup_state = {}
+
+    state = st.session_state.full_sup_state
+    if str(batch_id) not in state:
+        state[str(batch_id)] = {
+            "scan_value": "",
+            "sku_current": "",
+            "msg": "",
+            "msg_kind": "idle",
+            "qty_input": "",
+            "needs_decision": False,
+            "missing": 0,
+            "over": 0,
+            "last_lookup_sku": ""
+        }
+
+    sst = state[str(batch_id)]
+
+    # Input escaneo
+    scan_label = "Escaneo"
+    scan = st.text_input(scan_label, value=sst["scan_value"], key=f"full_scan_{batch_id}")
+    force_tel_keyboard(scan_label)
+    autofocus_input(scan_label)
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("🔎 Buscar / Validar", key=f"full_find_{batch_id}"):
+            sku = resolve_scan_to_sku(scan, barcode_to_sku)
+            sst["scan_value"] = scan
+            sst["sku_current"] = sku
+            sst["qty_input"] = ""
+            sst["needs_decision"] = False
+            sst["missing"] = 0
+            sst["over"] = 0
+
+            if not sku:
+                sst["msg_kind"] = "bad"
+                sst["msg"] = "No se pudo leer el código."
+                st.rerun()
+
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("""
+                SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked, status, areas, nros, instruccion, etiquetar, es_pack, vence
+                FROM full_batch_items
+                WHERE batch_id=? AND sku_ml=?
+            """, (batch_id, sku))
+            row = c.fetchone()
+            conn.close()
+
+            if not row:
+                sst["msg_kind"] = "bad"
+                sst["msg"] = f"{sku} no pertenece a este lote."
+            else:
+                sst["msg_kind"] = "ok"
+                sst["msg"] = "SKU encontrado."
+            st.rerun()
+
+    with col2:
+        if st.button("🧹 Limpiar", key=f"full_clear_{batch_id}"):
+            state.pop(str(batch_id), None)
+            st.rerun()
+
+    if sst["msg_kind"] == "ok":
+        st.markdown(f'<span class="tag ok">✅ OK</span> {sst["msg"]}', unsafe_allow_html=True)
+    elif sst["msg_kind"] == "bad":
+        st.markdown(f'<span class="tag bad">❌ ERROR</span> {sst["msg"]}', unsafe_allow_html=True)
+
+    sku_cur = normalize_sku(sst.get("sku_current", ""))
+    if not sku_cur:
+        st.info("Escanea un producto para ver datos y confirmar cantidad acopiada.")
+        return
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked, status, areas, nros, instruccion, etiquetar, es_pack, vence
+        FROM full_batch_items
+        WHERE batch_id=? AND sku_ml=?
+    """, (batch_id, sku_cur))
+    item = c.fetchone()
+    conn.close()
+
+    if not item:
+        st.warning("Este código no está en el lote seleccionado.")
+        if st.button("Registrar incidencia: NO CORRESPONDE", key=f"full_inc_no_{batch_id}"):
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO full_incidences (batch_id, sku_ml, qty_required, qty_checked, diff, reason, created_at)
+                VALUES (?,?,?,?,?,?,?)
+            """, (batch_id, sku_cur, 0, 0, 0, "NO_CORRESPONDE", now_iso()))
+            conn.commit()
+            conn.close()
+            st.success("Incidencia registrada.")
+        return
+
+    item_id, sku_ml, title, qty_required, qty_checked, status, areas, nros, instruccion, etiquetar, es_pack, vence = item
+    qty_required = int(qty_required or 0)
+    qty_checked = int(qty_checked or 0)
+
+    title_eff = title if title else inv_map_sku.get(sku_ml, "")
+    pending = max(qty_required - qty_checked, 0)
+
+    st.markdown(
+        f"""
+        <div class="hero2">
+            <div class="sku">SKU: {sku_ml}</div>
+            <div class="prod">{title_eff}</div>
+            <div class="qty">Solicitado: {qty_required} • Acopiado: {qty_checked} • Pendiente: {pending}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    meta_cols = st.columns(4)
+    meta_cols[0].caption(f"Áreas: {areas or '-'}")
+    meta_cols[1].caption(f"N°: {nros or '-'}")
+    meta_cols[2].caption(f"Instrucción: {instruccion or '-'}")
+    meta_cols[3].caption(f"Etiqueta/Pack/Vence: {(etiquetar or '-')}/{(es_pack or '-')}/{(vence or '-')}")
+
+    qty_label = "Cantidad acopiada"
+    qty_in = st.text_input(qty_label, value=sst["qty_input"], key=f"full_qty_{batch_id}")
+    force_tel_keyboard(qty_label)
+
+    # Confirmación
+    if st.button("✅ Confirmar acopio", key=f"full_confirm_{batch_id}"):
+        try:
+            q = int(str(qty_in).strip())
+        except Exception:
+            st.error("Ingresa un número válido.")
+            q = None
+
+        if q is None or q <= 0:
+            st.error("La cantidad debe ser mayor a 0.")
+            return
+
+        remaining = max(qty_required - qty_checked, 0)
+        new_checked = qty_checked + q
+
+        # Caso SOBRANTE (se pasa del requerido)
+        if q > remaining and qty_required > 0:
+            sst["needs_decision"] = True
+            sst["missing"] = 0
+            sst["over"] = q - remaining
+            sst["qty_input"] = str(q)
+            st.warning(f"Supera lo pendiente por {sst['over']}. Debes decidir si registrar SOBRANTE.")
+            st.rerun()
+
+        # Caso FALTANTE (no completa lo pendiente)
+        if q < remaining and qty_required > 0:
+            sst["needs_decision"] = True
+            sst["missing"] = remaining - q
+            sst["over"] = 0
+            sst["qty_input"] = str(q)
+            st.warning(f"Quedan {sst['missing']} pendientes. Decide si registrar FALTANTE.")
+            st.rerun()
+
+        # Caso exacto o requerido 0 (raro)
+        conn = get_conn()
+        c = conn.cursor()
+        # Ver si ya hay incidencias para este SKU en este batch
+        c.execute("SELECT COUNT(*) FROM full_incidences WHERE batch_id=? AND sku_ml=?", (batch_id, sku_ml))
+        has_inc = c.fetchone()[0] > 0
+
+        new_status = compute_full_status(qty_required, new_checked, has_inc)
+        c.execute("""
+            UPDATE full_batch_items
+            SET qty_checked=?, status=?, updated_at=?
+            WHERE id=?
+        """, (int(new_checked), new_status, now_iso(), item_id))
+        conn.commit()
+        conn.close()
+
+        sst["qty_input"] = ""
+        sst["needs_decision"] = False
+        sst["missing"] = 0
+        sst["over"] = 0
+        sst["msg_kind"] = "ok"
+        sst["msg"] = "Acopio confirmado."
+        st.rerun()
+
+    # Decisiones (faltante / sobrante)
+    if sst.get("needs_decision", False):
+        colA, colB = st.columns(2)
+
+        if sst.get("missing", 0) > 0:
+            with colA:
+                if st.button("📌 Registrar FALTANTE", key=f"full_reg_missing_{batch_id}"):
+                    q = int(sst["qty_input"])
+                    remaining = max(qty_required - qty_checked, 0)
+                    new_checked = qty_checked + q
+                    missing = remaining - q
+
+                    conn = get_conn()
+                    c = conn.cursor()
+                    c.execute("""
+                        INSERT INTO full_incidences (batch_id, sku_ml, qty_required, qty_checked, diff, reason, created_at)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, (batch_id, sku_ml, qty_required, int(new_checked), int(-missing), "FALTANTE_ACOPIO", now_iso()))
+
+                    new_status = compute_full_status(qty_required, new_checked, True)
+                    c.execute("""
+                        UPDATE full_batch_items
+                        SET qty_checked=?, status=?, updated_at=?
+                        WHERE id=?
+                    """, (int(new_checked), new_status, now_iso(), item_id))
+
+                    conn.commit()
+                    conn.close()
+
+                    sst["qty_input"] = ""
+                    sst["needs_decision"] = False
+                    sst["missing"] = 0
+                    sst["msg_kind"] = "warn"
+                    sst["msg"] = "Faltante registrado."
+                    st.rerun()
+
+            with colB:
+                if st.button("➡️ Solo acumular y seguir", key=f"full_just_partial_{batch_id}"):
+                    q = int(sst["qty_input"])
+                    new_checked = qty_checked + q
+
+                    conn = get_conn()
+                    c = conn.cursor()
+                    c.execute("SELECT COUNT(*) FROM full_incidences WHERE batch_id=? AND sku_ml=?", (batch_id, sku_ml))
+                    has_inc = c.fetchone()[0] > 0
+
+                    new_status = compute_full_status(qty_required, new_checked, has_inc)
+                    c.execute("""
+                        UPDATE full_batch_items
+                        SET qty_checked=?, status=?, updated_at=?
+                        WHERE id=?
+                    """, (int(new_checked), new_status, now_iso(), item_id))
+                    conn.commit()
+                    conn.close()
+
+                    sst["qty_input"] = ""
+                    sst["needs_decision"] = False
+                    sst["missing"] = 0
+                    sst["msg_kind"] = "ok"
+                    sst["msg"] = "Acumulado. Sigue con el siguiente SKU."
+                    st.rerun()
+
+        elif sst.get("over", 0) > 0:
+            with colA:
+                if st.button("📌 Registrar SOBRANTE", key=f"full_reg_over_{batch_id}"):
+                    q = int(sst["qty_input"])
+                    remaining = max(qty_required - qty_checked, 0)
+                    over = q - remaining
+                    new_checked = qty_checked + q
+
+                    conn = get_conn()
+                    c = conn.cursor()
+                    c.execute("""
+                        INSERT INTO full_incidences (batch_id, sku_ml, qty_required, qty_checked, diff, reason, created_at)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, (batch_id, sku_ml, qty_required, int(new_checked), int(over), "SOBRANTE_ACOPIO", now_iso()))
+
+                    new_status = compute_full_status(qty_required, new_checked, True)
+                    c.execute("""
+                        UPDATE full_batch_items
+                        SET qty_checked=?, status=?, updated_at=?
+                        WHERE id=?
+                    """, (int(new_checked), new_status, now_iso(), item_id))
+                    conn.commit()
+                    conn.close()
+
+                    sst["qty_input"] = ""
+                    sst["needs_decision"] = False
+                    sst["over"] = 0
+                    sst["msg_kind"] = "warn"
+                    sst["msg"] = "Sobrante registrado."
+                    st.rerun()
+
+            with colB:
+                if st.button("➡️ Aceptar acumulación", key=f"full_accept_over_{batch_id}"):
+                    q = int(sst["qty_input"])
+                    new_checked = qty_checked + q
+
+                    conn = get_conn()
+                    c = conn.cursor()
+                    c.execute("SELECT COUNT(*) FROM full_incidences WHERE batch_id=? AND sku_ml=?", (batch_id, sku_ml))
+                    has_inc = c.fetchone()[0] > 0
+
+                    new_status = compute_full_status(qty_required, new_checked, has_inc)
+                    c.execute("""
+                        UPDATE full_batch_items
+                        SET qty_checked=?, status=?, updated_at=?
+                        WHERE id=?
+                    """, (int(new_checked), new_status, now_iso(), item_id))
+                    conn.commit()
+                    conn.close()
+
+                    sst["qty_input"] = ""
+                    sst["needs_decision"] = False
+                    sst["over"] = 0
+                    sst["msg_kind"] = "ok"
+                    sst["msg"] = "Acumulado. Sigue con el siguiente SKU."
+                    st.rerun()
+
+
+# =========================
+# UI: FULL - ADMIN (progreso)
+# =========================
+def page_full_admin():
+    st.header("Full – Administrador (progreso)")
+
+    batches = get_open_full_batches()
+    if not batches:
+        st.info("No hay lotes Full cargados aún.")
+        return
+
+    options = [f"#{bid} — {name} ({status})" for bid, name, status, _ in batches]
+    default_idx = 0
+    if "full_selected_batch" in st.session_state:
+        for i, (bid, *_rest) in enumerate(batches):
+            if bid == st.session_state.full_selected_batch:
+                default_idx = i
+                break
+
+    sel = st.selectbox("Lote", options, index=default_idx)
+    batch_id = batches[options.index(sel)][0]
+    st.session_state.full_selected_batch = batch_id
+
+    b, s = get_full_batch_summary(batch_id)
+    if not b:
+        st.error("No se encontró el lote.")
+        return
+
+    batch_name, bstatus, created_at, closed_at = b
+    n_skus, req_units, chk_units, ok_skus, touched_skus, pending_skus = s
+    n_skus = int(n_skus or 0)
+    req_units = int(req_units or 0)
+    chk_units = int(chk_units or 0)
+    ok_skus = int(ok_skus or 0)
+    pending_skus = int(pending_skus or 0)
+
+    prog = (chk_units / req_units) if req_units else 0.0
+
+    st.caption(f"Lote: {batch_name} • Creado: {to_chile_display(created_at)} • Estado: {bstatus}")
+    st.progress(min(max(prog, 0.0), 1.0))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Progreso unidades", f"{prog*100:.1f}%")
+    c2.metric("Unidades acopiadas", f"{chk_units}/{req_units}")
+    c3.metric("SKUs OK", f"{ok_skus}/{n_skus}")
+    c4.metric("SKUs pendientes", pending_skus)
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    st.subheader("Detalle por SKU")
+    c.execute("""
+        SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked,
+               (qty_required - qty_checked) as pendiente,
+               status, updated_at, areas, nros
+        FROM full_batch_items
+        WHERE batch_id=?
+        ORDER BY status, CAST(sku_ml AS INTEGER), sku_ml
+    """, (batch_id,))
+    rows = c.fetchall()
+    df = pd.DataFrame(rows, columns=["SKU", "Artículo", "Solicitado", "Acopiado", "Pendiente", "Estado", "Actualizado", "Áreas", "Nros"])
+    df["Actualizado"] = df["Actualizado"].apply(to_chile_display)
+    st.dataframe(df, use_container_width=True)
+
+    st.subheader("Incidencias")
+    c.execute("""
+        SELECT sku_ml, qty_required, qty_checked, diff, reason, created_at
+        FROM full_incidences
+        WHERE batch_id=?
+        ORDER BY created_at DESC
+    """, (batch_id,))
+    inc = c.fetchall()
+    if inc:
+        df_inc = pd.DataFrame(inc, columns=["SKU", "Req", "Chk", "Diff", "Motivo", "Hora"])
+        df_inc["Hora"] = df_inc["Hora"].apply(to_chile_display)
+        st.dataframe(df_inc, use_container_width=True)
+    else:
+        st.info("Sin incidencias registradas para este lote.")
+
+    st.divider()
+    st.subheader("Acciones")
+
+    if bstatus == "OPEN":
+        if st.button("✅ Cerrar lote (LOCK)"):
+            c.execute("UPDATE full_batches SET status='CLOSED', closed_at=? WHERE id=?", (now_iso(), batch_id))
+            conn.commit()
+            st.success("Lote cerrado.")
+            st.rerun()
+    else:
+        st.info("Este lote está cerrado.")
+
+    conn.close()
+
+
+# =========================
+# UI: ADMIN (FLEX)
 # =========================
 def page_admin():
     st.header("Administrador")
@@ -1101,6 +1862,7 @@ def main():
     if st.sidebar.button("⬅️ Cambiar modo"):
         st.session_state.pop("app_mode", None)
         st.session_state.pop("selected_picker", None)
+        st.session_state.pop("full_selected_batch", None)
         st.rerun()
 
     # Estado maestro (lo dejamos en sidebar, bajo el título)
@@ -1132,14 +1894,22 @@ def main():
             page_admin()
 
     # ==========
-    # MODO FULL (nuevo módulo)
+    # MODO FULL (nuevo módulo completo)
     # ==========
     else:
         pages = [
-            "1) Full – Preparación",
+            "1) Cargar Excel Full",
+            "2) Supervisor de acopio",
+            "3) Admin Full (progreso)",
         ]
         page = st.sidebar.radio("Menú", pages, index=0)
-        page_full_placeholder()
+
+        if page.startswith("1"):
+            page_full_upload(inv_map_sku)
+        elif page.startswith("2"):
+            page_full_supervisor(inv_map_sku)
+        else:
+            page_full_admin()
 
 
 if __name__ == "__main__":
