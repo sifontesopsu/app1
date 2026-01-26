@@ -1343,6 +1343,7 @@ def page_full_supervisor(inv_map_sku: dict):
         .hero2 .sku { font-size: 26px; font-weight: 900; margin: 0; }
         .hero2 .prod { font-size: 22px; font-weight: 800; margin: 6px 0 0 0; line-height: 1.15; }
         .hero2 .qty { font-size: 20px; font-weight: 900; margin: 8px 0 0 0; }
+        .hero2 .meta { font-size: 14px; font-weight: 700; margin: 6px 0 0 0; opacity: 0.85; line-height: 1.2; }
         .tag { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
         .ok { background: rgba(0, 200, 0, 0.15); }
         .bad { background: rgba(255, 0, 0, 0.12); }
@@ -1449,7 +1450,7 @@ def page_full_supervisor(inv_map_sku: dict):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, COALESCE(qty_checked,0)
+        SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, COALESCE(qty_checked,0), COALESCE(etiquetar,''), COALESCE(es_pack,''), COALESCE(instruccion,''), COALESCE(vence,'')
         FROM full_batch_items
         WHERE batch_id=? AND sku_ml=?
     """, (batch_id, sku_cur))
@@ -1460,11 +1461,12 @@ def page_full_supervisor(inv_map_sku: dict):
         st.warning("El SKU no está en el lote (vuelve a validar).")
         return
 
-    sku_db, title_db, qty_req, qty_chk = row
+    sku_db, title_db, qty_req, qty_chk, etiquetar_db, es_pack_db, instruccion_db, vence_db = row
     title_clean = str(title_db or "").strip()
+    # Seguridad: si por algún motivo title viene como Series/objeto raro
     if hasattr(title_db, "iloc"):
         try:
-            title_clean = str(title_db.iloc[0]).strip()
+            title_clean = str(title_db.iloc[0] or "").strip()
         except Exception:
             title_clean = str(title_db).strip()
     if not title_clean:
@@ -1474,12 +1476,19 @@ def page_full_supervisor(inv_map_sku: dict):
     if pending < 0:
         pending = 0
 
+    # Campos extra del Excel Full
+    etiquetar_txt = str(etiquetar_db or "").strip() or "-"
+    es_pack_txt = str(es_pack_db or "").strip() or "-"
+    instruccion_txt = str(instruccion_db or "").strip() or "-"
+    vence_txt = str(vence_db or "").strip() or "-"
+
     st.markdown(
         f"""
         <div class="hero2">
             <div class="sku">SKU: {sku_db}</div>
             <div class="prod">{title_clean}</div>
             <div class="qty">Solicitado: {int(qty_req)} • Acopiado: {int(qty_chk)} • Pendiente: {pending}</div>
+            <div class="meta">ETIQUETAR: {etiquetar_txt} • ES PACK: {es_pack_txt}<br/>INSTRUCCIÓN: {instruccion_txt} • VENCE: {vence_txt}</div>
         </div>
         """,
         unsafe_allow_html=True
@@ -1494,9 +1503,11 @@ def page_full_supervisor(inv_map_sku: dict):
         c2 = conn2.cursor()
         c2.execute("""
             UPDATE full_batch_items
-            SET qty_checked = COALESCE(qty_checked,0) + ?
+            SET qty_checked = COALESCE(qty_checked,0) + ?,
+                status = CASE WHEN (COALESCE(qty_checked,0) + ?) >= COALESCE(qty_required,0) THEN 'OK' ELSE 'PENDING' END,
+                updated_at = ?
             WHERE batch_id=? AND sku_ml=?
-        """, (q, batch_id, sku_db))
+        """, (q, q, now_iso(), batch_id, sku_db))
         conn2.commit()
         conn2.close()
 
