@@ -584,6 +584,51 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
 
 
 # =========================
+# UI: LOBBY APP (NUEVO)
+# =========================
+def page_app_lobby():
+    st.markdown("## Ferretería Aurora – WMS")
+    st.caption("Selecciona el flujo de trabajo")
+
+    st.markdown(
+        """
+        <style>
+        .lobbybtn button {
+            width: 100% !important;
+            padding: 22px 14px !important;
+            font-size: 22px !important;
+            font-weight: 900 !important;
+            border-radius: 18px !important;
+        }
+        .lobbywrap { max-width: 860px; margin: 0 auto; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown('<div class="lobbywrap">', unsafe_allow_html=True)
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
+        if st.button("📦 Preparación pedidos Flex y Colecta", key="mode_flex"):
+            st.session_state.app_mode = "FLEX"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.caption("Picking por OT, incidencias, admin, etc.")
+
+    with colB:
+        st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
+        if st.button("🏷️ Preparación productos Full", key="mode_full"):
+            st.session_state.app_mode = "FULL"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.caption("Nuevo módulo (control de acopio Full).")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =========================
 # UI: IMPORTAR
 # =========================
 def page_import(inv_map_sku: dict):
@@ -804,7 +849,6 @@ def page_picking():
     elif s["scan_status"] == "bad":
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
-    # Compacto: input + validar + sin ean
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
@@ -924,6 +968,15 @@ def page_picking():
 
 
 # =========================
+# UI: FULL (placeholder por ahora)
+# =========================
+def page_full_placeholder():
+    st.header("Preparación productos Full")
+    st.info("Módulo en desarrollo: Control de acopio Full (escaneo + chequeo vs Excel).")
+    st.write("Siguiente paso: aquí agregamos carga del Excel Full + pantalla supervisor.")
+
+
+# =========================
 # UI: ADMIN
 # =========================
 def page_admin():
@@ -1030,35 +1083,63 @@ def page_admin():
 # MAIN
 # =========================
 def main():
-    st.set_page_config(page_title="Aurora ML – WMS Picking", layout="wide")
+    st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
     init_db()
 
-    # Auto-carga maestro desde repo
+    # Auto-carga maestro desde repo (sirve para ambos modos)
     inv_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
 
-    # Banner de estado del maestro (solo info, sin estorbar)
+    # Si no hay modo seleccionado, mostramos lobby y salimos
+    if "app_mode" not in st.session_state:
+        page_app_lobby()
+        return
+
+    # Sidebar común
+    st.sidebar.title("Ferretería Aurora – WMS")
+
+    # Botón para volver al lobby
+    if st.sidebar.button("⬅️ Cambiar modo"):
+        st.session_state.pop("app_mode", None)
+        st.session_state.pop("selected_picker", None)
+        st.rerun()
+
+    # Estado maestro (lo dejamos en sidebar, bajo el título)
     if os.path.exists(MASTER_FILE):
-        st.sidebar.success(f"Maestro cargado: {MASTER_FILE} ({len(inv_map_sku)} SKUs / {len(barcode_to_sku)} EAN)")
+        st.sidebar.success(f"Maestro OK: {len(inv_map_sku)} SKUs / {len(barcode_to_sku)} EAN")
         if conflicts:
             st.sidebar.warning(f"Conflictos EAN: {len(conflicts)} (se usa el primero)")
     else:
         st.sidebar.warning(f"No se encontró {MASTER_FILE}. (La app funciona, pero sin maestro)")
 
-    st.sidebar.title("Ferretería Aurora – WMS")
+    mode = st.session_state.get("app_mode", "FLEX")
 
-    pages = [
-        "1) Picking",
-        "2) Importar ventas",
-        "3) Administrador",
-    ]
-    page = st.sidebar.radio("Menú", pages, index=0)
+    # ==========
+    # MODO FLEX / COLECTA (lo actual)
+    # ==========
+    if mode == "FLEX":
+        pages = [
+            "1) Picking",
+            "2) Importar ventas",
+            "3) Administrador",
+        ]
+        page = st.sidebar.radio("Menú", pages, index=0)
 
-    if page.startswith("1"):
-        page_picking()
-    elif page.startswith("2"):
-        page_import(inv_map_sku)
+        if page.startswith("1"):
+            page_picking()
+        elif page.startswith("2"):
+            page_import(inv_map_sku)
+        else:
+            page_admin()
+
+    # ==========
+    # MODO FULL (nuevo módulo)
+    # ==========
     else:
-        page_admin()
+        pages = [
+            "1) Full – Preparación",
+        ]
+        page = st.sidebar.radio("Menú", pages, index=0)
+        page_full_placeholder()
 
 
 if __name__ == "__main__":
