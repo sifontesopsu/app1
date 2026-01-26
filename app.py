@@ -1361,12 +1361,14 @@ def page_full_supervisor(inv_map_sku: dict):
             "msg": "",
             "msg_kind": "idle",
             "confirm_partial": False,
-            "pending_qty": None
+            "pending_qty": None,
+            "scan_nonce": 0,
+            "qty_nonce": 0
         }
     sst = state[str(batch_id)]
 
-    scan_key = f"full_scan_{batch_id}"
-    qty_key = f"full_qty_{batch_id}"
+    scan_key = f"full_scan_{batch_id}_{sst.get('scan_nonce',0)}"
+    qty_key  = f"full_qty_{batch_id}_{sst.get('qty_nonce',0)}"
 
     # Mensaje flash (se muestra una vez)
     flash_key = f"full_flash_{batch_id}"
@@ -1429,11 +1431,8 @@ def page_full_supervisor(inv_map_sku: dict):
             sst["msg"] = ""
             sst["confirm_partial"] = False
             sst["pending_qty"] = None
-            try:
-                st.session_state[scan_key] = ""
-                st.session_state[qty_key] = ""
-            except Exception:
-                pass
+            sst["scan_nonce"] = int(sst.get("scan_nonce",0)) + 1
+            sst["qty_nonce"]  = int(sst.get("qty_nonce",0)) + 1
             st.rerun()
 
     if sst.get("msg_kind") == "ok":
@@ -1507,11 +1506,8 @@ def page_full_supervisor(inv_map_sku: dict):
         sst["msg"] = ""
         sst["confirm_partial"] = False
         sst["pending_qty"] = None
-        try:
-            st.session_state[scan_key] = ""
-            st.session_state[qty_key] = ""
-        except Exception:
-            pass
+        sst["scan_nonce"] = int(sst.get("scan_nonce",0)) + 1
+        sst["qty_nonce"]  = int(sst.get("qty_nonce",0)) + 1
 
         st.session_state[flash_key] = ("success", f"✅ Acopio registrado: {q} unidad(es).")
         st.rerun()
@@ -1577,11 +1573,8 @@ def page_full_supervisor(inv_map_sku: dict):
             sst["msg"] = ""
             sst["confirm_partial"] = False
             sst["pending_qty"] = None
-            try:
-                st.session_state[scan_key] = ""
-                st.session_state[qty_key] = ""
-            except Exception:
-                pass
+            sst["scan_nonce"] = int(sst.get("scan_nonce",0)) + 1
+            sst["qty_nonce"]  = int(sst.get("qty_nonce",0)) + 1
             st.rerun()
 
 
