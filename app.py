@@ -1336,6 +1336,19 @@ def page_full_supervisor(inv_map_sku: dict):
     barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
     conn.close()
 
+    # Mensaje "flash" (para que se vea incluso después de st.rerun)
+    flash_key = f"full_flash_{batch_id}"
+    if flash_key in st.session_state:
+        kind, msg = st.session_state.get(flash_key, ("info", ""))
+        if msg:
+            if kind == "warning":
+                st.warning(msg)
+            elif kind == "success":
+                st.success(msg)
+            else:
+                st.info(msg)
+        st.session_state.pop(flash_key, None)
+
     st.markdown(
         """
         <style>
@@ -1411,6 +1424,7 @@ def page_full_supervisor(inv_map_sku: dict):
                 st.session_state[f"full_qty_{batch_id}"] = ""
             except Exception:
                 pass
+            st.rerun()
             st.rerun()
 
     if sst.get("msg_kind") == "ok":
@@ -1508,7 +1522,8 @@ def page_full_supervisor(inv_map_sku: dict):
             except Exception:
                 pass
 
-            st.success(f"Acopiado: {q} unidades.")
+            st.session_state[f"full_flash_{batch_id}"] = ("warning" if q < pending else "success",
+                                               f"Acopio registrado: {q} unidad(es)." + (f" Pendiente: {pending - q}." if q < pending else " Completado."))
             st.rerun()
 
     with colD:
@@ -1524,6 +1539,7 @@ def page_full_supervisor(inv_map_sku: dict):
                 st.session_state[f"full_qty_{batch_id}"] = ""
             except Exception:
                 pass
+            st.rerun()
             st.rerun()
 
 
