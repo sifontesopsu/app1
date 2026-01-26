@@ -1255,12 +1255,23 @@ def get_full_batch_summary(batch_id: int):
 def page_full_upload(inv_map_sku: dict):
     st.header("Full – Cargar Excel")
 
-    colA, colB = st.columns([2, 1])
-    with colA:
-        default_name = f"FULL_{datetime.now().strftime('%Y-%m-%d_%H%M')}"
-        batch_name = st.text_input("Nombre del lote", value=default_name)
-    with colB:
-        st.caption("Crea un lote nuevo cada vez que armes una preparación Full.")
+    # Confirmación (mensaje flash)
+    if st.session_state.get("full_flash"):
+        st.success(st.session_state.get("full_flash"))
+        st.session_state["full_flash"] = ""
+
+    # Solo 1 corrida a la vez: si hay lote abierto, no permitir cargar otro
+    open_batches = get_open_full_batches()
+    if open_batches:
+        active_id, active_name, active_status, active_created = open_batches[0]
+        st.warning(
+            f"Ya hay un lote Full en curso (#{active_id}). "
+            "Para cargar uno nuevo, ve a **Full – Admin** y usa **Reiniciar corrida (BORRA TODO)**."
+        )
+        return
+
+    # Nombre de lote automático (no se muestra)
+    batch_name = f"FULL_{datetime.now().strftime('%Y-%m-%d_%H%M')}"
 
     file = st.file_uploader("Excel de preparación Full (xlsx)", type=["xlsx"], key="full_excel")
     if not file:
@@ -1288,53 +1299,27 @@ def page_full_upload(inv_map_sku: dict):
 
     if st.button("✅ Crear lote y cargar"):
         try:
-                        # Guardar SOLO un 'title' (evita duplicar columnas y que se muestre como Series)
+            # Guardar SOLO un 'title' (evita duplicar columnas y que se muestre como Series)
             df_save = df2.copy()
-            if 'title_eff' in df_save.columns:
-                # Si ya existe 'title', la reemplazamos por title_eff
-                if 'title' in df_save.columns:
-                    df_save = df_save.drop(columns=['title'])
-                df_save = df_save.rename(columns={'title_eff': 'title'})
-            batch_id = upsert_full_batch_from_df(df_save, batch_name.strip())
-            st.success(f"Lote creado: #{batch_id} – {batch_name}")
+            if "title_eff" in df_save.columns:
+                if "title" in df_save.columns:
+                    df_save = df_save.drop(columns=["title"])
+                df_save = df_save.rename(columns={"title_eff": "title"})
+
+            batch_id = upsert_full_batch_from_df(df_save, str(batch_name).strip())
+
+            # Mostrar confirmación aunque hagamos rerun
+            st.session_state["full_flash"] = f"✅ Lote Full cargado correctamente (#{batch_id})."
             st.session_state.full_selected_batch = batch_id
             st.rerun()
         except Exception as e:
             st.error(str(e))
 
 
+
 # =========================
 # UI: FULL - SUPERVISOR ACOPIO (ESCANEO)
 # =========================
-def page_full_supervisor(inv_map_sku: dict):
-    st.header("Full – Supervisor de acopio")
-
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
-    barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
-    conn.close()
-
-    batches = get_open_full_batches()
-    if not batches:
-        st.info("No hay lotes Full cargados. Ve a 'Cargar Excel Full' primero.")
-        return
-
-    # Lote activo = último lote cargado (se trabaja solo con una corrida a la vez)
-    batch_id = batches[0][0]
-    
-    b, s = get_full_batch_summary(batch_id)
-    if b:
-        batch_name, bstatus, created_at, closed_at = b
-        n_skus, req_units, chk_units, ok_skus, touched_skus, pending_skus = s
-        req_units = int(req_units or 0)
-        chk_units = int(chk_units or 0)
-        prog = (chk_units / req_units) if req_units else 0.0
-
-        st.caption(f"Lote: {batch_name} • Creado: {to_chile_display(created_at)} • Estado: {bstatus}")
-        st.progress(min(max(prog, 0.0), 1.0))
-        st.caption(f"Progreso unidades: {chk_units}/{req_units} ({prog*100:.1f}%) • SKUs OK: {ok_skus}/{n_skus}")
-
     st.markdown(
         """
         <style>
