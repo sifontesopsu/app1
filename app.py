@@ -1336,19 +1336,6 @@ def page_full_supervisor(inv_map_sku: dict):
     barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
     conn.close()
 
-    # Mensaje "flash" (para que se vea incluso después de st.rerun)
-    flash_key = f"full_flash_{batch_id}"
-    if flash_key in st.session_state:
-        kind, msg = st.session_state.get(flash_key, ("info", ""))
-        if msg:
-            if kind == "warning":
-                st.warning(msg)
-            elif kind == "success":
-                st.success(msg)
-            else:
-                st.info(msg)
-        st.session_state.pop(flash_key, None)
-
     st.markdown(
         """
         <style>
@@ -1367,15 +1354,35 @@ def page_full_supervisor(inv_map_sku: dict):
     # Estado UI supervisor (por lote)
     if "full_sup_state" not in st.session_state:
         st.session_state.full_sup_state = {}
-
     state = st.session_state.full_sup_state
     if str(batch_id) not in state:
-        state[str(batch_id)] = {"scan_value": "", "sku_current": "", "qty_input": "", "msg": "", "msg_kind": "idle"}
-
+        state[str(batch_id)] = {
+            "sku_current": "",
+            "msg": "",
+            "msg_kind": "idle",
+            "confirm_partial": False,
+            "pending_qty": None
+        }
     sst = state[str(batch_id)]
 
+    scan_key = f"full_scan_{batch_id}"
+    qty_key = f"full_qty_{batch_id}"
+
+    # Mensaje flash (se muestra una vez)
+    flash_key = f"full_flash_{batch_id}"
+    if flash_key in st.session_state:
+        kind, msg = st.session_state.get(flash_key, ("info", ""))
+        if msg:
+            if kind == "warning":
+                st.warning(msg)
+            elif kind == "success":
+                st.success(msg)
+            else:
+                st.info(msg)
+        st.session_state.pop(flash_key, None)
+
     scan_label = "Escaneo"
-    scan = st.text_input(scan_label, value=sst.get("scan_value", ""), key=f"full_scan_{batch_id}")
+    scan = st.text_input(scan_label, key=scan_key)
     force_tel_keyboard(scan_label)
     autofocus_input(scan_label)
 
@@ -1383,27 +1390,30 @@ def page_full_supervisor(inv_map_sku: dict):
     with colA:
         if st.button("🔎 Buscar / Validar", key=f"full_find_{batch_id}"):
             sku = resolve_scan_to_sku(scan, barcode_to_sku)
-            sst["scan_value"] = scan
             sst["sku_current"] = sku
-            sst["qty_input"] = ""
+            sst["confirm_partial"] = False
+            sst["pending_qty"] = None
+            try:
+                st.session_state[qty_key] = ""
+            except Exception:
+                pass
 
             if not sku:
                 sst["msg_kind"] = "bad"
                 sst["msg"] = "No se pudo leer el código."
                 st.rerun()
 
-            # Validar si existe en el lote
             conn = get_conn()
             c = conn.cursor()
             c.execute("""
-                SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked
+                SELECT 1
                 FROM full_batch_items
                 WHERE batch_id=? AND sku_ml=?
             """, (batch_id, sku))
-            row = c.fetchone()
+            ok = c.fetchone()
             conn.close()
 
-            if not row:
+            if not ok:
                 sst["msg_kind"] = "bad"
                 sst["msg"] = f"{sku} no pertenece a este lote."
                 sst["sku_current"] = ""
@@ -1414,17 +1424,16 @@ def page_full_supervisor(inv_map_sku: dict):
 
     with colB:
         if st.button("🧹 Limpiar", key=f"full_clear_{batch_id}"):
-            sst["scan_value"] = ""
             sst["sku_current"] = ""
-            sst["qty_input"] = ""
             sst["msg_kind"] = "idle"
             sst["msg"] = ""
+            sst["confirm_partial"] = False
+            sst["pending_qty"] = None
             try:
-                st.session_state[f"full_scan_{batch_id}"] = ""
-                st.session_state[f"full_qty_{batch_id}"] = ""
+                st.session_state[scan_key] = ""
+                st.session_state[qty_key] = ""
             except Exception:
                 pass
-            st.rerun()
             st.rerun()
 
     if sst.get("msg_kind") == "ok":
@@ -1441,7 +1450,7 @@ def page_full_supervisor(inv_map_sku: dict):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, qty_checked
+        SELECT sku_ml, COALESCE(NULLIF(title,''),''), qty_required, COALESCE(qty_checked,0)
         FROM full_batch_items
         WHERE batch_id=? AND sku_ml=?
     """, (batch_id, sku_cur))
@@ -1454,7 +1463,6 @@ def page_full_supervisor(inv_map_sku: dict):
 
     sku_db, title_db, qty_req, qty_chk = row
     title_clean = str(title_db or "").strip()
-    # Seguro por si por algún motivo llega como Series u otro objeto raro
     if hasattr(title_db, "iloc"):
         try:
             title_clean = str(title_db.iloc[0]).strip()
@@ -1479,8 +1487,61 @@ def page_full_supervisor(inv_map_sku: dict):
     )
 
     qty_label = "Cantidad a acopiar"
-    qty_in = st.text_input(qty_label, value=sst.get("qty_input",""), key=f"full_qty_{batch_id}")
+    qty_in = st.text_input(qty_label, key=qty_key)
     force_tel_keyboard(qty_label)
+
+    def do_acopio(q: int):
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+        c2.execute("""
+            UPDATE full_batch_items
+            SET qty_checked = COALESCE(qty_checked,0) + ?
+            WHERE batch_id=? AND sku_ml=?
+        """, (q, batch_id, sku_db))
+        conn2.commit()
+        conn2.close()
+
+        # Limpiar campos para siguiente escaneo
+        sst["sku_current"] = ""
+        sst["msg_kind"] = "idle"
+        sst["msg"] = ""
+        sst["confirm_partial"] = False
+        sst["pending_qty"] = None
+        try:
+            st.session_state[scan_key] = ""
+            st.session_state[qty_key] = ""
+        except Exception:
+            pass
+
+        st.session_state[flash_key] = ("success", f"✅ Acopio registrado: {q} unidad(es).")
+        st.rerun()
+
+    # Si está pendiente confirmación parcial, mostrar confirmación ANTES de acopiar
+    if sst.get("confirm_partial") and sst.get("pending_qty") is not None:
+        q_pending = int(sst["pending_qty"])
+        st.warning(f"Vas a acopiar **{q_pending}** unidad(es), pero el pendiente actual es **{pending}**. ¿Confirmas acopio parcial?")
+        colP1, colP2 = st.columns(2)
+        with colP1:
+            if st.button("✅ Sí, confirmar acopio parcial", key=f"full_confirm_partial_yes_{batch_id}"):
+                # Revalidar pendiente para evitar carrera
+                if q_pending <= 0:
+                    st.error("Cantidad inválida.")
+                    return
+                if q_pending > pending:
+                    st.error(f"No puedes acopiar {q_pending}. Pendiente actual: {pending}.")
+                    sst["confirm_partial"] = False
+                    sst["pending_qty"] = None
+                    return
+                do_acopio(q_pending)
+        with colP2:
+            if st.button("Cancelar", key=f"full_confirm_partial_no_{batch_id}"):
+                sst["confirm_partial"] = False
+                sst["pending_qty"] = None
+                st.session_state[flash_key] = ("info", "Acopio parcial cancelado. Ajusta cantidad y confirma nuevamente.")
+                st.rerun()
+
+        # Importante: no mostrar el botón normal mientras espera confirmación
+        return
 
     colC, colD = st.columns([1, 1])
     with colC:
@@ -1500,46 +1561,27 @@ def page_full_supervisor(inv_map_sku: dict):
                 st.error(f"No puedes acopiar {q}. Pendiente actual: {pending}.")
                 return
 
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("""
-                UPDATE full_batch_items
-                SET qty_checked = COALESCE(qty_checked,0) + ?
-                WHERE batch_id=? AND sku_ml=?
-            """, (q, batch_id, sku_db))
-            conn.commit()
-            conn.close()
+            # Si es menor al pendiente, pedir confirmación ANTES de acopiar
+            if q < pending:
+                sst["confirm_partial"] = True
+                sst["pending_qty"] = q
+                st.rerun()
 
-            # Limpiar para siguiente escaneo
-            sst["scan_value"] = ""
-            sst["sku_current"] = ""
-            sst["qty_input"] = ""
-            sst["msg_kind"] = "idle"
-            sst["msg"] = ""
-            try:
-                st.session_state[f"full_scan_{batch_id}"] = ""
-                st.session_state[f"full_qty_{batch_id}"] = ""
-            except Exception:
-                pass
-
-            st.session_state[f"full_flash_{batch_id}"] = ("warning" if q < pending else "success",
-                                               f"Acopio registrado: {q} unidad(es)." + (f" Pendiente: {pending - q}." if q < pending else " Completado."))
-            st.rerun()
+            # Si es exacto, acopia directo
+            do_acopio(q)
 
     with colD:
-        # Duplicamos "Limpiar" abajo por ergonomía
         if st.button("🧹 Limpiar campos", key=f"full_clear2_{batch_id}"):
-            sst["scan_value"] = ""
             sst["sku_current"] = ""
-            sst["qty_input"] = ""
             sst["msg_kind"] = "idle"
             sst["msg"] = ""
+            sst["confirm_partial"] = False
+            sst["pending_qty"] = None
             try:
-                st.session_state[f"full_scan_{batch_id}"] = ""
-                st.session_state[f"full_qty_{batch_id}"] = ""
+                st.session_state[scan_key] = ""
+                st.session_state[qty_key] = ""
             except Exception:
                 pass
-            st.rerun()
             st.rerun()
 
 
