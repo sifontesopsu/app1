@@ -1032,6 +1032,20 @@ def _safe_str(x) -> str:
         return ""
     return s
 
+def _cell_to_str(x) -> str:
+    """Convierte celdas que pueden venir como Series (por columnas duplicadas) a string limpio."""
+    try:
+        # Si por error hay columnas duplicadas, pandas puede entregar Series en vez de escalar
+        if isinstance(x, pd.Series):
+            for v in x.tolist():
+                s = _safe_str(v)
+                if s:
+                    return s
+            return ""
+    except Exception:
+        pass
+    return _safe_str(x)
+
 
 def read_full_excel(file) -> pd.DataFrame:
     """
@@ -1153,7 +1167,7 @@ def upsert_full_batch_from_df(df: pd.DataFrame, batch_name: str):
         if sku not in agg:
             agg[sku] = {
                 "sku_ml": sku,
-                "title": _safe_str(r.get("title", "")),
+                "title": _cell_to_str(r.get("title", "")),
                 "qty_required": 0,
                 "areas": set(),
                 "nros": set(),
@@ -1181,7 +1195,7 @@ def upsert_full_batch_from_df(df: pd.DataFrame, batch_name: str):
 
         # si no hay título, intentar completar después con maestro (en UI)
         if not a["title"]:
-            a["title"] = _safe_str(r.get("title", ""))
+            a["title"] = _cell_to_str(r.get("title", ""))
 
     conn = get_conn()
     c = conn.cursor()
@@ -1274,7 +1288,14 @@ def page_full_upload(inv_map_sku: dict):
 
     if st.button("✅ Crear lote y cargar"):
         try:
-            batch_id = upsert_full_batch_from_df(df2.rename(columns={"title_eff": "title"}), batch_name.strip())
+                        # Guardar SOLO un 'title' (evita duplicar columnas y que se muestre como Series)
+            df_save = df2.copy()
+            if 'title_eff' in df_save.columns:
+                # Si ya existe 'title', la reemplazamos por title_eff
+                if 'title' in df_save.columns:
+                    df_save = df_save.drop(columns=['title'])
+                df_save = df_save.rename(columns={'title_eff': 'title'})
+            batch_id = upsert_full_batch_from_df(df_save, batch_name.strip())
             st.success(f"Lote creado: #{batch_id} – {batch_name}")
             st.session_state.full_selected_batch = batch_id
             st.rerun()
@@ -1350,14 +1371,9 @@ def page_full_supervisor(inv_map_sku: dict):
             "sku_current": "",
             "msg": "",
             "msg_kind": "idle",
-            "qty_input": "",
-            "needs_decision": False,
-            "missing": 0,
-            "over": 0,
-            "last_lookup_sku": ""
+            "qty_input": ""
         }
 
-    sst = state[str(batch_id)]
 
     # Input escaneo
     scan_label = "Escaneo"
@@ -1372,9 +1388,6 @@ def page_full_supervisor(inv_map_sku: dict):
             sst["scan_value"] = scan
             sst["sku_current"] = sku
             sst["qty_input"] = ""
-            sst["needs_decision"] = False
-            sst["missing"] = 0
-            sst["over"] = 0
 
             if not sku:
                 sst["msg_kind"] = "bad"
@@ -1426,16 +1439,6 @@ def page_full_supervisor(inv_map_sku: dict):
 
     if not item:
         st.warning("Este código no está en el lote seleccionado.")
-        if st.button("Registrar incidencia: NO CORRESPONDE", key=f"full_inc_no_{batch_id}"):
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO full_incidences (batch_id, sku_ml, qty_required, qty_checked, diff, reason, created_at)
-                VALUES (?,?,?,?,?,?,?)
-            """, (batch_id, sku_cur, 0, 0, 0, "NO_CORRESPONDE", now_iso()))
-            conn.commit()
-            conn.close()
-            st.success("Incidencia registrada.")
         return
 
     item_id, sku_ml, title, qty_required, qty_checked, status, areas, nros, instruccion, etiquetar, es_pack, vence = item
@@ -1478,17 +1481,54 @@ def page_full_supervisor(inv_map_sku: dict):
             st.error("La cantidad debe ser mayor a 0.")
             return
 
-        remaining = max(qty_required - qty_checked, 0)
+        # No registramos faltantes ni sobrantes en este módulo:
+        # solo acumulamos acopio, sin permitir superar lo solicitado.
+        if pending <= 0:
+            st.warning("Este SKU ya está completo (pendiente 0).")
+            # limpiar para siguiente escaneo
+            sst["sku_current"] = ""
+            sst["qty_input"] = ""
+            sst["msg_kind"] = "ok"
+            sst["msg"] = "SKU completo. Escanea el siguiente."
+            sst["scan_value"] = ""
+            try:
+                st.session_state[f"full_scan_{batch_id}"] = ""
+                st.session_state[f"full_qty_{batch_id}"] = ""
+            except Exception:
+                pass
+            st.rerun()
+
+        if q > pending:
+            st.error(f"No puedes acopiar {q} porque el pendiente es {pending}.")
+            return
+
         new_checked = qty_checked + q
 
-        # Caso SOBRANTE (se pasa del requerido)
-        if q > remaining and qty_required > 0:
-            sst["needs_decision"] = True
-            sst["missing"] = 0
-            sst["over"] = q - remaining
-            sst["qty_input"] = str(q)
-            st.warning(f"Supera lo pendiente por {sst['over']}. Debes decidir si registrar SOBRANTE.")
-            st.rerun()
+        conn = get_conn()
+        c = conn.cursor()
+        new_status = compute_full_status(qty_required, new_checked, False)
+        c.execute("""
+            UPDATE full_batch_items
+            SET qty_checked=?, status=?, updated_at=?
+            WHERE id=?
+        """, (int(new_checked), new_status, now_iso(), item_id))
+        conn.commit()
+        conn.close()
+
+        # Reset para dejar listo el escáner
+        sst["scan_value"] = ""
+        sst["sku_current"] = ""
+        sst["qty_input"] = ""
+        sst["msg_kind"] = "ok"
+        sst["msg"] = "Acopio confirmado. Escanea el siguiente."
+
+        try:
+            st.session_state[f"full_scan_{batch_id}"] = ""
+            st.session_state[f"full_qty_{batch_id}"] = ""
+        except Exception:
+            pass
+
+        st.rerun()
 
         # Caso FALTANTE (no completa lo pendiente)
         if q < remaining and qty_required > 0:
@@ -1516,132 +1556,9 @@ def page_full_supervisor(inv_map_sku: dict):
         conn.close()
 
         sst["qty_input"] = ""
-        sst["needs_decision"] = False
-        sst["missing"] = 0
-        sst["over"] = 0
         sst["msg_kind"] = "ok"
         sst["msg"] = "Acopio confirmado."
         st.rerun()
-
-    # Decisiones (faltante / sobrante)
-    if sst.get("needs_decision", False):
-        colA, colB = st.columns(2)
-
-        if sst.get("missing", 0) > 0:
-            with colA:
-                if st.button("📌 Registrar FALTANTE", key=f"full_reg_missing_{batch_id}"):
-                    q = int(sst["qty_input"])
-                    remaining = max(qty_required - qty_checked, 0)
-                    new_checked = qty_checked + q
-                    missing = remaining - q
-
-                    conn = get_conn()
-                    c = conn.cursor()
-                    c.execute("""
-                        INSERT INTO full_incidences (batch_id, sku_ml, qty_required, qty_checked, diff, reason, created_at)
-                        VALUES (?,?,?,?,?,?,?)
-                    """, (batch_id, sku_ml, qty_required, int(new_checked), int(-missing), "FALTANTE_ACOPIO", now_iso()))
-
-                    new_status = compute_full_status(qty_required, new_checked, True)
-                    c.execute("""
-                        UPDATE full_batch_items
-                        SET qty_checked=?, status=?, updated_at=?
-                        WHERE id=?
-                    """, (int(new_checked), new_status, now_iso(), item_id))
-
-                    conn.commit()
-                    conn.close()
-
-                    sst["qty_input"] = ""
-                    sst["needs_decision"] = False
-                    sst["missing"] = 0
-                    sst["msg_kind"] = "warn"
-                    sst["msg"] = "Faltante registrado."
-                    st.rerun()
-
-            with colB:
-                if st.button("➡️ Solo acumular y seguir", key=f"full_just_partial_{batch_id}"):
-                    q = int(sst["qty_input"])
-                    new_checked = qty_checked + q
-
-                    conn = get_conn()
-                    c = conn.cursor()
-                    c.execute("SELECT COUNT(*) FROM full_incidences WHERE batch_id=? AND sku_ml=?", (batch_id, sku_ml))
-                    has_inc = c.fetchone()[0] > 0
-
-                    new_status = compute_full_status(qty_required, new_checked, has_inc)
-                    c.execute("""
-                        UPDATE full_batch_items
-                        SET qty_checked=?, status=?, updated_at=?
-                        WHERE id=?
-                    """, (int(new_checked), new_status, now_iso(), item_id))
-                    conn.commit()
-                    conn.close()
-
-                    sst["qty_input"] = ""
-                    sst["needs_decision"] = False
-                    sst["missing"] = 0
-                    sst["msg_kind"] = "ok"
-                    sst["msg"] = "Acumulado. Sigue con el siguiente SKU."
-                    st.rerun()
-
-        elif sst.get("over", 0) > 0:
-            with colA:
-                if st.button("📌 Registrar SOBRANTE", key=f"full_reg_over_{batch_id}"):
-                    q = int(sst["qty_input"])
-                    remaining = max(qty_required - qty_checked, 0)
-                    over = q - remaining
-                    new_checked = qty_checked + q
-
-                    conn = get_conn()
-                    c = conn.cursor()
-                    c.execute("""
-                        INSERT INTO full_incidences (batch_id, sku_ml, qty_required, qty_checked, diff, reason, created_at)
-                        VALUES (?,?,?,?,?,?,?)
-                    """, (batch_id, sku_ml, qty_required, int(new_checked), int(over), "SOBRANTE_ACOPIO", now_iso()))
-
-                    new_status = compute_full_status(qty_required, new_checked, True)
-                    c.execute("""
-                        UPDATE full_batch_items
-                        SET qty_checked=?, status=?, updated_at=?
-                        WHERE id=?
-                    """, (int(new_checked), new_status, now_iso(), item_id))
-                    conn.commit()
-                    conn.close()
-
-                    sst["qty_input"] = ""
-                    sst["needs_decision"] = False
-                    sst["over"] = 0
-                    sst["msg_kind"] = "warn"
-                    sst["msg"] = "Sobrante registrado."
-                    st.rerun()
-
-            with colB:
-                if st.button("➡️ Aceptar acumulación", key=f"full_accept_over_{batch_id}"):
-                    q = int(sst["qty_input"])
-                    new_checked = qty_checked + q
-
-                    conn = get_conn()
-                    c = conn.cursor()
-                    c.execute("SELECT COUNT(*) FROM full_incidences WHERE batch_id=? AND sku_ml=?", (batch_id, sku_ml))
-                    has_inc = c.fetchone()[0] > 0
-
-                    new_status = compute_full_status(qty_required, new_checked, has_inc)
-                    c.execute("""
-                        UPDATE full_batch_items
-                        SET qty_checked=?, status=?, updated_at=?
-                        WHERE id=?
-                    """, (int(new_checked), new_status, now_iso(), item_id))
-                    conn.commit()
-                    conn.close()
-
-                    sst["qty_input"] = ""
-                    sst["needs_decision"] = False
-                    sst["over"] = 0
-                    sst["msg_kind"] = "ok"
-                    sst["msg"] = "Acumulado. Sigue con el siguiente SKU."
-                    st.rerun()
-
 
 # =========================
 # UI: FULL - ADMIN (progreso)
