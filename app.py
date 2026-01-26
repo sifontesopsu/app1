@@ -1320,19 +1320,9 @@ def page_full_supervisor(inv_map_sku: dict):
         st.info("No hay lotes Full cargados. Ve a 'Cargar Excel Full' primero.")
         return
 
-    # Selector de lote
-    options = [f"#{bid} — {name} ({status})" for bid, name, status, _ in batches]
-    default_idx = 0
-    if "full_selected_batch" in st.session_state:
-        for i, (bid, *_rest) in enumerate(batches):
-            if bid == st.session_state.full_selected_batch:
-                default_idx = i
-                break
-
-    sel = st.selectbox("Lote activo", options, index=default_idx)
-    batch_id = batches[options.index(sel)][0]
-    st.session_state.full_selected_batch = batch_id
-
+    # Lote activo = último lote cargado (se trabaja solo con una corrida a la vez)
+    batch_id = batches[0][0]
+    
     b, s = get_full_batch_summary(batch_id)
     if b:
         batch_name, bstatus, created_at, closed_at = b
@@ -1415,7 +1405,18 @@ def page_full_supervisor(inv_map_sku: dict):
 
     with col2:
         if st.button("🧹 Limpiar", key=f"full_clear_{batch_id}"):
-            state.pop(str(batch_id), None)
+            # Limpia estado + campos visibles
+            if str(batch_id) in state:
+                state[str(batch_id)]["scan_value"] = ""
+                state[str(batch_id)]["sku_current"] = ""
+                state[str(batch_id)]["qty_input"] = ""
+                state[str(batch_id)]["msg_kind"] = "idle"
+                state[str(batch_id)]["msg"] = ""
+            try:
+                st.session_state[f"full_scan_{batch_id}"] = ""
+                st.session_state[f"full_qty_{batch_id}"] = ""
+            except Exception:
+                pass
             st.rerun()
 
     if sst["msg_kind"] == "ok":
@@ -1611,51 +1612,45 @@ def page_full_admin():
         st.info("Sin incidencias registradas para este lote.")
 
     st.divider()
-    
-st.subheader("Acciones")
 
-if "full_confirm_reset" not in st.session_state:
-    st.session_state.full_confirm_reset = False
+    st.subheader("Acciones")
 
-if not st.session_state.full_confirm_reset:
-    if st.button("🔄 Reiniciar corrida (poner todo en 0)"):
-        st.session_state.full_confirm_reset = True
-        st.warning("⚠️ Esto reinicia el lote seleccionado: acopiado vuelve a 0 y se borran incidencias. Confirma abajo.")
-        st.rerun()
-else:
-    st.error("CONFIRMACIÓN: se reiniciará la corrida del lote (todo vuelve a 0).")
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("✅ Sí, reiniciar ahora"):
-            # Reset items
-            c.execute("""
-                UPDATE full_batch_items
-                SET qty_checked=0, status='PENDING', updated_at=NULL
-                WHERE batch_id=?
-            """, (batch_id,))
-            # Delete incidences
-            c.execute("DELETE FROM full_incidences WHERE batch_id=?", (batch_id,))
-            # Keep batch OPEN
-            c.execute("UPDATE full_batches SET status='OPEN', closed_at=NULL WHERE id=?", (batch_id,))
-            conn.commit()
+    # Reiniciar corrida FULL (borrar todo lo cargado para Full)
+    if "full_confirm_reset" not in st.session_state:
+        st.session_state.full_confirm_reset = False
 
-            # Limpia estado UI del supervisor para este lote
-            try:
-                if "full_sup_state" in st.session_state and str(batch_id) in st.session_state.full_sup_state:
-                    st.session_state.full_sup_state.pop(str(batch_id), None)
-                st.session_state.pop(f"full_scan_{batch_id}", None)
-                st.session_state.pop(f"full_qty_{batch_id}", None)
-            except Exception:
-                pass
-
-            st.session_state.full_confirm_reset = False
-            st.success("Corrida reiniciada. Todo quedó en 0 para procesar nuevamente.")
+    if not st.session_state.full_confirm_reset:
+        if st.button("🔄 Reiniciar corrida (BORRA TODO Full)"):
+            st.session_state.full_confirm_reset = True
+            st.warning("⚠️ Esto borrará TODOS los datos de Full (lote, items y registros de acopio). Confirma abajo.")
             st.rerun()
-    with colB:
-        if st.button("Cancelar"):
-            st.session_state.full_confirm_reset = False
-            st.info("Reinicio cancelado.")
-            st.rerun()
+    else:
+        st.error("CONFIRMACIÓN: se borrará TODO lo relacionado a Full.")
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("✅ Sí, borrar todo y reiniciar Full"):
+                conn2 = get_conn()
+                c2 = conn2.cursor()
+                c2.execute("DELETE FROM full_incidences;")
+                c2.execute("DELETE FROM full_batch_items;")
+                c2.execute("DELETE FROM full_batches;")
+                conn2.commit()
+                conn2.close()
+
+                st.session_state.full_confirm_reset = False
+                st.session_state.pop("full_selected_batch", None)
+
+                # limpiar estados UI del supervisor
+                if "full_supervisor_state" in st.session_state:
+                    st.session_state.pop("full_supervisor_state", None)
+
+                st.success("Full reiniciado (todo borrado).")
+                st.rerun()
+        with colB:
+            if st.button("Cancelar"):
+                st.session_state.full_confirm_reset = False
+                st.info("Reinicio cancelado.")
+                st.rerun()
 
     conn.close()
 
