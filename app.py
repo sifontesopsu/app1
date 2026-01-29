@@ -2162,39 +2162,79 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
     st.caption("Carga 1 manifiesto (Control PDF) y asigna TODAS las páginas a mesas. 1 página = 1 mesa.")
 
     active = get_active_sorting_manifest()
+
+    # Siempre permitir cargar etiquetas y/o continuar asignación para el manifiesto ACTIVO.
     if active:
-        st.warning(f"Hay un manifiesto ACTIVO: {active['name']}. Debes terminarlo antes de cargar otro.")
-        st.info("Ve a 'Camarero' y completa todas las corridas. Luego se cerrará el manifiesto.")
-        return
-
-    pdf = st.file_uploader("Control / Manifiesto (PDF)", type=["pdf"], key="sorting_pdf")
-    zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL) (opcional pero recomendado)", type=["txt"], key="sorting_zpl")
-
-    if not pdf:
-        st.info("Sube el PDF para continuar.")
-        return
-
-    pages = parse_control_pdf_by_page(pdf)
-    if not pages:
-        st.error("No se pudo leer el PDF.")
-        return
-
-    manifest_name = getattr(pdf, "name", "manifiesto.pdf")
-    if "sorting_parsed_pages" not in st.session_state or st.session_state.get("sorting_manifest_name") != manifest_name:
-        st.session_state.sorting_parsed_pages = pages
-        st.session_state.sorting_manifest_name = manifest_name
-
-    # create manifest row now
-    if "sorting_manifest_id" not in st.session_state:
-        mid = create_sorting_manifest(manifest_name)
+        st.info(f"Manifiesto ACTIVO: **{active['name']}** (creado: {to_chile_display(active['created_at'])})")
+        st.warning("Este manifiesto sigue en proceso. Puedes cargar etiquetas y/o terminar la asignación de páginas. "
+                   "No se permite crear un manifiesto nuevo hasta finalizar éste.")
+        mid = active["id"]
         st.session_state.sorting_manifest_id = mid
-        # store labels if uploaded
+        # Para continuar (re)asignación, pedimos el PDF del manifiesto activo (para volver a parsear páginas si es necesario)
+        pdf = st.file_uploader("Control / Manifiesto ACTIVO (PDF)", type=["pdf"], key="sorting_pdf_active")
+        zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL) (puedes cargarlo ahora)", type=["txt"], key="sorting_zpl_active")
+
+        # Permite cargar etiquetas en cualquier momento
         if zpl is not None:
             raw = zpl.read().decode("utf-8", errors="ignore")
             pack_map, ship_map = parse_zpl_labels(raw)
             upsert_labels_to_db(mid, pack_map, raw)
+            st.success("Etiquetas cargadas/actualizadas para el manifiesto activo.")
+            st.rerun()
 
-    mid = st.session_state.sorting_manifest_id
+        # Si ya existen corridas creadas, solo mostramos resumen y enviamos a Camarero
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=?;", (mid,))
+        run_count = int(c.fetchone()[0] or 0)
+        conn.close()
+
+        if run_count > 0:
+            st.success(f"Corridas ya creadas para este manifiesto: **{run_count}**. Ve a 'Camarero' para completarlas.")
+            st.stop()
+
+        # Si aún no hay corridas, necesitamos el PDF para (re)leer páginas y asignarlas
+        if not pdf:
+            st.info("Sube el PDF del manifiesto activo para asignar sus páginas a mesas.")
+            st.stop()
+
+        pages = parse_control_pdf_by_page(pdf)
+        if not pages:
+            st.error("No se pudo leer el PDF.")
+            st.stop()
+
+        manifest_name = getattr(pdf, "name", active["name"]) or active["name"]
+        st.session_state.sorting_parsed_pages = pages
+        st.session_state.sorting_manifest_name = manifest_name
+
+    else:
+        pdf = st.file_uploader("Control / Manifiesto (PDF)", type=["pdf"], key="sorting_pdf")
+        zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL) (opcional pero recomendado)", type=["txt"], key="sorting_zpl")
+
+        if not pdf:
+            st.info("Sube el PDF para continuar.")
+            return
+
+        pages = parse_control_pdf_by_page(pdf)
+        if not pages:
+            st.error("No se pudo leer el PDF.")
+            return
+
+        manifest_name = getattr(pdf, "name", "manifiesto.pdf")
+        if "sorting_parsed_pages" not in st.session_state or st.session_state.get("sorting_manifest_name") != manifest_name:
+            st.session_state.sorting_parsed_pages = pages
+            st.session_state.sorting_manifest_name = manifest_name
+
+        # create manifest row now
+        if "sorting_manifest_id" not in st.session_state:
+            mid = create_sorting_manifest(manifest_name)
+            st.session_state.sorting_manifest_id = mid
+            # store labels if uploaded
+            if zpl is not None:
+                raw = zpl.read().decode("utf-8", errors="ignore")
+                pack_map, ship_map = parse_zpl_labels(raw)
+                upsert_labels_to_db(mid, pack_map, raw)
+        mid = st.session_state.sorting_manifest_id
     pages = st.session_state.sorting_parsed_pages
 
     st.subheader("Asignación de páginas a mesas (obligatorio)")
