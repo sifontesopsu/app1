@@ -15,6 +15,7 @@ NUM_MESAS = 4
 
 # Maestro SKU/EAN en la misma carpeta que app.py
 MASTER_FILE = "maestro_sku_ean.xlsx"
+APP_VERSION = "2026-01-29 | Sorting lobby visible"
 
 
 # =========================
@@ -635,6 +636,7 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
 def page_app_lobby():
     st.markdown("## Ferretería Aurora – WMS")
     st.caption("Selecciona el flujo de trabajo")
+    st.caption(f"Versión: {APP_VERSION}")
 
     st.markdown(
         """
@@ -1829,6 +1831,7 @@ def main():
 
     # Sidebar común
     st.sidebar.title("Ferretería Aurora – WMS")
+    st.sidebar.caption(f"Versión: {APP_VERSION}")
 
     # Botón para volver al lobby
     if st.sidebar.button("⬅️ Cambiar modo"):
