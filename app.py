@@ -269,15 +269,6 @@ def init_db():
 
     # --- SORTING (Flex/Colecta por página -> mesa) ---
     c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_manifests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        logistics TEXT,
-        manifest_name TEXT,
-        uploaded_at TEXT,
-        status TEXT DEFAULT 'ACTIVE'
-    );
-    """)
-    c.execute("""
     CREATE TABLE IF NOT EXISTS sorting_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         logistics TEXT,
@@ -298,8 +289,6 @@ def init_db():
         seq INTEGER,
         ml_order_id TEXT,
         pack_id TEXT,
-        buyer_name TEXT,
-        address_text TEXT,
         sku_ml TEXT,
         title_ml TEXT,
         title_tec TEXT,
@@ -314,31 +303,25 @@ def init_db():
     CREATE TABLE IF NOT EXISTS sorting_labels (
         pack_id TEXT PRIMARY KEY,
         shipment_id TEXT,
-        recipient_name TEXT,
-        recipient_address TEXT,
         raw_zpl TEXT,
         created_at TEXT
     );
     """)
+        # --- MIGRACIONES SUAVES (agregar columnas si faltan) ---
+    def _ensure_col(table: str, col: str, col_type: str):
+        c.execute(f"PRAGMA table_info({table});")
+        cols_ = [r[1] for r in c.fetchall()]
+        if col not in cols_:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type};")
 
-    # Migraciones suaves (por si la DB ya existía)
-    for ddl in [
-        "ALTER TABLE sorting_run_items ADD COLUMN buyer_name TEXT;",
-        "ALTER TABLE sorting_run_items ADD COLUMN address_text TEXT;",
-        "ALTER TABLE sorting_labels ADD COLUMN recipient_name TEXT;",
-        "ALTER TABLE sorting_labels ADD COLUMN recipient_address TEXT;",
-    ]:
-        try:
-            c.execute(ddl)
-        except Exception:
-            pass
+    _ensure_col("sorting_run_items", "buyer_name", "TEXT")
+    _ensure_col("sorting_run_items", "addr_text", "TEXT")
+    _ensure_col("sorting_run_items", "recipient_name", "TEXT")
 
-    # Índices / unicidad (evita duplicar páginas)
-    try:
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_sorting_runs_manifest_page ON sorting_runs(manifest_name, page_num);")
-    except Exception:
-        pass
-    # Maestro EAN/SKU (común)
+    _ensure_col("sorting_labels", "recipient_name", "TEXT")
+    _ensure_col("sorting_labels", "addr_text", "TEXT")
+
+# Maestro EAN/SKU (común)
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_barcodes (
         barcode TEXT PRIMARY KEY,
@@ -398,74 +381,66 @@ def init_db():
 # MAESTRO SKU/EAN (AUTO)
 # =========================
 def load_master_from_path(path: str) -> tuple[dict, dict, list]:
-    inv_map_sku = {}
-    barcode_to_sku = {}
-    conflicts = []
+    """
+    Devuelve:
+      - inv_map_sku: {SKU(str): Descripción(str)}
+      - barcode_to_sku: {EAN(str): SKU(str)}
+      - conflicts: lista de EAN duplicados con distinto SKU
+    Soporta celdas con múltiples EAN separados por espacio/otros.
+    """
+    inv_map_sku: dict[str, str] = {}
+    barcode_to_sku: dict[str, str] = {}
+    conflicts: list[tuple[str, str, str]] = []
 
     if not path or not os.path.exists(path):
         return inv_map_sku, barcode_to_sku, conflicts
 
-    df = pd.read_excel(path, dtype=str)
+    df = pd.read_excel(path, dtype=str).copy()
+    df.columns = [str(c).strip() for c in df.columns]
     cols = df.columns.tolist()
-    lower = [str(c).strip().lower() for c in cols]
+    lower = [c.lower() for c in cols]
 
-    sku_col = None
-    if "sku" in lower:
-        sku_col = cols[lower.index("sku")]
+    def pick_col(cands):
+        for cand in cands:
+            if cand in lower:
+                return cols[lower.index(cand)]
+        return None
 
-    tech_col = None
-    for cand in ["artículo", "articulo", "descripcion", "descripción", "nombre", "producto", "detalle"]:
-        if cand in lower:
-            tech_col = cols[lower.index(cand)]
-            break
+    sku_col = pick_col(["sku"])
+    tech_col = pick_col(["descripción", "descripcion", "artículo", "articulo", "nombre", "producto", "detalle"])
+    barcode_col = pick_col(["codigo de barras", "código de barras", "barcode", "ean", "eans"])
 
-    barcode_col = None
-    for cand in ["codigo de barras", "código de barras", "barcode", "ean", "eans"]:
-        if cand in lower:
-            barcode_col = cols[lower.index(cand)]
-            break
+    # Fallback si no trae headers claros: 1ra col descripción, 2da col sku, 3ra col ean
+    if sku_col is None and len(cols) >= 2:
+        sku_col = cols[1]
+    if tech_col is None and len(cols) >= 1:
+        tech_col = cols[0]
+    if barcode_col is None and len(cols) >= 3:
+        barcode_col = cols[2]
 
-    # Fallback por si el archivo no trae headers claros
-    if sku_col is None or tech_col is None:
-        df0 = pd.read_excel(path, header=None, dtype=str)
-        if df0.shape[1] >= 2:
-            a, b = df0.columns[0], df0.columns[1]
-            sample = df0.head(200)
+    ean_re = re.compile(r"\b\d{8,14}\b")
 
-            def score(series):
-                s = 0
-                for v in series:
-                    if re.fullmatch(r"\d{4,}", normalize_sku(v)):
-                        s += 1
-                return s
-
-            sa, sb = score(sample[a]), score(sample[b])
-            if sb >= sa:
-                sku_col, tech_col = b, a
-            else:
-                sku_col, tech_col = a, b
-            df = df0
-            barcode_col = None  # sin header no asumimos dónde está EAN
-
-    for _, r in df.iterrows():
-        sku = normalize_sku(r.get(sku_col, ""))
+    for _, row in df.iterrows():
+        sku_raw = "" if pd.isna(row.get(sku_col)) else str(row.get(sku_col))
+        sku = normalize_sku(sku_raw)
         if not sku:
             continue
 
-        tech = str(r.get(tech_col, "")).strip() if tech_col is not None else ""
-        if tech and tech.lower() != "nan":
-            inv_map_sku[sku] = tech
+        name_raw = "" if pd.isna(row.get(tech_col)) else str(row.get(tech_col))
+        name = name_raw.strip()
 
-        if barcode_col is not None:
-            codes = split_barcodes(r.get(barcode_col, ""))
-            for code in codes:
-                if code in barcode_to_sku and barcode_to_sku[code] != sku:
-                    conflicts.append((code, barcode_to_sku[code], sku))
-                    continue
-                barcode_to_sku[code] = sku
+        if name and sku not in inv_map_sku:
+            inv_map_sku[sku] = name
+
+        raw_bar = "" if pd.isna(row.get(barcode_col)) else str(row.get(barcode_col))
+        for ean in ean_re.findall(raw_bar):
+            prev = barcode_to_sku.get(ean)
+            if prev and prev != sku:
+                conflicts.append((ean, prev, sku))
+                continue
+            barcode_to_sku[ean] = sku
 
     return inv_map_sku, barcode_to_sku, conflicts
-
 
 def upsert_barcodes_to_db(barcode_to_sku: dict):
     if not barcode_to_sku:
@@ -586,12 +561,18 @@ def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
     """Devuelve una lista de páginas. Cada página es:
     {
       page_num: int,
-      items: [ {seq, ml_order_id, pack_id, sku_ml, qty} ... ]
+      items: [ {seq, ml_order_id, pack_id, sku_ml, title_ml, buyer, qty} ... ]
     }
     Mantiene el orden EXACTO en que aparecen en la página.
     """
     if not HAS_PDF_LIB:
         raise RuntimeError("Falta pdfplumber. Agrega 'pdfplumber' a requirements.txt")
+
+    uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-", re.I)
+    mel_re = re.compile(r"^MEL[0-9A-Za-z]+", re.I)
+
+    def is_meta(lw: str) -> bool:
+        return any(k in lw for k in ["pack id", "venta", "sku", "cantidad", "color:", "diámetro", "diametro"])
 
     pages_out = []
     with pdfplumber.open(uploaded_file) as pdf:
@@ -603,26 +584,40 @@ def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
             cur_pack = None
             cur_venta = None
             cur_sku = None
-            last_name_candidate = None
-            last_title_candidate = None
+            cur_title = ""
             seq = 0
             items = []
 
-            for line in lines:
-                # Candidato a título de producto (desde el manifiesto)
-                # Ejemplo: "<uuid> Limpia Contacto 400ml ..." o "MEL... <título>"
-                if re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F\-]{12,}\s+", line):
-                    last_title_candidate = re.sub(r"^[0-9a-fA-F]{8}-[0-9a-fA-F\-]{12,}\s+", "", line).strip()
-                elif re.match(r"^MEL[0-9A-Z]+\s+", line):
-                    last_title_candidate = re.sub(r"^MEL[0-9A-Z]+\s+", "", line).strip()
-                # Candidato a nombre de cliente: líneas con letras (sin dígitos) y sin palabras clave.
-                if (not re.search(r"\d", line)) and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", line):
-                    low = line.lower()
-                    if not any(k in low for k in ["pack id", "venta", "sku", "cantidad", "color", "identific", "productos", "despacha", "mel"]):
-                        # Evita IDs/UUID
-                        if not re.fullmatch(r"[0-9a-fA-F\-]{16,}", line.strip()):
-                            if 3 <= len(line.strip()) <= 60:
-                                last_name_candidate = line.strip()
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                low = line.lower()
+
+                # Título (viene junto a UUID o MEL...)
+                # ej: "eb66a2ba-... Limpia Contacto 400ml ..."
+                if uuid_re.match(line) or mel_re.match(line):
+                    parts = line.split(" ", 1)
+                    if len(parts) == 2:
+                        cur_title = parts[1].strip()
+                    else:
+                        cur_title = ""
+                    # Continuación de título (líneas siguientes hasta que aparezca meta)
+                    j = i + 1
+                    cont = []
+                    while j < len(lines):
+                        nxt = lines[j].strip()
+                        lw = nxt.lower()
+                        if is_meta(lw) or uuid_re.match(nxt) or mel_re.match(nxt):
+                            break
+                        # evita capturar nombres de personas sueltas (heurística: 2-5 palabras con mayúsculas)
+                        if len(nxt.split()) <= 6 and not re.search(r"\d", nxt) and nxt[:1].isupper():
+                            break
+                        cont.append(nxt)
+                        j += 1
+                    if cont:
+                        cur_title = (cur_title + " " + " ".join(cont)).strip()
+                    i = j
+                    continue
 
                 m_pack = re.search(r"Pack\s*ID\s*[:#]?\s*([0-9]+)", line, flags=re.I)
                 if m_pack:
@@ -639,161 +634,141 @@ def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
                 m_qty = re.search(r"Cantidad\s*[:#]?\s*([0-9]+)", line, flags=re.I)
                 if m_qty:
                     qty = int(m_qty.group(1))
-                    # A veces el nombre viene en la misma línea antes de 'Cantidad'
-                    inline_name = None
-                    try:
-                        pre = re.split(r"\bCantidad\b", line, flags=re.I)[0].strip()
-                        if pre and (not re.search(r"\d", pre)) and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", pre):
-                            # pre puede incluir 'Venta:' o 'Color:'; filtramos
-                            lowp = pre.lower()
-                            if not any(k in lowp for k in ["venta", "pack", "sku", "color"]):
-                                inline_name = pre
-                    except Exception:
-                        inline_name = None
-                    # Solo creamos item cuando tenemos lo mínimo
                     if cur_pack and cur_venta and cur_sku and qty > 0:
+                        buyer = ""
+                        # En el manifiesto, el nombre suele venir en la línea siguiente
+                        if i + 1 < len(lines):
+                            cand = lines[i + 1].strip()
+                            lw = cand.lower()
+                            if cand and (not is_meta(lw)) and (not uuid_re.match(cand)) and (not mel_re.match(cand)):
+                                # evita "Color:" etc
+                                if not re.fullmatch(r"[0-9 .:/-]+", cand):
+                                    buyer = cand
                         seq += 1
                         items.append({
                             "seq": seq,
                             "ml_order_id": cur_venta,
                             "pack_id": cur_pack,
                             "sku_ml": cur_sku,
-                            "qty": qty,
-                            "buyer_name": (inline_name or last_name_candidate or "").strip(),
-                            "title_ml": (last_title_candidate or "").strip()
+                            "title_ml": cur_title or "",
+                            "buyer": buyer or "",
+                            "qty": qty
                         })
-                        last_name_candidate = None
-                        last_title_candidate = None
+
+                i += 1
 
             pages_out.append({"page_num": pidx, "items": items})
 
     return pages_out
 
-
-# =========================
-# PARSER ZPL ETIQUETAS (TXT) -> pack_id -> shipment_id
-# =========================
 def parse_labels_zpl_text(zpl_text: str) -> dict:
-    """Lee un TXT con ZPL (varias etiquetas) y devuelve un mapping por pack_id.
-
-    Devuelve:
-      {
-        pack_id: {
-          shipment_id: str,
-          recipient_name: str,
-          recipient_address: str
-        }, ...
-      }
-
-    No intenta imprimir, solo extrae datos para mostrar en pantalla.
+    """
+    Lee un TXT con ZPL (varias etiquetas) y devuelve:
+      {pack_id: {"shipment_id": str, "addr_text": str, "recipient": str}}
+    Maneja el caso donde el Pack ID viene partido:
+      'Pack ID: 20000^FS' y luego una línea '^FD1128...^FS'
     """
     if not zpl_text:
         return {}
 
-    lines = [ln.rstrip("\n") for ln in str(zpl_text).splitlines()]
-    mappings = {}
+    text = str(zpl_text)
+    # Separa por etiqueta
+    blocks = re.split(r"\^XA", text)
+    out = {}
 
-    pending_pack_prefix = None
-    current_pack = None
-    current_ship = None
-    name_lines = []
-    addr_lines = []
+    ship_re = re.compile(r"\^FD>:\s*([0-9]{6,20})\^FS")
+    pack_prefix_re = re.compile(r"Pack ID:\s*([0-9]+)\^FS", re.I)
+    fd_digits_re = re.compile(r"\^FD\s*([0-9]{6,20})\^FS")
+    fd_text_re = re.compile(r"\^FD(.+?)\^FS")
 
-    def flush():
-        nonlocal current_pack, current_ship, name_lines, addr_lines
-        if current_pack:
-            rec_name = " ".join([x for x in name_lines if x]).strip()
-            rec_addr = " ".join([x for x in addr_lines if x]).strip()
-            mappings[current_pack] = {
-                "shipment_id": (current_ship or "").strip() or None,
-                "recipient_name": rec_name or None,
-                "recipient_address": rec_addr or None,
-            }
-        current_pack = None
-        current_ship = None
-        name_lines = []
-        addr_lines = []
+    for blk in blocks:
+        if "^XZ" not in blk:
+            continue
 
-    for i, ln in enumerate(lines):
-        # Shipment / barcode: ^FD>:46359656238  (o variantes)
-        m_ship = re.search(r"\^FD>?:?\s*([0-9]{6,})", ln)
-        if m_ship:
-            current_ship = m_ship.group(1).strip()
+        # Shipment
+        mship = ship_re.search(blk)
+        shipment = mship.group(1) if mship else ""
 
-        # Texto humano en ZPL suele venir como ^FD...^FS
-        m_txt = re.search(r"\^FD([^\^]{1,120})\^FS", ln)
-        if m_txt:
-            txt = m_txt.group(1)
-            txt = re.sub(r"\s+", " ", txt).strip()
-            # Filtra ruido común
-            if txt and not txt.startswith(">:") and not re.fullmatch(r"[0-9]{6,}", txt):
-                # Heurística: las primeras 1-2 líneas de texto suelen ser nombre + calle.
-                # Si ya capturamos nombre, el resto lo tratamos como dirección.
-                if len(name_lines) < 1 and len(txt) <= 60 and not any(k in txt.lower() for k in ["pack id", "ship", "env", "retira"]):
-                    name_lines.append(txt)
-                else:
-                    # evitamos duplicar 'Pack ID'
-                    if "pack id" not in txt.lower():
-                        addr_lines.append(txt)
+        # Pack ID (prefijo + siguiente FD numérica)
+        pack_id = ""
+        mp = pack_prefix_re.search(blk)
+        if mp:
+            prefix = mp.group(1)
+            # buscamos un FD numérico cercano DESPUÉS del Pack ID (los dígitos restantes)
+            tail = blk[mp.end(): mp.end()+250]
+            mt = fd_digits_re.search(tail)
+            if mt:
+                pack_id = (prefix + mt.group(1)).strip()
+            else:
+                pack_id = prefix.strip()
 
-        # Pack ID puede venir partido en dos líneas: "Pack ID: 20000" y luego "11272609499"
-        m_pack = re.search(r"Pack\s*ID\s*:\s*([0-9]+)", ln, flags=re.I)
-        if m_pack:
-            digits = m_pack.group(1).strip()
-            pending_pack_prefix = digits
-            # si ya viene completo, úsalo
-            if len(digits) >= 12:
-                current_pack = digits
-                pending_pack_prefix = None
+        if not pack_id:
+            continue
 
-        # Si hay un prefijo pendiente y la línea es solo dígitos, concatenamos
-        if pending_pack_prefix and re.fullmatch(r"[0-9]{6,}", ln.strip()):
-            current_pack = pending_pack_prefix + ln.strip()
-            pending_pack_prefix = None
+        # Texto humano (dirección / nombre)
+        texts = []
+        for mt in fd_text_re.finditer(blk):
+            val = mt.group(1).strip()
+            if not val:
+                continue
+            low = val.lower()
+            # Filtra tokens internos
+            if any(x in low for x in ["pack id", "frm", "mercado libre", "meli"]):
+                continue
+            if re.fullmatch(r"[0-9]{6,20}", val):
+                continue
+            texts.append(val)
 
-        # Cada etiqueta normalmente termina con ^XZ, usamos eso para "cerrar" registro
-        if "^XZ" in ln:
-            flush()
+        # Heurística: primer texto "tipo nombre" como destinatario
+        recipient = ""
+        addr = ""
+        if texts:
+            recipient = texts[0]
+            addr = " · ".join(texts[1:]) if len(texts) > 1 else ""
 
-    flush()
-    return mappings
+        out[pack_id] = {"shipment_id": shipment or "", "addr_text": addr or "", "recipient": recipient or ""}
 
+    return out
 
 def upsert_labels_to_db(pack_to_ship: dict, raw_text: str):
+    """
+    pack_to_ship:
+      {pack_id: shipment_id}  o
+      {pack_id: {"shipment_id":..., "recipient":..., "addr_text":...}}
+    """
     if not pack_to_ship:
         return
     conn = get_conn()
     c = conn.cursor()
     created = now_iso()
-    for pack_id, info in pack_to_ship.items():
-        shipment_id = None
-        rec_name = None
-        rec_addr = None
-        if isinstance(info, dict):
-            shipment_id = info.get("shipment_id")
-            rec_name = info.get("recipient_name")
-            rec_addr = info.get("recipient_address")
+    raw_clip = (raw_text or "")[:200000]
+
+    for pack_id, v in pack_to_ship.items():
+        ship = ""
+        recipient = ""
+        addr = ""
+        if isinstance(v, dict):
+            ship = str(v.get("shipment_id") or "")
+            recipient = str(v.get("recipient") or v.get("recipient_name") or "")
+            addr = str(v.get("addr_text") or "")
         else:
-            shipment_id = str(info) if info is not None else None
+            ship = str(v or "")
 
         c.execute(
-            "INSERT OR REPLACE INTO sorting_labels (pack_id, shipment_id, recipient_name, recipient_address, raw_zpl, created_at) VALUES (?,?,?,?,?,?)",
-            (str(pack_id), str(shipment_id) if shipment_id else None, rec_name, rec_addr, raw_text[:200000], created)
+            "INSERT OR REPLACE INTO sorting_labels (pack_id, shipment_id, raw_zpl, created_at, recipient_name, addr_text) VALUES (?,?,?,?,?,?)",
+            (str(pack_id), ship, raw_clip, created, recipient, addr)
         )
     conn.commit()
     conn.close()
 
-
 def build_sorting_runs_from_pages(pages: list[dict], logistics: str, manifest_name: str, page_to_mesa: dict,
-                                  inv_map_sku: dict) -> int:
+                                  inv_map_sku: dict):
     """Crea corridas (runs) y sus items desde páginas parseadas.
     page_to_mesa: {page_num: mesa_int}
     """
     conn = get_conn()
     c = conn.cursor()
     created = now_iso()
-
-    created_runs = 0
 
     # Crear corridas por página seleccionada
     for p in pages:
@@ -805,47 +780,35 @@ def build_sorting_runs_from_pages(pages: list[dict], logistics: str, manifest_na
         items = p.get("items", []) or []
         total = len(items)
 
-        # Evita duplicar una misma página del mismo manifiesto (regla: 1 página = 1 corrida)
-        try:
-            c.execute(
-                "INSERT INTO sorting_runs (logistics, manifest_name, page_num, total_items, mesa, status, created_at, completed_at) VALUES (?,?,?,?,?,?,?,?)",
-                (str(logistics), str(manifest_name), page_num, total, mesa, "OPEN", created, None)
-            )
-            run_id = c.lastrowid
-            created_runs += 1
-        except Exception:
-            # Ya existe corrida para esa página: no la recreamos
-            continue
+        c.execute(
+            "INSERT INTO sorting_runs (logistics, manifest_name, page_num, total_items, mesa, status, created_at, completed_at) VALUES (?,?,?,?,?,?,?,?)",
+            (str(logistics), str(manifest_name), page_num, total, mesa, "OPEN", created, None)
+        )
+        run_id = c.lastrowid
 
         for it in items:
             sku = normalize_sku(it.get("sku_ml", ""))
             title_tec = inv_map_sku.get(sku, "")
             c.execute(
-                """
-                INSERT INTO sorting_run_items
-                  (run_id, seq, ml_order_id, pack_id, buyer_name, address_text, sku_ml, title_ml, title_tec, qty, label_shipment, status, confirmed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
+                "INSERT INTO sorting_run_items (run_id, seq, ml_order_id, pack_id, sku_ml, title_ml, title_tec, qty, label_shipment, status, confirmed_at, buyer_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_id,
                     int(it.get("seq", 0) or 0),
                     str(it.get("ml_order_id", "") or ""),
                     str(it.get("pack_id", "") or ""),
-                    str(it.get("buyer_name", "") or ""),
-                    "",  # la dirección suele venir mejor desde ZPL
                     sku,
-                    str(it.get("title_ml", "") or ""),
+                    str(it.get("title_ml","") or ""),
                     title_tec,
                     int(it.get("qty", 0) or 0),
                     None,
                     "PENDING",
-                    None
+                    None,
+                    str(it.get("buyer","") or "")
                 )
             )
 
     conn.commit()
     conn.close()
-    return created_runs
 # =========================
 # IMPORTAR VENTAS (FLEX)
 # =========================
@@ -1525,9 +1488,16 @@ def page_sorting_camarero(inv_map_sku: dict):
 
     # Item actual (primero pendiente por secuencia)
     c.execute("""
-        SELECT id, seq, ml_order_id, pack_id, buyer_name, address_text,
-               sku_ml, COALESCE(NULLIF(title_tec,''), title_ml) AS prod, title_tec,
-               qty, label_shipment, status
+        SELECT id, seq, ml_order_id, pack_id, sku_ml,
+               title_ml,
+               title_tec,
+               COALESCE(NULLIF(title_tec,''), NULLIF(title_ml,'')) AS prod,
+               qty,
+               label_shipment,
+               status,
+               buyer_name,
+               (SELECT recipient_name FROM sorting_labels WHERE pack_id=sorting_run_items.pack_id) AS recipient_name,
+               (SELECT addr_text FROM sorting_labels WHERE pack_id=sorting_run_items.pack_id) AS addr_text
         FROM sorting_run_items
         WHERE run_id=? AND status='PENDING'
         ORDER BY seq
@@ -1546,25 +1516,21 @@ def page_sorting_camarero(inv_map_sku: dict):
         conn.close()
         return
 
-    item_id, seq, ml_order_id, pack_id, buyer_name, address_text, sku_expected, prod_name, title_tec, qty, label_ship, _istatus = item
+    item_id, seq, ml_order_id, pack_id, sku_expected, title_ml, title_tec, prod_name, qty, label_ship, _istatus, buyer_name, recipient_name, addr_text = item
+    # Conteo por etiqueta (Pack ID) dentro de la corrida
+    c.execute("SELECT COUNT(*), COALESCE(SUM(qty),0) FROM sorting_run_items WHERE run_id=? AND pack_id=?", (run_id, str(pack_id)))
+    _cnt_lines, _cnt_units = c.fetchone()
+    cnt_lines = int(_cnt_lines or 0)
+    cnt_units = int(_cnt_units or 0)
 
-    # Enriquecimiento desde etiquetas (ZPL): shipment + nombre + dirección
-    label_rec_name = None
-    label_rec_addr = None
-    if pack_id:
-        c.execute("SELECT shipment_id, recipient_name, recipient_address FROM sorting_labels WHERE pack_id=?", (str(pack_id),))
+    # Si no hay label_shipment guardado, intentamos desde sorting_labels por pack_id
+    if not label_ship and pack_id:
+        c.execute("SELECT shipment_id FROM sorting_labels WHERE pack_id=?", (str(pack_id),))
         lr = c.fetchone()
         if lr:
-            if not label_ship and lr[0]:
-                label_ship = lr[0]
-                c.execute("UPDATE sorting_run_items SET label_shipment=? WHERE id=?", (label_ship, item_id))
-                conn.commit()
-            label_rec_name = lr[1]
-            label_rec_addr = lr[2]
-
-    # Si falta nombre/dirección en el item, usa lo del ZPL (sin sobreescribir si ya viene del PDF)
-    buyer_display = (str(buyer_name or '').strip() or str(label_rec_name or '').strip())
-    addr_display = (str(address_text or '').strip() or str(label_rec_addr or '').strip())
+            label_ship = lr[0]
+            c.execute("UPDATE sorting_run_items SET label_shipment=? WHERE id=?", (label_ship, item_id))
+            conn.commit()
 
     # Estado UI por item
     if "sorting_state" not in st.session_state:
@@ -1603,14 +1569,6 @@ def page_sorting_camarero(inv_map_sku: dict):
     if not prod_display:
         prod_display = "(Sin nombre en maestro)"  # nunca dejamos vacío
 
-    meta_lines = []
-    meta_lines.append(f"Venta: {ml_order_id} • Pack ID: {pack_id}")
-    if buyer_display:
-        meta_lines.append(f"Cliente: {buyer_display}")
-    if addr_display:
-        meta_lines.append(f"Dirección: {addr_display}")
-    meta_lines.append(f"Etiqueta: {label_ship or '-'}")
-
     st.markdown(
         f"""
         <div class='heroS'>
@@ -1618,7 +1576,7 @@ def page_sorting_camarero(inv_map_sku: dict):
             <div class='sku'>SKU: {sku_expected}</div>
             <div class='prod'>{prod_display}</div>
             <div class='qty'>Cantidad: {int(qty)}</div>
-            <div class='meta'>{'<br/>'.join(meta_lines)}</div>
+            <div class='meta'>Venta: {ml_order_id} • Pack ID: {pack_id} • En esta etiqueta: {cnt_lines} producto(s) / {cnt_units} unidad(es)<br/>Cliente: {buyer_name or recipient_name or '-'}<br/>Dirección: {addr_text or '-'}<br/>Etiqueta: {label_ship if label_ship else '(no cargada)'}</div>
         </div>
         """,
         unsafe_allow_html=True
@@ -1702,65 +1660,9 @@ def page_sorting_camarero(inv_map_sku: dict):
     conn.close()
 
 
-def get_active_sorting_manifest():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, logistics, manifest_name, uploaded_at, status
-        FROM sorting_manifests
-        WHERE status='ACTIVE'
-        ORDER BY id DESC
-        LIMIT 1
-    """)
-    row = c.fetchone()
-    conn.close()
-    return row
-
-
-def maybe_close_active_manifest_if_done(manifest_name: str):
-    """Si todas las corridas del manifiesto están DONE, cierra el manifiesto."""
-    if not manifest_name:
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT COUNT(*) FROM sorting_runs WHERE manifest_name=? AND status IN ('OPEN','IN_PROGRESS')",
-        (str(manifest_name),)
-    )
-    open_cnt = int(c.fetchone()[0] or 0)
-    if open_cnt == 0:
-        c.execute("UPDATE sorting_manifests SET status='DONE' WHERE status='ACTIVE' AND manifest_name=?", (str(manifest_name),))
-        conn.commit()
-    conn.close()
-
-
 def page_sorting_upload(inv_map_sku: dict):
     st.header("Sorting – Cargar manifiesto")
     st.caption("Sube un manifiesto (Flex o Colecta). El sistema creará 1 corrida por página y podrás asignar cada página a una mesa.")
-
-    active = get_active_sorting_manifest()
-    if active:
-        _mid, _logi, _mname, _u, _st = active
-        maybe_close_active_manifest_if_done(_mname)
-        # Relee si se cerró
-        active2 = get_active_sorting_manifest()
-        if active2:
-            st.warning(f"Ya existe un manifiesto ACTIVO ({active2[1]} • {active2[2]}). Debes terminar sus corridas antes de cargar otro.")
-            st.info("Tip: cierra cada corrida en el módulo Camarero (cuando finalice la página).")
-            # Resumen rápido
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("""
-                SELECT status, COUNT(*)
-                FROM sorting_runs
-                WHERE manifest_name=?
-                GROUP BY status
-            """, (str(active2[2]),))
-            stats = c.fetchall()
-            conn.close()
-            if stats:
-                st.write({s: int(n) for s, n in stats})
-            return
 
     logistics = st.radio("Tipo de logística", ["COLECTA", "FLEX"], horizontal=True)
 
@@ -1792,65 +1694,29 @@ def page_sorting_upload(inv_map_sku: dict):
     st.subheader("Páginas detectadas")
     st.dataframe(pd.DataFrame(summary), use_container_width=True)
 
-    st.subheader("Asignar páginas a mesas (1 página = 1 mesa)")
-    st.caption("Elige una MESA y una PÁGINA. La página asignada queda bloqueada para no duplicarla.")
-
-    # UI más clara: selector de mesa + selector de página disponible
-    pages_available = [int(p["page_num"]) for p in pages if len(p.get("items", []) or []) > 0]
-    if not pages_available:
-        st.error("No encontré items en el manifiesto.")
-        return
+    st.subheader("Asignar páginas a mesas")
+    st.caption("Selecciona una mesa por cada página que quieras convertir en corrida. 0 = no asignar.")
 
     page_to_mesa = {}
-    colL, colR = st.columns([1, 2])
-    with colL:
-        selected_mesa = st.selectbox("Mesa", options=list(range(1, int(NUM_MESAS) + 1)), key="sort_assign_mesa")
-    with colR:
-        selected_page = st.selectbox("Página", options=pages_available, key="sort_assign_page")
-
-    # Asignaciones en memoria (para esta carga)
-    if "sort_page_to_mesa" not in st.session_state:
-        st.session_state.sort_page_to_mesa = {}
-
-    if st.button("➕ Asignar página a mesa"):
-        # evita duplicar página
-        if int(selected_page) in st.session_state.sort_page_to_mesa:
-            st.warning("Esa página ya está asignada.")
-        else:
-            # evita duplicar mesa (si quieres 1 corrida activa por mesa al crear)
-            if int(selected_mesa) in st.session_state.sort_page_to_mesa.values():
-                st.warning("Esa mesa ya tiene una página asignada en esta creación.")
-            else:
-                st.session_state.sort_page_to_mesa[int(selected_page)] = int(selected_mesa)
-                st.success(f"Asignado: Página {int(selected_page)} → Mesa {int(selected_mesa)}")
-
-    # Mostrar asignaciones actuales
-    if st.session_state.sort_page_to_mesa:
-        ass_df = pd.DataFrame(
-            [{"Página": p, "Mesa": m} for p, m in sorted(st.session_state.sort_page_to_mesa.items())]
-        )
-        st.dataframe(ass_df, use_container_width=True)
-
-    page_to_mesa = dict(st.session_state.sort_page_to_mesa)
+    cols = st.columns(3)
+    for idx, p in enumerate(pages):
+        page_num = p["page_num"]
+        with cols[idx % 3]:
+            mesa = st.selectbox(
+                f"Página {page_num}",
+                options=[0] + list(range(1, int(NUM_MESAS) + 1)),
+                index=0,
+                key=f"mesa_page_{page_num}"
+            )
+            if int(mesa) > 0:
+                page_to_mesa[int(page_num)] = int(mesa)
 
     if st.button("✅ Crear corridas (por página)"):
         if not page_to_mesa:
             st.warning("No asignaste ninguna página a mesa.")
             return
-        created_runs = build_sorting_runs_from_pages(pages, logistics, manifest_name, page_to_mesa, inv_map_sku)
-        if created_runs <= 0:
-            st.warning("No se crearon corridas (puede que esas páginas ya existan).")
-        else:
-            # Registrar manifiesto como activo (bloquea subir otro hasta terminar)
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("INSERT INTO sorting_manifests (logistics, manifest_name, uploaded_at, status) VALUES (?,?,?,?)",
-                      (str(logistics), str(manifest_name), now_iso(), "ACTIVE"))
-            conn.commit()
-            conn.close()
-            st.success("Corridas creadas. Ve a 'Sorting – Camarero' y selecciona la mesa.")
-        # Limpia asignaciones para la próxima vez
-        st.session_state.sort_page_to_mesa = {}
+        build_sorting_runs_from_pages(pages, logistics, manifest_name, page_to_mesa, inv_map_sku)
+        st.success("Corridas creadas. Ve a 'Sorting – Camarero' y selecciona la mesa.")
         st.rerun()
 
 
@@ -1898,7 +1764,6 @@ def page_sorting_admin():
                 c.execute("DELETE FROM sorting_run_items;")
                 c.execute("DELETE FROM sorting_runs;")
                 c.execute("DELETE FROM sorting_labels;")
-                c.execute("DELETE FROM sorting_manifests;")
                 conn.commit()
                 st.session_state.sort_confirm_reset = False
                 st.session_state.pop("selected_mesa", None)
