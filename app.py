@@ -370,6 +370,61 @@ def init_db():
         UNIQUE(manifest_id, pack_id)
     );
     """)
+
+    # --- MIGRACIONES SUAVES (para BD antiguas) ---
+    def _cols(table: str) -> set:
+        try:
+            c.execute(f"PRAGMA table_info({table});")
+            return {r[1] for r in c.fetchall()}
+        except Exception:
+            return set()
+
+    def _ensure_col(table: str, col: str, ddl: str):
+        cols = _cols(table)
+        if col in cols:
+            return
+        try:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl};")
+        except Exception:
+            # Si falla (por locks o tablas raras), no botar la app.
+            pass
+
+    # sorting_manifests
+    _ensure_col("sorting_manifests", "name", "TEXT")
+    _ensure_col("sorting_manifests", "created_at", "TEXT")
+    _ensure_col("sorting_manifests", "status", "TEXT")
+
+    # sorting_runs
+    _ensure_col("sorting_runs", "manifest_id", "INTEGER")
+    _ensure_col("sorting_runs", "page_no", "INTEGER")
+    _ensure_col("sorting_runs", "mesa", "INTEGER")
+    _ensure_col("sorting_runs", "status", "TEXT")
+    _ensure_col("sorting_runs", "created_at", "TEXT")
+    _ensure_col("sorting_runs", "closed_at", "TEXT")
+
+    # sorting_run_items
+    _ensure_col("sorting_run_items", "run_id", "INTEGER")
+    _ensure_col("sorting_run_items", "seq", "INTEGER")
+    _ensure_col("sorting_run_items", "ml_order_id", "TEXT")
+    _ensure_col("sorting_run_items", "pack_id", "TEXT")
+    _ensure_col("sorting_run_items", "sku", "TEXT")
+    _ensure_col("sorting_run_items", "title_ml", "TEXT")
+    _ensure_col("sorting_run_items", "title_tec", "TEXT")
+    _ensure_col("sorting_run_items", "qty", "INTEGER")
+    _ensure_col("sorting_run_items", "buyer", "TEXT")
+    _ensure_col("sorting_run_items", "address", "TEXT")
+    _ensure_col("sorting_run_items", "shipment_id", "TEXT")
+    _ensure_col("sorting_run_items", "status", "TEXT")
+    _ensure_col("sorting_run_items", "done_at", "TEXT")
+    _ensure_col("sorting_run_items", "incidence_note", "TEXT")
+
+    # sorting_labels
+    _ensure_col("sorting_labels", "manifest_id", "INTEGER")
+    _ensure_col("sorting_labels", "pack_id", "TEXT")
+    _ensure_col("sorting_labels", "shipment_id", "TEXT")
+    _ensure_col("sorting_labels", "buyer", "TEXT")
+    _ensure_col("sorting_labels", "address", "TEXT")
+    _ensure_col("sorting_labels", "raw", "TEXT")
     conn.commit()
     conn.close()
 
