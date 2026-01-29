@@ -2498,6 +2498,8 @@ def main():
         st.session_state.pop("full_selected_batch", None)
         st.rerun()
 
+    mode = st.session_state.get("app_mode", "FLEX_PICK")
+
     # Estado maestro (lo dejamos en sidebar, bajo el título)
     if os.path.exists(MASTER_FILE):
         st.sidebar.success(f"Maestro OK: {len(inv_map_sku)} SKUs / {len(barcode_to_sku)} EAN")
@@ -2505,8 +2507,6 @@ def main():
             st.sidebar.warning(f"Conflictos EAN: {len(conflicts)} (se usa el primero)")
     else:
         st.sidebar.warning(f"No se encontró {MASTER_FILE}. (La app funciona, pero sin maestro)")
-
-        mode = st.session_state.get("app_mode", "FLEX_PICK")
 
     # ==========
     # MODO PICKING (Flex / Colecta)
