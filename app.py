@@ -106,6 +106,11 @@ def get_conn():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
 
 
+
+def get_db():
+    """Backward-compatible alias used by some sorting helpers."""
+    return get_conn()
+
 def force_tel_keyboard(label: str):
     """Fuerza teclado numérico tipo 'teléfono' para el input con aria-label=label."""
     safe = label.replace("\\", "\\\\").replace('"', '\\"')
