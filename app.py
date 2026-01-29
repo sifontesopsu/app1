@@ -111,6 +111,41 @@ def get_db():
     """Backward-compatible alias used by some sorting helpers."""
     return get_conn()
 
+
+
+def upsert_labels_to_db(pack_to_ship: dict, raw_zpl: str):
+    """Guarda/actualiza etiquetas (ZPL) en BD.
+
+    pack_to_ship: dict {pack_id: shipment_id}. En FLEX puede venir sin pack_id;
+    en ese caso se puede usar shipment_id como clave externa en otras tablas,
+    pero esta tabla se mantiene por pack_id.
+    """
+    if not pack_to_ship:
+        return
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        ts = now_iso()
+        for pack_id, shipment_id in pack_to_ship.items():
+            pack_id = str(pack_id or "").strip()
+            shipment_id = str(shipment_id or "").strip() or None
+            if not pack_id:
+                continue
+            c.execute(
+                """INSERT INTO sorting_labels (pack_id, shipment_id, raw_zpl, created_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(pack_id) DO UPDATE SET
+                       shipment_id=excluded.shipment_id,
+                       raw_zpl=excluded.raw_zpl,
+                       created_at=excluded.created_at
+                """,
+                (pack_id, shipment_id, raw_zpl, ts),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def force_tel_keyboard(label: str):
     """Fuerza teclado numérico tipo 'teléfono' para el input con aria-label=label."""
     safe = label.replace("\\", "\\\\").replace('"', '\\"')
