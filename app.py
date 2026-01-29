@@ -557,6 +557,35 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
 # =========================
 # PARSER PDF MANIFIESTO (POR PÁGINA PARA SORTING)
 # =========================
+
+def get_active_sorting_manifest():
+    """Retorna (logistics, manifest_name) si hay un manifiesto con corridas no terminadas."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT logistics, manifest_name, COUNT(*)
+        FROM sorting_runs
+        WHERE status != 'DONE'
+        GROUP BY logistics, manifest_name
+        ORDER BY MIN(id) ASC
+        LIMIT 1
+    """)
+    row = cur.fetchone()
+    if row:
+        return row[0], row[1]
+    return None
+
+def delete_sorting_manifest(logistics: str, manifest_name: str):
+    """Borra corridas/items de un manifiesto (reprocesar)."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM sorting_runs WHERE logistics=? AND manifest_name=?", (logistics, manifest_name))
+    run_ids = [r[0] for r in cur.fetchall()]
+    if run_ids:
+        cur.executemany("DELETE FROM sorting_run_items WHERE run_id=?", [(rid,) for rid in run_ids])
+    cur.execute("DELETE FROM sorting_runs WHERE logistics=? AND manifest_name=?", (logistics, manifest_name))
+    conn.commit()
+
 def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
     """Devuelve una lista de páginas. Cada página es:
     {
@@ -636,14 +665,33 @@ def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
                     qty = int(m_qty.group(1))
                     if cur_pack and cur_venta and cur_sku and qty > 0:
                         buyer = ""
-                        # En el manifiesto, el nombre suele venir en la línea siguiente
-                        if i + 1 < len(lines):
+                        # 1) A veces el nombre viene en la MISMA línea (ej: "Daniel Mella Cantidad: 1")
+                        #    Tomamos el texto antes de "Cantidad:" si no parece meta.
+                        same_line = line
+                        m_same = re.search(r"^(.*)\bCantidad\s*[:#]?\s*[0-9]+", same_line, flags=re.I)
+                        if m_same:
+                            left = m_same.group(1)
+                            # Quita "Venta: xxxx" y "SKU: yyyy" del lado izquierdo
+                            left = re.sub(r"Venta\s*[:#]?\s*[0-9]+", "", left, flags=re.I)
+                            left = re.sub(r"SKU\s*[:#]?\s*[0-9A-Za-z.\-]+", "", left, flags=re.I)
+                            left = left.replace("Pack ID:", "")
+                            left = left.strip(" -•:\t")
+                            if left and (not is_meta(left.lower())) and (not re.fullmatch(r"[0-9 .:/-]+", left)):
+                                buyer = left.strip()
+
+                        # 2) En muchos manifiestos, el nombre viene en la línea siguiente
+                        if not buyer and i + 1 < len(lines):
                             cand = lines[i + 1].strip()
                             lw = cand.lower()
                             if cand and (not is_meta(lw)) and (not uuid_re.match(cand)) and (not mel_re.match(cand)):
                                 # evita "Color:" etc
                                 if not re.fullmatch(r"[0-9 .:/-]+", cand):
-                                    buyer = cand
+                                    # si trae "Nombre Cantidad: X" en la línea siguiente, separa
+                                    m_cand = re.search(r"^(.*?)\s+Cantidad\s*[:#]?\s*([0-9]+)\s*$", cand, flags=re.I)
+                                    if m_cand:
+                                        buyer = m_cand.group(1).strip()
+                                    else:
+                                        buyer = cand
                         seq += 1
                         items.append({
                             "seq": seq,
@@ -665,21 +713,29 @@ def parse_labels_zpl_text(zpl_text: str) -> dict:
     """
     Lee un TXT con ZPL (varias etiquetas) y devuelve:
       {pack_id: {"shipment_id": str, "addr_text": str, "recipient": str}}
-    Maneja el caso donde el Pack ID viene partido:
-      'Pack ID: 20000^FS' y luego una línea '^FD1128...^FS'
+    - Reconstruye Pack ID cuando viene partido en dos líneas:
+        '^FDPack ID: 20000^FS' + '^FD11280208685^FS'  -> '2000011280208685'
+    - Extrae shipment desde '^FD>:<digits>^FS'
+    - Extrae texto humano (dirección/ciudad) desde ^FD...^FS (heurística)
     """
     if not zpl_text:
         return {}
 
     text = str(zpl_text)
+
     # Separa por etiqueta
     blocks = re.split(r"\^XA", text)
-    out = {}
+    out: dict = {}
 
     ship_re = re.compile(r"\^FD>:\s*([0-9]{6,20})\^FS")
-    pack_prefix_re = re.compile(r"Pack ID:\s*([0-9]+)\^FS", re.I)
+    pack_prefix_re = re.compile(r"Pack ID:\s*([0-9]{1,20})\^FS", re.I)
     fd_digits_re = re.compile(r"\^FD\s*([0-9]{6,20})\^FS")
-    fd_text_re = re.compile(r"\^FD(.+?)\^FS")
+    fd_text_re = re.compile(r"\^FD(.+?)\^FS", re.S)
+
+    def clean_fd(s: str) -> str:
+        s = (s or "").replace("\r", "\n")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
     for blk in blocks:
         if "^XZ" not in blk:
@@ -687,79 +743,78 @@ def parse_labels_zpl_text(zpl_text: str) -> dict:
 
         # Shipment
         mship = ship_re.search(blk)
-        shipment = mship.group(1) if mship else ""
+        shipment = mship.group(1).strip() if mship else ""
 
-        # Pack ID (prefijo + siguiente FD numérica)
+        # Pack prefix (parte 1)
+        mpref = pack_prefix_re.search(blk)
         pack_id = ""
-        mp = pack_prefix_re.search(blk)
-        if mp:
-            prefix = mp.group(1)
-            # buscamos un FD numérico cercano DESPUÉS del Pack ID (los dígitos restantes)
-            tail = blk[mp.end(): mp.end()+250]
-            mt = fd_digits_re.search(tail)
-            if mt:
-                pack_id = (prefix + mt.group(1)).strip()
-            else:
-                pack_id = prefix.strip()
+        if mpref:
+            prefix = mpref.group(1).strip()
+            # Busca el primer ^FD digits DESPUÉS del Pack ID que no sea shipment
+            tail = ""
+            after = blk[mpref.end():]
+            for mfd in fd_digits_re.finditer(after):
+                cand = mfd.group(1).strip()
+                if cand == shipment:
+                    continue
+                # evita capturar números cortos tipo '463623'
+                if len(cand) < 8:
+                    continue
+                tail = cand
+                break
+            # Si el prefix ya es largo, úsalo; si no, concatena tail si existe
+            pack_id = (prefix + tail) if tail and len(prefix) <= 8 else prefix
 
-        if not pack_id:
-            continue
-
-        # Texto humano (dirección / nombre)
-        texts = []
-        for mt in fd_text_re.finditer(blk):
-            val = mt.group(1).strip()
-            if not val:
-                continue
-            low = val.lower()
-            # Filtra tokens internos
-            if any(x in low for x in ["pack id", "frm", "mercado libre", "meli"]):
-                continue
-            if re.fullmatch(r"[0-9]{6,20}", val):
-                continue
-            texts.append(val)
-
-        # Heurística: primer texto "tipo nombre" como destinatario
+        # Texto humano: buscamos ^FD...^FS y filtramos ruido
+        fds = [clean_fd(x) for x in fd_text_re.findall(blk)]
+        human = []
         recipient = ""
-        addr = ""
-        if texts:
-            recipient = texts[0]
-            addr = " · ".join(texts[1:]) if len(texts) > 1 else ""
+        for s in fds:
+            if not s:
+                continue
+            sl = s.lower()
+            if sl.startswith(">:"):
+                continue
+            if "pack id:" in sl:
+                continue
+            if sl.startswith("remitente"):
+                continue
+            if sl.startswith("despachar:"):
+                continue
+            if re.fullmatch(r"[0-9]{3,}", s):
+                continue
+            if re.fullmatch(r"frm\d+", sl):
+                continue
+            # candidato humano
+            human.append(s)
 
-        out[pack_id] = {"shipment_id": shipment or "", "addr_text": addr or "", "recipient": recipient or ""}
+        # Heurística: en muchos ZPL, primero viene destinatario, luego calle, luego comuna/ciudad
+        # Si no podemos distinguir, al menos guardamos 2 líneas de dirección.
+        if human:
+            # Si hay un nombre evidente (2-5 palabras, sin coma, con mayúsculas iniciales)
+            for s in human[:4]:
+                if "," not in s and 2 <= len(s.split()) <= 6 and not re.search(r"\d", s):
+                    recipient = s.strip()
+                    break
+
+        # Dirección: tomamos las líneas con coma o dígitos (suelen ser calle y comuna)
+        addr_lines = []
+        for s in human:
+            if s == recipient:
+                continue
+            if "," in s or re.search(r"\d", s):
+                addr_lines.append(s)
+        addr_text = " | ".join(addr_lines[:3]).strip()
+
+        if pack_id:
+            out[pack_id] = {
+                "shipment_id": shipment or "",
+                "addr_text": addr_text or "",
+                "recipient": recipient or ""
+            }
 
     return out
 
-def upsert_labels_to_db(pack_to_ship: dict, raw_text: str):
-    """
-    pack_to_ship:
-      {pack_id: shipment_id}  o
-      {pack_id: {"shipment_id":..., "recipient":..., "addr_text":...}}
-    """
-    if not pack_to_ship:
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    created = now_iso()
-    raw_clip = (raw_text or "")[:200000]
-
-    for pack_id, v in pack_to_ship.items():
-        ship = ""
-        recipient = ""
-        addr = ""
-        if isinstance(v, dict):
-            ship = str(v.get("shipment_id") or "")
-            recipient = str(v.get("recipient") or v.get("recipient_name") or "")
-            addr = str(v.get("addr_text") or "")
-        else:
-            ship = str(v or "")
-
-        c.execute(
-            "INSERT OR REPLACE INTO sorting_labels (pack_id, shipment_id, raw_zpl, created_at, recipient_name, addr_text) VALUES (?,?,?,?,?,?)",
-            (str(pack_id), ship, raw_clip, created, recipient, addr)
-        )
-    conn.commit()
-    conn.close()
 
 def build_sorting_runs_from_pages(pages: list[dict], logistics: str, manifest_name: str, page_to_mesa: dict,
                                   inv_map_sku: dict):
@@ -1411,7 +1466,43 @@ def sorting_mesa_lobby():
     return "selected_mesa" in st.session_state
 
 
+def _clean_addr_text(addr: str) -> str:
+    """Keep only human readable address, removing control symbols / json fragments from ZPL-derived text."""
+    if not addr:
+        return ""
+    s = str(addr)
+    # remove non-printable chars
+    s = "".join(ch for ch in s if ch.isprintable())
+    s = s.replace("\u00b7", " ").replace("|", " ").replace("\t", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # Prefer substring after "Dirección:" or "Domicilio:"
+    if "Domicilio:" in s:
+        s = s.split("Domicilio:", 1)[1].strip()
+    elif "Dirección:" in s:
+        s = s.split("Dirección:", 1)[1].strip()
+
+    # Cut noisy parts
+    for cut in [" {", "{", "->", '"', " LA,", " |", " [", " (id", " Referencia:", " Liberador", " SLT", " NR"]:
+        if cut in s:
+            s = s.split(cut, 1)[0].strip()
+
+    # If we still have "Ciudad de destino", keep it but trim after it
+    if "Ciudad de destino:" in s:
+        pre, post = s.split("Ciudad de destino:", 1)
+        city = post.split(" ", 1)[0].strip()
+        s = (pre.strip() + f" • Destino: {city}").strip(" •")
+
+    return s[:180].strip()
+
+
 def page_sorting_camarero(inv_map_sku: dict):
+    """
+    UI Camarero por ETIQUETA/VENTA:
+    - Toma el primer grupo pendiente (ml_order_id + pack_id) respetando el orden (seq) de la página.
+    - Muestra todos los productos de esa etiqueta abajo, cada uno con su escaneo/validación.
+    - Cuando todos los productos del grupo están validados (DONE/INCIDENCE), cierra el grupo y pasa al siguiente.
+    """
     if "selected_mesa" not in st.session_state:
         ok = sorting_mesa_lobby()
         if not ok:
@@ -1434,15 +1525,19 @@ def page_sorting_camarero(inv_map_sku: dict):
         """
         <style>
         div.block-container { padding-top: 0.6rem; padding-bottom: 1rem; }
-        .heroS { padding: 10px 12px; border-radius: 12px; background: rgba(0,0,0,0.04); margin: 6px 0 8px 0; }
-        .heroS .sku { font-size: 26px; font-weight: 900; margin: 0; }
-        .heroS .prod { font-size: 22px; font-weight: 800; margin: 6px 0 0 0; line-height: 1.15; }
-        .heroS .qty { font-size: 22px; font-weight: 900; margin: 8px 0 0 0; }
-        .heroS .meta { font-size: 14px; font-weight: 800; margin: 6px 0 0 0; opacity: 0.9; line-height: 1.15; }
-        .smallcap { font-size: 12px; opacity: 0.75; margin: 0 0 4px 0; }
-        .scanok { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
-        .ok { background: rgba(0, 200, 0, 0.15); }
-        .bad { background: rgba(255, 0, 0, 0.12); }
+        .heroS { padding: 12px 14px; border-radius: 14px; background: rgba(0,0,0,0.04); margin: 8px 0 12px 0; }
+        .heroS .h1 { font-size: 22px; font-weight: 900; margin: 0; }
+        .heroS .h2 { font-size: 16px; font-weight: 900; margin: 6px 0 0 0; opacity: 0.92; }
+        .heroS .meta { font-size: 13px; font-weight: 800; margin: 6px 0 0 0; opacity: 0.9; line-height: 1.25; }
+        .pill { display:inline-block; padding: 4px 10px; border-radius: 999px; font-weight: 900; font-size: 12px; }
+        .p-ok { background: rgba(0,200,0,0.14); }
+        .p-pend { background: rgba(255,160,0,0.16); }
+        .p-bad { background: rgba(255,0,0,0.12); }
+        .rowCard { border: 1px solid rgba(0,0,0,0.07); border-radius: 14px; padding: 10px 12px; margin: 8px 0; }
+        .rowCard .sku { font-size: 16px; font-weight: 900; margin: 0; }
+        .rowCard .prod { font-size: 14px; font-weight: 800; margin: 4px 0 0 0; }
+        .rowCard .qty { font-size: 14px; font-weight: 900; margin: 6px 0 0 0; }
+        .smallcap { font-size: 12px; opacity: 0.75; margin: 0 0 6px 0; }
         </style>
         """,
         unsafe_allow_html=True
@@ -1455,7 +1550,7 @@ def page_sorting_camarero(inv_map_sku: dict):
     c.execute("SELECT barcode, sku_ml FROM sku_barcodes")
     barcode_to_sku = {r[0]: r[1] for r in c.fetchall()}
 
-    # Corrida activa (la más reciente OPEN/IN_PROGRESS)
+    # Corrida activa (OPEN/IN_PROGRESS)
     c.execute("""
         SELECT id, logistics, manifest_name, page_num, total_items, status
         FROM sorting_runs
@@ -1476,7 +1571,6 @@ def page_sorting_camarero(inv_map_sku: dict):
     if status == "OPEN":
         c.execute("UPDATE sorting_runs SET status='IN_PROGRESS' WHERE id=?", (run_id,))
         conn.commit()
-        status = "IN_PROGRESS"
 
     c.execute("SELECT COUNT(*) FROM sorting_run_items WHERE run_id=?", (run_id,))
     total = int(c.fetchone()[0] or 0)
@@ -1486,26 +1580,17 @@ def page_sorting_camarero(inv_map_sku: dict):
     st.caption(f"{logistics} • {manifest_name} • Página {page_num} • Progreso: {done}/{total}")
     st.progress((done / total) if total else 0.0)
 
-    # Item actual (primero pendiente por secuencia)
+    # Grupo actual: primera venta/pack pendiente por secuencia (respeta orden de página)
     c.execute("""
-        SELECT id, seq, ml_order_id, pack_id, sku_ml,
-               title_ml,
-               title_tec,
-               COALESCE(NULLIF(title_tec,''), NULLIF(title_ml,'')) AS prod,
-               qty,
-               label_shipment,
-               status,
-               buyer_name,
-               (SELECT recipient_name FROM sorting_labels WHERE pack_id=sorting_run_items.pack_id) AS recipient_name,
-               (SELECT addr_text FROM sorting_labels WHERE pack_id=sorting_run_items.pack_id) AS addr_text
+        SELECT ml_order_id, pack_id
         FROM sorting_run_items
         WHERE run_id=? AND status='PENDING'
         ORDER BY seq
         LIMIT 1
     """, (run_id,))
-    item = c.fetchone()
+    g = c.fetchone()
 
-    if not item:
+    if not g:
         st.success("Corrida completada.")
         if st.button("Cerrar corrida"):
             c.execute("UPDATE sorting_runs SET status='DONE', completed_at=? WHERE id=?", (now_iso(), run_id))
@@ -1516,153 +1601,185 @@ def page_sorting_camarero(inv_map_sku: dict):
         conn.close()
         return
 
-    item_id, seq, ml_order_id, pack_id, sku_expected, title_ml, title_tec, prod_name, qty, label_ship, _istatus, buyer_name, recipient_name, addr_text = item
-    # Conteo por etiqueta (Pack ID) dentro de la corrida
-    c.execute("SELECT COUNT(*), COALESCE(SUM(qty),0) FROM sorting_run_items WHERE run_id=? AND pack_id=?", (run_id, str(pack_id)))
-    _cnt_lines, _cnt_units = c.fetchone()
-    cnt_lines = int(_cnt_lines or 0)
-    cnt_units = int(_cnt_units or 0)
+    ml_order_id, pack_id = g
 
-    # Si no hay label_shipment guardado, intentamos desde sorting_labels por pack_id
-    if not label_ship and pack_id:
-        c.execute("SELECT shipment_id FROM sorting_labels WHERE pack_id=?", (str(pack_id),))
-        lr = c.fetchone()
-        if lr:
-            label_ship = lr[0]
-            c.execute("UPDATE sorting_run_items SET label_shipment=? WHERE id=?", (label_ship, item_id))
-            conn.commit()
+    # Traer todos los items de esa venta/etiqueta
+    c.execute("""
+        SELECT id, seq, ml_order_id, pack_id, sku_ml,
+               COALESCE(NULLIF(title_tec,''), NULLIF(title_ml,'')) AS prod,
+               qty,
+               label_shipment,
+               status,
+               buyer_name,
+               (SELECT recipient_name FROM sorting_labels WHERE pack_id=sorting_run_items.pack_id) AS recipient_name,
+               (SELECT addr_text FROM sorting_labels WHERE pack_id=sorting_run_items.pack_id) AS addr_text
+        FROM sorting_run_items
+        WHERE run_id=? AND ml_order_id=? AND pack_id=?
+        ORDER BY seq
+    """, (run_id, ml_order_id, pack_id))
+    items = c.fetchall()
 
-    # Estado UI por item
-    if "sorting_state" not in st.session_state:
-        st.session_state.sorting_state = {}
-    state = st.session_state.sorting_state
-    key = str(item_id)
-    if key not in state:
-        state[key] = {
-            "confirmed": False,
-            "confirm_mode": None,
-            "scan_value": "",
-            "scan_status": "idle",
-            "scan_msg": "",
-            "show_manual_confirm": False,
-            "scan_nonce": 0
-        }
-    s = state[key]
+    # Conteo por etiqueta
+    cnt_lines = len(items)
+    cnt_units = int(sum(int(r[6] or 0) for r in items))
 
-    # Si cambia item, resetea
-    last_item = st.session_state.get("sorting_last_item_id")
-    if last_item != item_id:
-        st.session_state["sorting_last_item_id"] = item_id
-        s["confirmed"] = False
-        s["confirm_mode"] = None
-        s["scan_value"] = ""
-        s["scan_status"] = "idle"
-        s["scan_msg"] = ""
-        s["show_manual_confirm"] = False
-        s["scan_nonce"] = int(s.get("scan_nonce", 0)) + 1
+    # Datos encabezado (cliente/dirección/etiqueta)
+    buyer_name = None
+    recipient_name = None
+    addr_text = None
+    label_ship = None
+    for r in items:
+        buyer_name = buyer_name or (r[9] if len(r) > 9 else None)
+        recipient_name = recipient_name or (r[10] if len(r) > 10 else None)
+        addr_text = addr_text or (r[11] if len(r) > 11 else None)
+        label_ship = label_ship or (r[7] if len(r) > 7 else None)
 
-    # Nombre maestro (si existe)
-    prod_display = str(prod_name or "").strip()
-    if not prod_display:
-        prod_display = inv_map_sku.get(sku_expected, "") or ""
+    client_display = (buyer_name or recipient_name or "-")
+    addr_display = _clean_addr_text(addr_text) or "-"
 
-    if not prod_display:
-        prod_display = "(Sin nombre en maestro)"  # nunca dejamos vacío
+    # Progreso del grupo
+    g_done = sum(1 for r in items if r[8] in ("DONE", "INCIDENCE"))
+    g_total = len(items)
 
     st.markdown(
         f"""
         <div class='heroS'>
-            <div class='smallcap'>Mesa {mesa} • Corrida #{run_id} • Paso {seq}</div>
-            <div class='sku'>SKU: {sku_expected}</div>
-            <div class='prod'>{prod_display}</div>
-            <div class='qty'>Cantidad: {int(qty)}</div>
-            <div class='meta'>Venta: {ml_order_id} • Pack ID: {pack_id} • En esta etiqueta: {cnt_lines} producto(s) / {cnt_units} unidad(es)<br/>Cliente: {buyer_name or recipient_name or '-'}<br/>Dirección: {addr_text or '-'}<br/>Etiqueta: {label_ship if label_ship else '(no cargada)'}</div>
+            <div class='smallcap'>Mesa {mesa} • Corrida #{run_id} • Página {page_num}</div>
+            <div class='h1'>VENTA: {ml_order_id}</div>
+            <div class='h2'>Pack ID: {pack_id} • Etiqueta: {label_ship or '(no cargada)'}</div>
+            <div class='meta'>En esta etiqueta: <b>{cnt_lines}</b> producto(s) / <b>{cnt_units}</b> unidad(es) • Progreso: {g_done}/{g_total}<br/>
+            Cliente: {client_display}<br/>
+            Dirección: {addr_display}
+            </div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    if s["scan_status"] == "ok":
-        st.markdown(f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}', unsafe_allow_html=True)
-    elif s["scan_status"] == "bad":
-        st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
+    st.markdown("#### Productos de esta venta/etiqueta")
 
-    scan_label = "Escaneo"
-    scan_key = f"sort_scan_{item_id}_{s.get('scan_nonce',0)}"
-    scan = st.text_input(scan_label, value=s.get("scan_value", ""), key=scan_key)
-    force_tel_keyboard(scan_label)
-    autofocus_input(scan_label)
+    # Estado UI por item (errores de escaneo por fila)
+    if "sorting_row_state" not in st.session_state:
+        st.session_state.sorting_row_state = {}
+    row_state = st.session_state.sorting_row_state
 
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col2:
-        if st.button("Validar", key=f"sort_validate_{item_id}"):
-            sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
-            if not sku_detected:
-                s["scan_status"] = "bad"
-                s["scan_msg"] = "No se pudo leer el código."
-                s["confirmed"] = False
-                s["confirm_mode"] = None
-            elif sku_detected != sku_expected:
-                s["scan_status"] = "bad"
-                s["scan_msg"] = f"Leído: {sku_detected}"
-                s["confirmed"] = False
-                s["confirm_mode"] = None
-            else:
-                s["scan_status"] = "ok"
-                s["scan_msg"] = "Producto correcto."
-                s["confirmed"] = True
-                s["confirm_mode"] = "SCAN"
-                s["scan_value"] = scan
-            st.rerun()
+    any_change = False
 
-    with col3:
-        if st.button("Sin EAN", key=f"sort_noean_{item_id}"):
-            s["show_manual_confirm"] = True
-            st.rerun()
+    for (item_id, seq, _oid, _pid, sku_expected, prod_name, qty, label_shipment, istatus, _bname, _rname, _addr) in items:
+        prod_display = str(prod_name or "").strip()
+        if not prod_display:
+            prod_display = inv_map_sku.get(str(sku_expected).strip(), "") or ""
 
-    if s.get("show_manual_confirm") and not s.get("confirmed"):
-        st.info("Confirmación manual")
-        st.write(f"✅ {prod_display}")
-        if st.button("Confirmar", key=f"sort_manual_confirm_{item_id}"):
-            s["confirmed"] = True
-            s["confirm_mode"] = "MANUAL_NO_EAN"
-            s["show_manual_confirm"] = False
-            s["scan_status"] = "ok"
-            s["scan_msg"] = "Confirmado manual."
-            st.rerun()
+        if not prod_display:
+            prod_display = "(Sin nombre)"
 
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("✅ Confirmar armado", disabled=not s.get("confirmed"), key=f"sort_done_{item_id}"):
-            c.execute(
-                "UPDATE sorting_run_items SET status='DONE', confirmed_at=? WHERE id=?",
-                (now_iso(), item_id)
-            )
-            conn.commit()
-            # limpiar estado del item para siguiente
-            state.pop(key, None)
-            st.success("OK. Siguiente…")
-            conn.close()
-            st.rerun()
+        rs = row_state.setdefault(str(item_id), {"msg": "", "status": "idle", "val": "", "nonce": 0})
 
-    with colB:
-        if st.button("⚠️ Incidencia (faltante)", key=f"sort_inc_{item_id}"):
-            c.execute(
-                "UPDATE sorting_run_items SET status='INCIDENCE', confirmed_at=? WHERE id=?",
-                (now_iso(), item_id)
-            )
-            conn.commit()
-            state.pop(key, None)
-            st.warning("Marcado como incidencia. Siguiente…")
-            conn.close()
-            st.rerun()
+        # Status pill
+        if istatus == "DONE":
+            pill = "<span class='pill p-ok'>OK</span>"
+        elif istatus == "INCIDENCE":
+            pill = "<span class='pill p-bad'>INCIDENCIA</span>"
+        else:
+            pill = "<span class='pill p-pend'>PENDIENTE</span>"
+
+        st.markdown(
+            f"""
+            <div class='rowCard'>
+                <div class='sku'>SKU: {sku_expected} {pill}</div>
+                <div class='prod'>{prod_display}</div>
+                <div class='qty'>Requiere: {int(qty)} unidad(es)</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        if istatus in ("DONE", "INCIDENCE"):
+            continue
+
+        cols = st.columns([3, 1, 1, 1])
+        with cols[0]:
+            k = f"sort_row_scan_{item_id}_{rs.get('nonce',0)}"
+            rs["val"] = st.text_input("Escaneo", value=rs.get("val",""), key=k, label_visibility="collapsed")
+        with cols[1]:
+            if st.button("Validar", key=f"sort_row_val_{item_id}"):
+                scanned = rs.get("val","")
+                sku_detected = resolve_scan_to_sku(scanned, barcode_to_sku)
+                if not sku_detected:
+                    rs["status"] = "bad"
+                    rs["msg"] = "No se pudo leer el código."
+                elif str(sku_detected).strip() != str(sku_expected).strip():
+                    rs["status"] = "bad"
+                    rs["msg"] = f"Leído: {sku_detected}"
+                else:
+                    # marcar DONE
+                    c.execute("UPDATE sorting_run_items SET status='DONE', done_at=? WHERE id=?", (now_iso(), item_id))
+                    conn.commit()
+                    rs["status"] = "ok"
+                    rs["msg"] = "OK"
+                    rs["val"] = ""
+                    rs["nonce"] = int(rs.get("nonce", 0)) + 1
+                    any_change = True
+                st.rerun()
+        with cols[2]:
+            if st.button("Sin EAN", key=f"sort_row_noean_{item_id}"):
+                # Confirmación manual rápida
+                c.execute("UPDATE sorting_run_items SET status='DONE', done_at=? WHERE id=?", (now_iso(), item_id))
+                conn.commit()
+                rs["status"] = "ok"
+                rs["msg"] = "OK (manual)"
+                rs["val"] = ""
+                rs["nonce"] = int(rs.get("nonce", 0)) + 1
+                any_change = True
+                st.rerun()
+        with cols[3]:
+            if st.button("Faltante", key=f"sort_row_inc_{item_id}"):
+                c.execute("UPDATE sorting_run_items SET status='INCIDENCE', incidence_note=?, done_at=? WHERE id=?",
+                          ("Faltante", now_iso(), item_id))
+                conn.commit()
+                rs["status"] = "bad"
+                rs["msg"] = "Incidencia: faltante"
+                rs["val"] = ""
+                rs["nonce"] = int(rs.get("nonce", 0)) + 1
+                any_change = True
+                st.rerun()
+
+        if rs.get("status") == "bad" and rs.get("msg"):
+            st.error(rs["msg"])
+        elif rs.get("status") == "ok" and rs.get("msg"):
+            st.success(rs["msg"])
+
+    # Si el grupo está completo, avanza automáticamente al siguiente
+    c.execute("""
+        SELECT COUNT(*) FROM sorting_run_items
+        WHERE run_id=? AND ml_order_id=? AND pack_id=? AND status='PENDING'
+    """, (run_id, ml_order_id, pack_id))
+    pending_in_group = int(c.fetchone()[0] or 0)
+
+    if pending_in_group == 0:
+        st.success("✅ Venta/Etiqueta completada. Pasando a la siguiente…")
+        # para que se note el cambio, guardamos un flash
+        st.session_state["sorting_last_completed_group"] = f"{ml_order_id}-{pack_id}"
+        conn.close()
+        st.rerun()
 
     conn.close()
-
-
 def page_sorting_upload(inv_map_sku: dict):
     st.header("Sorting – Cargar manifiesto")
     st.caption("Sube un manifiesto (Flex o Colecta). El sistema creará 1 corrida por página y podrás asignar cada página a una mesa.")
+
+    # Bloquea carga si existe un manifiesto activo (regla operativa)
+    active = get_active_sorting_manifest()
+    if active:
+        act_log, act_name = active
+        st.warning(f"Hay un manifiesto ACTIVO pendiente: {act_log} • {act_name}. Termina esas corridas antes de cargar otro.")
+        with st.expander("Opciones avanzadas (reprocesar/borrar)", expanded=False):
+            if st.button("🗑️ Borrar manifiesto activo (solo si fue un error)"):
+                delete_sorting_manifest(act_log, act_name)
+                st.success("Manifiesto borrado. Ya puedes cargar uno nuevo.")
+                st.rerun()
+        return
+
 
     logistics = st.radio("Tipo de logística", ["COLECTA", "FLEX"], horizontal=True)
 
@@ -1695,27 +1812,55 @@ def page_sorting_upload(inv_map_sku: dict):
     st.dataframe(pd.DataFrame(summary), use_container_width=True)
 
     st.subheader("Asignar páginas a mesas")
-    st.caption("Selecciona una mesa por cada página que quieras convertir en corrida. 0 = no asignar.")
+    st.caption("Regla: 1 página = 1 mesa (corrida). Respeta el orden de la página. Asigna páginas a mesas de forma clara.")
 
-    page_to_mesa = {}
-    cols = st.columns(3)
-    for idx, p in enumerate(pages):
-        page_num = p["page_num"]
-        with cols[idx % 3]:
-            mesa = st.selectbox(
-                f"Página {page_num}",
-                options=[0] + list(range(1, int(NUM_MESAS) + 1)),
-                index=0,
-                key=f"mesa_page_{page_num}"
-            )
-            if int(mesa) > 0:
-                page_to_mesa[int(page_num)] = int(mesa)
+    if "sort_page_to_mesa" not in st.session_state:
+        st.session_state["sort_page_to_mesa"] = {}
+
+    page_to_mesa = dict(st.session_state["sort_page_to_mesa"])
+
+    all_pages = [p["page_num"] for p in pages]
+    assigned_pages = set(page_to_mesa.keys())
+    available_pages = [p for p in all_pages if p not in assigned_pages]
+
+    colA, colB, colC = st.columns([1, 1, 1])
+    with colA:
+        mesa_sel = st.selectbox("Mesa", options=list(range(1, int(NUM_MESAS) + 1)), key="sort_mesa_sel")
+    with colB:
+        page_sel = st.selectbox("Página", options=available_pages if available_pages else [None], key="sort_page_sel")
+    with colC:
+        add_disabled = (page_sel is None)
+        if st.button("➕ Asignar", disabled=add_disabled):
+            page_to_mesa[int(page_sel)] = int(mesa_sel)
+            st.session_state["sort_page_to_mesa"] = page_to_mesa
+            st.rerun()
+
+    # Tabla de asignaciones (ordenadas por página)
+    if page_to_mesa:
+        df_map = pd.DataFrame(
+            [{"Página": p, "Mesa": m} for p, m in sorted(page_to_mesa.items(), key=lambda x: x[0])]
+        )
+        st.dataframe(df_map, use_container_width=True, hide_index=True)
+
+        # Quitar asignación
+        rm_col1, rm_col2 = st.columns([1, 2])
+        with rm_col1:
+            rm_page = st.selectbox("Quitar página", options=sorted(page_to_mesa.keys()), key="sort_rm_page")
+        with rm_col2:
+            if st.button("➖ Quitar asignación"):
+                page_to_mesa.pop(int(rm_page), None)
+                st.session_state["sort_page_to_mesa"] = page_to_mesa
+                st.rerun()
+    else:
+        st.info("Aún no asignas páginas a mesas.")
+
 
     if st.button("✅ Crear corridas (por página)"):
         if not page_to_mesa:
             st.warning("No asignaste ninguna página a mesa.")
             return
         build_sorting_runs_from_pages(pages, logistics, manifest_name, page_to_mesa, inv_map_sku)
+        st.session_state["sort_page_to_mesa"] = {}
         st.success("Corridas creadas. Ve a 'Sorting – Camarero' y selecciona la mesa.")
         st.rerun()
 
