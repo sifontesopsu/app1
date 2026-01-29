@@ -335,7 +335,9 @@ def init_db():
         qty INTEGER,
         label_shipment TEXT,
         status TEXT DEFAULT 'PENDING',
-        confirmed_at TEXT
+        confirmed_at TEXT,
+        done_at TEXT,
+        incidence_note TEXT
     );
     """)
 
@@ -357,6 +359,9 @@ def init_db():
     _ensure_col("sorting_run_items", "buyer_name", "TEXT")
     _ensure_col("sorting_run_items", "addr_text", "TEXT")
     _ensure_col("sorting_run_items", "recipient_name", "TEXT")
+    _ensure_col("sorting_run_items", "done_at", "TEXT")
+    _ensure_col("sorting_run_items", "incidence_note", "TEXT")
+
 
     _ensure_col("sorting_labels", "recipient_name", "TEXT")
     _ensure_col("sorting_labels", "addr_text", "TEXT")
@@ -800,6 +805,14 @@ def parse_labels_zpl_text(zpl_text: str) -> dict:
             s = s.encode("latin-1", "ignore").decode("utf-8", "ignore")
         except Exception:
             pass
+
+        # Limpieza extra: elimina JSON del QR y símbolos que ensucian dirección/cliente
+        s = re.sub(r'\{[^}]*\}', ' ', s)  # quita {...} típicamente JSON
+        s = s.replace("LA,", " ")
+        s = s.replace("->", " ")
+        # quita tokens tipo Pa_C3_B1 / _C3_A9 que a veces quedan tras decodificar
+        s = re.sub(r'\b[A-Za-z]+_[A-Za-z0-9_]+\b', ' ', s)
+        s = re.sub(r'[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s\-\.,#:/]', ' ', s)
 
         s = re.sub(r"\s+", " ", s).strip()
         return s
@@ -1609,6 +1622,19 @@ def page_sorting_camarero(inv_map_sku: dict):
 
     topA, topB = st.columns([2, 1])
     with topA:
+        st.markdown(
+            """
+<style>
+.big-metric {font-size: 26px; font-weight: 800; margin: 6px 0 10px 0;}
+.big-product {font-size: 22px; font-weight: 800; margin: 6px 0;}
+.big-qty {font-size: 20px; font-weight: 700; margin: 2px 0 10px 0;}
+.subtle-line {font-size: 16px; opacity: 0.9; margin: 2px 0;}
+.badge {display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:700; margin-left:8px;}
+</style>
+""",
+            unsafe_allow_html=True,
+        )
+
         st.markdown(f"### Sorting (Camarero) — Mesa {mesa}")
     with topB:
         if st.button("Cambiar mesa"):
@@ -1729,9 +1755,9 @@ def page_sorting_camarero(inv_map_sku: dict):
         label_ship = label_ship or (r[7] if len(r) > 7 else None)
 
     client_display = (buyer_name or recipient_name or "-")
-    addr_display = _clean_addr_text(addr_text) or "-"
-
-    # Progreso del grupo
+            <div class='big-metric'>En esta etiqueta: <b>{cnt_lines}</b> producto(s) / <b>{cnt_units}</b> unidad(es) • Progreso: {g_done}/{g_total}</div>
+            <div class='subtle-line'>Cliente: <b>{client_display}</b></div>
+            <div class='subtle-line'>Dirección: <b>{addr_display}</b></div>
     g_done = sum(1 for r in items if r[8] in ("DONE", "INCIDENCE"))
     g_total = len(items)
 
@@ -1781,8 +1807,8 @@ def page_sorting_camarero(inv_map_sku: dict):
             f"""
             <div class='rowCard'>
                 <div class='sku'>SKU: {sku_expected} {pill}</div>
-                <div class='prod'>{prod_display}</div>
-                <div class='qty'>Requiere: {int(qty)} unidad(es)</div>
+                <div class='big-product'>{prod_display}</div>
+                <div class='big-qty'>Requiere: {int(qty)} unidad(es)</div>
             </div>
             """,
             unsafe_allow_html=True
