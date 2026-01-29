@@ -5,6 +5,7 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 import re
+import hashlib
 
 # =========================
 # CONFIG
@@ -2185,15 +2186,19 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
         pdf = st.file_uploader("Control / Manifiesto ACTIVO (PDF)", type=["pdf"], key="sorting_pdf_active")
         zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL) (puedes cargarlo ahora)", type=["txt"], key="sorting_zpl_active")
 
-        # Permite cargar etiquetas en cualquier momento
+        # Permite cargar etiquetas en cualquier momento (evita bucles: solo procesa si cambia el archivo)
         if zpl is not None:
             raw = zpl.read().decode("utf-8", errors="ignore")
-            pack_map, ship_map = parse_zpl_labels(raw)
-            upsert_labels_to_db(mid, pack_map, raw)
-            st.success("Etiquetas cargadas/actualizadas para el manifiesto activo.")
-            st.rerun()
-
-        # Si ya existen corridas creadas, solo mostramos resumen y enviamos a Camarero
+            zpl_hash = hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
+            key_hash = f"sorting_zpl_hash_{mid}"
+            if st.session_state.get(key_hash) != zpl_hash:
+                pack_map, ship_map = parse_zpl_labels(raw)
+                upsert_labels_to_db(mid, pack_map, raw)
+                st.session_state[key_hash] = zpl_hash
+                st.success("Etiquetas cargadas/actualizadas para el manifiesto activo.")
+            else:
+                st.caption("Etiquetas ya cargadas (sin cambios).")
+# Si ya existen corridas creadas, solo mostramos resumen y enviamos a Camarero
         conn = get_conn()
         c = conn.cursor()
         c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=?;", (mid,))
@@ -2240,12 +2245,16 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
         if "sorting_manifest_id" not in st.session_state:
             mid = create_sorting_manifest(manifest_name)
             st.session_state.sorting_manifest_id = mid
-            # store labels if uploaded
+            # store labels if uploaded (solo si cambia el archivo)
             if zpl is not None:
                 raw = zpl.read().decode("utf-8", errors="ignore")
-                pack_map, ship_map = parse_zpl_labels(raw)
-                upsert_labels_to_db(mid, pack_map, raw)
-        mid = st.session_state.sorting_manifest_id
+                zpl_hash = hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
+                key_hash = f"sorting_zpl_hash_{mid}"
+                if st.session_state.get(key_hash) != zpl_hash:
+                    pack_map, ship_map = parse_zpl_labels(raw)
+                    upsert_labels_to_db(mid, pack_map, raw)
+                    st.session_state[key_hash] = zpl_hash
+mid = st.session_state.sorting_manifest_id
     pages = st.session_state.sorting_parsed_pages
 
     st.subheader("Asignación de páginas a mesas (obligatorio)")
@@ -2263,7 +2272,7 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
         if st.button("➕ Asignar"):
             assignments[int(page_sel)] = int(mesa_sel)
             st.session_state.sorting_assignments = assignments
-            st.rerun()
+            st.success(f"Página {int(page_sel)} asignada a Mesa {int(mesa_sel)}")
 
     # show table
     df_assign = pd.DataFrame([{"Página": p["page_no"], "Mesa": assignments.get(p["page_no"], "")} for p in pages])
