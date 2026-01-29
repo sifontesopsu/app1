@@ -425,6 +425,17 @@ def init_db():
     _ensure_col("sorting_labels", "buyer", "TEXT")
     _ensure_col("sorting_labels", "address", "TEXT")
     _ensure_col("sorting_labels", "raw", "TEXT")
+
+    # Asegurar índices/constraints para UPSERT (BD antiguas)
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sorting_labels_manifest_pack ON sorting_labels(manifest_id, pack_id);")
+    except Exception:
+        pass
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sorting_runs_manifest_page ON sorting_runs(manifest_id, page_no);")
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
