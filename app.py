@@ -616,6 +616,7 @@ def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
             cur_pack = None
+            cur_ship = None
             cur_venta = None
             cur_sku = None
             cur_title = ""
@@ -626,6 +627,10 @@ def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
             while i < len(lines):
                 line = lines[i].strip()
                 low = line.lower()
+
+                # En algunos manifiestos (Flex) el primer número de cada bloque es el ID de envío (shipment)
+                if re.fullmatch(r"[0-9]{10,12}", line):
+                    cur_ship = line.strip()
 
                 # Título (viene junto a UUID o MEL...)
                 # ej: "eb66a2ba-... Limpia Contacto 400ml ..."
@@ -668,7 +673,7 @@ def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
                 m_qty = re.search(r"Cantidad\s*[:#]?\s*([0-9]+)", line, flags=re.I)
                 if m_qty:
                     qty = int(m_qty.group(1))
-                    if cur_pack and cur_venta and cur_sku and qty > 0:
+                    if (cur_pack or cur_ship) and cur_venta and cur_sku and qty > 0:
                         buyer = ""
                         # 1) A veces el nombre viene en la MISMA línea (ej: "Daniel Mella Cantidad: 1")
                         #    Tomamos el texto antes de "Cantidad:" si no parece meta.
@@ -701,7 +706,8 @@ def parse_manifest_pdf_pages(uploaded_file) -> list[dict]:
                         items.append({
                             "seq": seq,
                             "ml_order_id": cur_venta,
-                            "pack_id": cur_pack,
+                            "pack_id": (cur_pack or cur_ship),
+                            "shipment_id": (cur_ship or ""),
                             "sku_ml": cur_sku,
                             "title_ml": cur_title or "",
                             "buyer": buyer or "",
@@ -732,13 +738,34 @@ def parse_labels_zpl_text(zpl_text: str) -> dict:
     blocks = re.split(r"\^XA", text)
     out: dict = {}
 
+    # Shipment puede venir como:
+    # - Código de barras: ^FD>:4636...^FS
+    # - QR (Flex): ^BQN... ^FDLA,{"id":"4636...", ...}^FS
+    # - Texto "Envio: 4636105" + siguiente ^FD "9888"
     ship_re = re.compile(r"\^FD>:\s*([0-9]{6,20})\^FS")
+    qr_id_re = re.compile(r'\"id\"\s*:\s*\"([0-9]{6,20})\"')
+    envio_prefix_re = re.compile(r"Envio:\s*([0-9]{3,20})\^FS", re.I)
+    # Pack ID puede venir partido: 'Pack ID: 20000' + '1127...'
     pack_prefix_re = re.compile(r"Pack ID:\s*([0-9]{1,20})\^FS", re.I)
+    venta_prefix_re = re.compile(r"Venta:\s*([0-9]{1,20})\^FS", re.I)
     fd_digits_re = re.compile(r"\^FD\s*([0-9]{6,20})\^FS")
     fd_text_re = re.compile(r"\^FD(.+?)\^FS", re.S)
 
     def clean_fd(s: str) -> str:
         s = (s or "").replace("\r", "\n")
+
+        # Decodifica secuencias ZPL con ^FH (ej: _C3_A9 => é)
+        def _hex_to_chr(m):
+            try:
+                return bytes([int(m.group(1), 16)]).decode("latin-1")
+            except Exception:
+                return ""
+        s = re.sub(r"_([0-9A-Fa-f]{2})", _hex_to_chr, s)
+        try:
+            s = s.encode("latin-1", "ignore").decode("utf-8", "ignore")
+        except Exception:
+            pass
+
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
@@ -746,9 +773,33 @@ def parse_labels_zpl_text(zpl_text: str) -> dict:
         if "^XZ" not in blk:
             continue
 
-        # Shipment
+        # Shipment (envío) desde barcode, QR o texto
+        shipment = ""
         mship = ship_re.search(blk)
-        shipment = mship.group(1).strip() if mship else ""
+        if mship:
+            shipment = mship.group(1).strip()
+
+        if not shipment:
+            mqr = qr_id_re.search(blk)
+            if mqr:
+                shipment = mqr.group(1).strip()
+
+        # 'Envio: 4636105' + siguiente FD '9888'
+        if not shipment:
+            menv = envio_prefix_re.search(blk)
+            if menv:
+                prefix = menv.group(1).strip()
+                tail = ""
+                after = blk[menv.end():]
+                for mfd in fd_digits_re.finditer(after):
+                    cand = mfd.group(1).strip()
+                    if cand == prefix:
+                        continue
+                    if len(cand) < 3:
+                        continue
+                    tail = cand
+                    break
+                shipment = (prefix + tail) if tail and len(prefix) <= 8 else prefix
 
         # Pack prefix (parte 1)
         mpref = pack_prefix_re.search(blk)
@@ -779,6 +830,8 @@ def parse_labels_zpl_text(zpl_text: str) -> dict:
                 continue
             sl = s.lower()
             if sl.startswith(">:"):
+                continue
+            if ("{\"id\"" in s) or ("sender_id" in sl and "{\"id\"" in sl) or sl.startswith("la,{"):
                 continue
             if "pack id:" in sl:
                 continue
@@ -811,8 +864,9 @@ def parse_labels_zpl_text(zpl_text: str) -> dict:
                 addr_lines.append(s)
         addr_text = " | ".join(addr_lines[:3]).strip()
 
-        if pack_id:
-            out[pack_id] = {
+        key = pack_id or (shipment or "")
+        if key:
+            out[key] = {
                 "shipment_id": shipment or "",
                 "addr_text": addr_text or "",
                 "recipient": recipient or ""
@@ -860,7 +914,7 @@ def build_sorting_runs_from_pages(pages: list[dict], logistics: str, manifest_na
                     str(it.get("title_ml","") or ""),
                     title_tec,
                     int(it.get("qty", 0) or 0),
-                    None,
+                    str(it.get("shipment_id", "") or "") or None,
                     "PENDING",
                     None,
                     str(it.get("buyer","") or "")
