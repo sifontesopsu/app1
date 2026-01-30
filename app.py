@@ -5,6 +5,7 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 import re
+import hashlib
 
 # =========================
 # CONFIG
@@ -532,6 +533,39 @@ def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
     return normalize_sku(raw)
 
 
+def extract_location_suffix(text: str) -> str:
+    """Extracts location/UBC suffix like '[UBC: 1234]' from a title."""
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    # Common pattern in Aurora: '[UBC: 2260]' or '[ubc: 2260]'
+    m = re.search(r"(\[\s*UBC\s*:\s*[^\]]+\])\s*$", t, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Sometimes without brackets: 'UBC: 2260' at end
+    m = re.search(r"(UBC\s*:\s*\d+)\s*$", t, flags=re.IGNORECASE)
+    if m:
+        return f"[{m.group(1).strip()}]"
+    return ""
+
+
+def with_location(title_display: str, title_tec: str) -> str:
+    """Ensures the product title shown includes the location suffix when available."""
+    base = str(title_display or "").strip()
+    tec = str(title_tec or "").strip()
+
+    # If base already contains a suffix, keep it
+    if extract_location_suffix(base):
+        return base
+
+    # If technical title contains suffix, append it
+    suf = extract_location_suffix(tec)
+    if suf:
+        return f"{base} {suf}".strip()
+
+    return base
+
+
 @st.cache_data(show_spinner=False)
 def get_master_cached(master_path: str) -> tuple[dict, dict, list]:
     return load_master_from_path(master_path)
@@ -946,7 +980,7 @@ def page_picking():
         return
 
     c.execute("""
-        SELECT id, sku_ml, COALESCE(NULLIF(title_tec,''), title_ml) AS producto,
+        SELECT id, sku_ml, title_ml, title_tec,
                qty_total, qty_picked, status
         FROM picking_tasks
         WHERE ot_id=?
@@ -968,7 +1002,10 @@ def page_picking():
         conn.close()
         return
 
-    task_id, sku_expected, producto, qty_total, qty_picked, status = current
+    task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
+    producto_base = (title_tec or title_ml or '').strip()
+    producto_show = with_location(producto_base, title_tec)
+
 
     if "pick_state" not in st.session_state:
         st.session_state.pick_state = {}
@@ -1005,7 +1042,7 @@ def page_picking():
         <div class="hero">
             <div class="smallcap">OT: {ot_code}</div>
             <div class="sku">SKU: {sku_expected}</div>
-            <div class="prod">{producto}</div>
+            <div class="prod">{producto_show}</div>
             <div class="qty">Solicitado: {qty_total}</div>
         </div>
         """,
@@ -1053,7 +1090,7 @@ def page_picking():
 
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
         st.info("Confirmación manual")
-        st.write(f"✅ {producto}")
+        st.write(f"✅ {producto_show}")
         if st.button("Confirmar", key=f"confirm_manual_{task_id}"):
             s["confirmed"] = True
             s["confirm_mode"] = "MANUAL_NO_EAN"
@@ -2185,13 +2222,18 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
         pdf = st.file_uploader("Control / Manifiesto ACTIVO (PDF)", type=["pdf"], key="sorting_pdf_active")
         zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL) (puedes cargarlo ahora)", type=["txt"], key="sorting_zpl_active")
 
-        # Permite cargar etiquetas en cualquier momento
+        # Permite cargar etiquetas en cualquier momento (sin bucles por rerun)
         if zpl is not None:
-            raw = zpl.read().decode("utf-8", errors="ignore")
-            pack_map, ship_map = parse_zpl_labels(raw)
-            upsert_labels_to_db(mid, pack_map, raw)
-            st.success("Etiquetas cargadas/actualizadas para el manifiesto activo.")
-            st.rerun()
+            raw_bytes = zpl.getvalue()
+            zpl_hash = hashlib.md5(raw_bytes).hexdigest()
+            if st.session_state.get("sorting_last_zpl_hash") != zpl_hash:
+                raw = raw_bytes.decode("utf-8", errors="ignore")
+                pack_map, ship_map = parse_zpl_labels(raw)
+                upsert_labels_to_db(mid, pack_map, raw)
+                st.session_state["sorting_last_zpl_hash"] = zpl_hash
+                st.success("Etiquetas cargadas/actualizadas para el manifiesto activo.")
+            else:
+                st.info("Etiquetas ya procesadas (sin cambios).")
 
         # Si ya existen corridas creadas, solo mostramos resumen y enviamos a Camarero
         conn = get_conn()
@@ -2204,12 +2246,15 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
             st.success(f"Corridas ya creadas para este manifiesto: **{run_count}**. Ve a 'Camarero' para completarlas.")
             st.stop()
 
-        # Si aún no hay corridas, necesitamos el PDF para (re)leer páginas y asignarlas
+        # Si aún no hay corridas, necesitamos páginas del PDF para asignarlas.
+        # Si ya las tenemos en sesión (por una carga previa), NO obligamos a re-subir el PDF.
         if not pdf:
-            st.info("Sube el PDF del manifiesto activo para asignar sus páginas a mesas.")
-            st.stop()
-
-        pages = parse_control_pdf_by_page(pdf)
+            pages = st.session_state.get("sorting_parsed_pages")
+            if not pages:
+                st.info("Sube el PDF del manifiesto activo para asignar sus páginas a mesas.")
+                st.stop()
+        else:
+            pages = parse_control_pdf_by_page(pdf)
         if not pages:
             st.error("No se pudo leer el PDF.")
             st.stop()
@@ -2240,11 +2285,15 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
         if "sorting_manifest_id" not in st.session_state:
             mid = create_sorting_manifest(manifest_name)
             st.session_state.sorting_manifest_id = mid
-            # store labels if uploaded
+            # store labels if uploaded (sin bucles)
             if zpl is not None:
-                raw = zpl.read().decode("utf-8", errors="ignore")
-                pack_map, ship_map = parse_zpl_labels(raw)
-                upsert_labels_to_db(mid, pack_map, raw)
+                raw_bytes = zpl.getvalue()
+                zpl_hash = hashlib.md5(raw_bytes).hexdigest()
+                if st.session_state.get("sorting_last_zpl_hash") != zpl_hash:
+                    raw = raw_bytes.decode("utf-8", errors="ignore")
+                    pack_map, ship_map = parse_zpl_labels(raw)
+                    upsert_labels_to_db(mid, pack_map, raw)
+                    st.session_state["sorting_last_zpl_hash"] = zpl_hash
         mid = st.session_state.sorting_manifest_id
     pages = st.session_state.sorting_parsed_pages
 
