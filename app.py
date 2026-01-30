@@ -1215,16 +1215,20 @@ def page_picking():
 
     with col4:
         if st.button("Surtido en venta"):
-            # Manda este SKU al final de la fila (se pickea al final dentro de la OT)
+            # Siempre manda este SKU al final de la fila (rotación circular).
+            # Implementación: defer_rank = (máximo defer_rank en esta OT) + 1
             try:
+                c.execute("SELECT COALESCE(MAX(defer_rank), 0) FROM picking_tasks WHERE ot_id=?", (ot_id,))
+                max_rank = c.fetchone()[0] or 0
+                new_rank = int(max_rank) + 1
                 c.execute(
-                    "UPDATE picking_tasks SET defer_rank=1, defer_at=? WHERE id=?",
-                    (now_iso(), task_id)
+                    "UPDATE picking_tasks SET defer_rank=?, defer_at=? WHERE id=?",
+                    (new_rank, now_iso(), task_id)
                 )
                 conn.commit()
             except Exception:
                 pass
-            # limpiar estado UI de este task y seguir con el siguiente
+            # Limpiar estado UI de este task y seguir con el siguiente
             state.pop(str(task_id), None)
             st.rerun()
 
