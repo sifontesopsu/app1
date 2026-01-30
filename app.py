@@ -1034,15 +1034,11 @@ def page_picking():
         conn.close()
         return
 
-    task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
-    # Always show location (UBC) clearly, even when title is long
-    loc = extract_location_suffix(title_tec or '') or extract_location_suffix(title_ml or '')
-    producto_base = (title_tec or title_ml or '').strip()
-    producto_clean = strip_location_suffix(producto_base)
-    producto_show = producto_clean
-    loc_show = loc
+        task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
 
-    loc_html = f'<div class="loc">{loc_show}</div>' if loc_show else ''
+    # Título EXACTO: preferimos el título técnico del maestro (si existe), sin recortar ni separar ubicaciones/UBC.
+    producto_show = (title_tec or title_ml or "").strip()
+
 
     if "pick_state" not in st.session_state:
         st.session_state.pick_state = {}
@@ -1074,12 +1070,17 @@ def page_picking():
         s["qty_input"] = ""
         s["scan_value"] = ""
 
-    # Tarjeta principal (sin HTML) para que UBC siempre se vea
-    titulo_main, ubc = split_title_ubc(producto_show)
-    if not ubc:
-        _, ubc = split_title_ubc(title_tec if 'title_tec' in locals() else "")
+    # Tarjeta principal (sin HTML) para que UBC siempre se vea    # Tarjeta principal: mostrar el título tal cual (incluye UBC/ubicación como prefijo o sufijo)
     st.caption(f"OT: {ot_code}")
     st.markdown(f"### SKU: {sku_expected}")
+
+    st.markdown(
+        f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{producto_show}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(f"### Solicitado: {qty_total}")
+### SKU: {sku_expected}")
     st.markdown(f"## {titulo_main}")
     if ubc:
         st.markdown(f"**UBC:** {ubc}")
