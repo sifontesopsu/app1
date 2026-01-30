@@ -1083,10 +1083,16 @@ def page_picking():
     st.markdown(f"## {titulo_main}")
     if ubc:
         st.markdown(f"**UBC:** {ubc}")
-    st.markdown(f"### Solicitado: {qty_total}")
-if s["scan_status"] == "ok":
-        st.markdown(f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}', unsafe_allow_html=True)
+    st.markdown(f"### Solicitado: {qty_total}")    if s["scan_status"] == "ok":
+        st.markdown(
+            f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}',
+            unsafe_allow_html=True,
+        )
     elif s["scan_status"] == "bad":
+        st.markdown(
+            f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}',
+            unsafe_allow_html=True,
+        )
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([2, 1, 1])
