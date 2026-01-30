@@ -46,6 +46,25 @@ def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
 
+
+# =========================
+# TEXT HELPERS
+# =========================
+UBC_RE = re.compile(r"\[\s*UBC\s*:\s*([^\]]+)\]", re.IGNORECASE)
+
+def split_title_ubc(title: str):
+    """Return (title_without_ubc, ubc_str_or_empty)."""
+    t = str(title or "").strip()
+    ubc = ""
+    m = UBC_RE.search(t)
+    if m:
+        ubc = m.group(1).strip()
+        # remove the whole [UBC: ...] chunk
+        t = UBC_RE.sub("", t).strip()
+        # collapse double spaces
+        t = re.sub(r"\s{2,}", " ", t)
+    return t, ubc
+
 def to_chile_display(iso_str: str) -> str:
     """Convierte ISO guardado (asumido UTC server) a hora Chile para mostrar."""
     if not iso_str:
@@ -1055,20 +1074,17 @@ def page_picking():
         s["qty_input"] = ""
         s["scan_value"] = ""
 
-    st.markdown(
-        f"""
-        <div class="hero">
-            <div class="smallcap">OT: {ot_code}</div>
-            <div class="sku">SKU: {sku_expected}</div>
-            <div class="prod">{producto_show}</div>
-            {loc_html}
-            <div class="qty">Solicitado: {qty_total}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    if s["scan_status"] == "ok":
+    # Tarjeta principal (sin HTML) para que UBC siempre se vea
+    titulo_main, ubc = split_title_ubc(producto_show)
+    if not ubc:
+        _, ubc = split_title_ubc(title_tec if 'title_tec' in locals() else "")
+    st.caption(f"OT: {ot_code}")
+    st.markdown(f"### SKU: {sku_expected}")
+    st.markdown(f"## {titulo_main}")
+    if ubc:
+        st.markdown(f"**UBC:** {ubc}")
+    st.markdown(f"### Solicitado: {qty_total}")
+if s["scan_status"] == "ok":
         st.markdown(f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}', unsafe_allow_html=True)
     elif s["scan_status"] == "bad":
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
