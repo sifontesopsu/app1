@@ -1074,15 +1074,18 @@ def page_picking():
         s["qty_input"] = ""
         s["scan_value"] = ""
 
-    # Tarjeta principal (sin HTML) para que UBC siempre se vea
-    titulo_main, ubc = split_title_ubc(producto_show)
-    if not ubc:
-        _, ubc = split_title_ubc(title_tec if 'title_tec' in locals() else "")
+    # Tarjeta principal: mostrar título COMPLETO (incluye UBC/ubicación) y permitir wrap
+    producto_full = with_location(strip_location_suffix(producto_base), title_tec or title_ml)
+
     st.caption(f"OT: {ot_code}")
     st.markdown(f"### SKU: {sku_expected}")
-    st.markdown(f"## {titulo_main}")
-    if ubc:
-        st.markdown(f"**UBC:** {ubc}")
+
+    # Título con wrap garantizado (para ubicaciones/UBC al final)
+    st.markdown(
+        f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{producto_full}</div></div>',
+        unsafe_allow_html=True
+    )
+
     st.markdown(f"### Solicitado: {qty_total}")
     if s["scan_status"] == "ok":
         st.markdown(f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}', unsafe_allow_html=True)
