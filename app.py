@@ -43,8 +43,8 @@ except ImportError:
 # UTILIDADES
 # =========================
 def now_iso():
-    # Guardamos naive ISO (server suele ser UTC en Streamlit Cloud)
-    return datetime.now().isoformat(timespec="seconds")
+    # Guardamos UTC naive ISO (sin tz). Luego to_chile_display lo convierte a hora Chile.
+    return datetime.utcnow().isoformat(timespec="seconds")
 
 
 
