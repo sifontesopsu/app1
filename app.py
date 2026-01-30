@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime
 import re
 import hashlib
+import html
 
 # =========================
 # CONFIG
@@ -249,7 +250,9 @@ def init_db():
         qty_picked INTEGER DEFAULT 0,
         status TEXT DEFAULT 'PENDING',
         decided_at TEXT,
-        confirm_mode TEXT
+        confirm_mode TEXT,
+        defer_rank INTEGER DEFAULT 0,
+        defer_at TEXT
     );
     """)
 
@@ -409,7 +412,11 @@ def init_db():
             # Si falla (por locks o tablas raras), no botar la app.
             pass
 
-    # sorting_manifests
+        # picking_tasks (nuevas columnas para reordenar por "Surtido en venta")
+    _ensure_col("picking_tasks", "defer_rank", "INTEGER DEFAULT 0")
+    _ensure_col("picking_tasks", "defer_at", "TEXT")
+
+# sorting_manifests
     _ensure_col("sorting_manifests", "name", "TEXT")
     _ensure_col("sorting_manifests", "created_at", "TEXT")
     _ensure_col("sorting_manifests", "status", "TEXT")
@@ -531,6 +538,86 @@ def load_master_from_path(path: str) -> tuple[dict, dict, list]:
                 barcode_to_sku[code] = sku
 
     return inv_map_sku, barcode_to_sku, conflicts
+
+
+# Cache extra: lookup directo del título "tal cual" en el maestro (sin limpiar)
+_MASTER_DF_CACHE = {"path": None, "mtime": None, "df": None}
+
+def _load_master_df_cached(path: str):
+    """Carga el Excel del maestro una sola vez (por mtime) para poder buscar el texto crudo."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+
+    if (_MASTER_DF_CACHE.get("path") == path and _MASTER_DF_CACHE.get("mtime") == mtime
+            and _MASTER_DF_CACHE.get("df") is not None):
+        return _MASTER_DF_CACHE["df"]
+
+    try:
+        dfm = pd.read_excel(path, dtype=str)
+    except Exception:
+        return None
+
+    _MASTER_DF_CACHE.update({"path": path, "mtime": mtime, "df": dfm})
+    return dfm
+
+def master_raw_title_lookup(path: str, sku: str) -> str:
+    """Devuelve el texto EXACTO del maestro para ese SKU (tal cual viene en la celda)."""
+    dfm = _load_master_df_cached(path)
+    if dfm is None or dfm.empty:
+        return ""
+    cols = list(dfm.columns)
+    lower = [str(c).strip().lower() for c in cols]
+
+    # columna SKU
+    sku_col = None
+    if "sku" in lower:
+        sku_col = cols[lower.index("sku")]
+    if sku_col is None:
+        return ""
+
+    # preferir columnas típicas de descripción/título
+    pref = [
+        "descripción", "descripcion", "artículo", "articulo",
+        "detalle", "producto", "nombre", "descripción pack", "nombre pack"
+    ]
+    title_col = None
+    for cand in pref:
+        if cand in lower:
+            title_col = cols[lower.index(cand)]
+            break
+    # si no hay, tomar la primera no-SKU
+    if title_col is None:
+        for c in cols:
+            if c != sku_col:
+                title_col = c
+                break
+    if title_col is None:
+        return ""
+
+    target = normalize_sku(sku)
+    if not target:
+        return ""
+
+    try:
+        ser = dfm[sku_col].astype(str).map(normalize_sku)
+        hits = dfm.loc[ser == target]
+    except Exception:
+        return ""
+
+    if hits.empty:
+        return ""
+
+    val = hits.iloc[0][title_col]
+    if val is None:
+        return ""
+    sval = str(val)
+    if sval.lower() == "nan":
+        return ""
+    return sval
 
 
 def upsert_barcodes_to_db(barcode_to_sku: dict):
@@ -883,7 +970,7 @@ def page_import(inv_map_sku: dict):
         sales_df = parse_manifest_pdf(pdf_file)
 
     st.subheader("Vista previa")
-    st.dataframe(sales_df.head(30), use_container_width=True, hide_index=True)
+    st.dataframe(sales_df.head(30))
 
     if st.button("Cargar y generar OTs"):
         save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers))
@@ -1016,7 +1103,7 @@ def page_picking():
                qty_total, qty_picked, status
         FROM picking_tasks
         WHERE ot_id=?
-        ORDER BY CAST(sku_ml AS INTEGER), sku_ml
+        ORDER BY COALESCE(defer_rank,0) ASC, CAST(sku_ml AS INTEGER), sku_ml
     """, (ot_id,))
     tasks = c.fetchall()
 
@@ -1036,10 +1123,9 @@ def page_picking():
 
     task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
 
-    # Título exacto como viene del maestro (title_tec) o de ML (title_ml)
-    producto_show = (title_tec or title_ml or "").strip()
-
-
+    # Título: prioridad absoluta al texto crudo del maestro (tal cual). Si no existe, cae a title_tec/title_ml.
+    raw_master = master_raw_title_lookup(MASTER_FILE, sku_expected)
+    producto_show = raw_master if raw_master else (title_tec if title_tec not in (None, "") else (title_ml or ""))
     if "pick_state" not in st.session_state:
         st.session_state.pick_state = {}
     state = st.session_state.pick_state
@@ -1075,7 +1161,7 @@ def page_picking():
     st.markdown(f"### SKU: {sku_expected}")
 
     st.markdown(
-        f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{producto_show}</div></div>',
+        f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{html.escape(str(producto_show))}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -1093,7 +1179,7 @@ def page_picking():
         )
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
     with col1:
         scan_label = "Escaneo"
@@ -1125,6 +1211,21 @@ def page_picking():
     with col3:
         if st.button("Sin EAN"):
             s["show_manual_confirm"] = True
+            st.rerun()
+
+    with col4:
+        if st.button("Surtido en venta"):
+            # Manda este SKU al final de la fila (se pickea al final dentro de la OT)
+            try:
+                c.execute(
+                    "UPDATE picking_tasks SET defer_rank=1, defer_at=? WHERE id=?",
+                    (now_iso(), task_id)
+                )
+                conn.commit()
+            except Exception:
+                pass
+            # limpiar estado UI de este task y seguir con el siguiente
+            state.pop(str(task_id), None)
             st.rerun()
 
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
@@ -1490,7 +1591,7 @@ def page_full_upload(inv_map_sku: dict):
     df2["title_eff"] = df2.apply(lambda r: r["title"] if str(r["title"]).strip() else inv_map_sku.get(r["sku_ml"], ""), axis=1)
 
     st.subheader("Vista previa (primeras 50 filas)")
-    st.dataframe(df2.head(50), use_container_width=True, hide_index=True)
+    st.dataframe(df2.head(50))
 
     st.caption("Se agregará por SKU (sumando cantidades de todas las hojas).")
 
@@ -1845,7 +1946,7 @@ def page_full_admin():
     rows = c.fetchall()
     df = pd.DataFrame(rows, columns=["SKU", "Artículo", "Solicitado", "Acopiado", "Pendiente", "Estado", "Actualizado", "Áreas", "Nros"])
     df["Actualizado"] = df["Actualizado"].apply(to_chile_display)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, use_container_width=True)
 
     st.subheader("Incidencias")
     c.execute("""
@@ -1858,7 +1959,7 @@ def page_full_admin():
     if inc:
         df_inc = pd.DataFrame(inc, columns=["SKU", "Req", "Chk", "Diff", "Motivo", "Hora"])
         df_inc["Hora"] = df_inc["Hora"].apply(to_chile_display)
-        st.dataframe(df_inc, use_container_width=True, hide_index=True)
+        st.dataframe(df_inc, use_container_width=True)
     else:
         st.info("Sin incidencias registradas para este lote.")
 
@@ -1953,7 +2054,7 @@ def page_admin():
     ])
     df["Creada"] = df["Creada"].apply(to_chile_display)
     df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df)
 
     st.subheader("Incidencias")
     c.execute("""
@@ -1967,7 +2068,7 @@ def page_admin():
     if inc_rows:
         df_inc = pd.DataFrame(inc_rows, columns=["OT", "Picker", "SKU", "Solicitado", "Pickeado", "Faltante", "Motivo", "Hora"])
         df_inc["Hora"] = df_inc["Hora"].apply(to_chile_display)
-        st.dataframe(df_inc, use_container_width=True, hide_index=True)
+        st.dataframe(df_inc)
     else:
         st.info("Sin incidencias en la corrida actual.")
 
