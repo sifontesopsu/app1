@@ -2054,7 +2054,7 @@ def page_admin():
     ])
     df["Creada"] = df["Creada"].apply(to_chile_display)
     df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
-    st.dataframe(df)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.subheader("Incidencias")
     c.execute("""
