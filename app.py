@@ -1036,7 +1036,7 @@ def page_picking():
 
     task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
 
-    # Título EXACTO: preferimos el título técnico del maestro si existe (incluye UBC/ubicación como prefijo o sufijo)
+    # Título exacto como viene del maestro (title_tec) o de ML (title_ml)
     producto_show = (title_tec or title_ml or "").strip()
 
 
@@ -1070,7 +1070,7 @@ def page_picking():
         s["qty_input"] = ""
         s["scan_value"] = ""
 
-    # Tarjeta principal: mostrar el título tal cual (incluye UBC/ubicación) y permitir wrap
+    # Tarjeta principal: mostrar el título tal cual (incluye UBC/ubicación aunque venga al inicio/medio/final)
     st.caption(f"OT: {ot_code}")
     st.markdown(f"### SKU: {sku_expected}")
 
@@ -1079,16 +1079,14 @@ def page_picking():
         unsafe_allow_html=True,
     )
 
-    st.markdown(f"### Solicitado: {qty_total}")    if s["scan_status"] == "ok":
+    st.markdown(f"### Solicitado: {qty_total}")
+
+    if s["scan_status"] == "ok":
         st.markdown(
             f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}',
             unsafe_allow_html=True,
         )
     elif s["scan_status"] == "bad":
-        st.markdown(
-            f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}',
-            unsafe_allow_html=True,
-        )
         st.markdown(
             f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}',
             unsafe_allow_html=True,
