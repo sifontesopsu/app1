@@ -1034,7 +1034,7 @@ def page_picking():
         conn.close()
         return
 
-        task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
+    task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
 
     # Título EXACTO: preferimos el título técnico del maestro (si existe), sin recortar ni separar ubicaciones/UBC.
     producto_show = (title_tec or title_ml or "").strip()
