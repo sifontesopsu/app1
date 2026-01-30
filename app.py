@@ -548,6 +548,18 @@ def extract_location_suffix(text: str) -> str:
         return f"[{m.group(1).strip()}]"
     return ""
 
+def strip_location_suffix(text: str) -> str:
+    """Remove trailing location suffix like '[UBC: 2260]' if present."""
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    # remove bracketed suffix
+    t2 = re.sub(r"\s*(\[\s*UBC\s*:\s*[^\]]+\])\s*$", "", t, flags=re.IGNORECASE).strip()
+    # remove unbracketed suffix
+    t2 = re.sub(r"\s*(UBC\s*:\s*\d+)\s*$", "", t2, flags=re.IGNORECASE).strip()
+    return t2
+
+
 
 def with_location(title_display: str, title_tec: str) -> str:
     """Ensures the product title shown includes the location suffix when available."""
@@ -936,6 +948,7 @@ def page_picking():
         .hero .sku { font-size: 26px; font-weight: 900; margin: 0; }
         .hero .prod { font-size: 22px; font-weight: 800; margin: 6px 0 0 0; line-height: 1.15; }
         .hero .qty { font-size: 26px; font-weight: 900; margin: 8px 0 0 0; }
+.hero .loc { font-size: 18px; font-weight: 900; margin: 6px 0 0 0; opacity: 0.9; }
         .smallcap { font-size: 12px; opacity: 0.75; margin: 0 0 4px 0; }
         .scanok { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
         .ok { background: rgba(0, 200, 0, 0.15); }
@@ -1003,9 +1016,14 @@ def page_picking():
         return
 
     task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
+    # Always show location (UBC) clearly, even when title is long
+    loc = extract_location_suffix(title_tec or '') or extract_location_suffix(title_ml or '')
     producto_base = (title_tec or title_ml or '').strip()
-    producto_show = with_location(producto_base, title_tec)
+    producto_clean = strip_location_suffix(producto_base)
+    producto_show = producto_clean
+    loc_show = loc
 
+    loc_html = f'<div class="loc">{loc_show}</div>' if loc_show else ''
 
     if "pick_state" not in st.session_state:
         st.session_state.pick_state = {}
@@ -1043,6 +1061,7 @@ def page_picking():
             <div class="smallcap">OT: {ot_code}</div>
             <div class="sku">SKU: {sku_expected}</div>
             <div class="prod">{producto_show}</div>
+            {loc_html}
             <div class="qty">Solicitado: {qty_total}</div>
         </div>
         """,
