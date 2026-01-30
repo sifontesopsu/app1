@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime
 import re
 import hashlib
+import html
 
 # =========================
 # CONFIG
@@ -249,7 +250,9 @@ def init_db():
         qty_picked INTEGER DEFAULT 0,
         status TEXT DEFAULT 'PENDING',
         decided_at TEXT,
-        confirm_mode TEXT
+        confirm_mode TEXT,
+        defer_rank INTEGER DEFAULT 0,
+        defer_at TEXT
     );
     """)
 
@@ -409,7 +412,11 @@ def init_db():
             # Si falla (por locks o tablas raras), no botar la app.
             pass
 
-    # sorting_manifests
+        # picking_tasks (nuevas columnas para reordenar por "Surtido en venta")
+    _ensure_col("picking_tasks", "defer_rank", "INTEGER DEFAULT 0")
+    _ensure_col("picking_tasks", "defer_at", "TEXT")
+
+# sorting_manifests
     _ensure_col("sorting_manifests", "name", "TEXT")
     _ensure_col("sorting_manifests", "created_at", "TEXT")
     _ensure_col("sorting_manifests", "status", "TEXT")
@@ -1016,7 +1023,7 @@ def page_picking():
                qty_total, qty_picked, status
         FROM picking_tasks
         WHERE ot_id=?
-        ORDER BY CAST(sku_ml AS INTEGER), sku_ml
+        ORDER BY COALESCE(defer_rank,0) ASC, CAST(sku_ml AS INTEGER), sku_ml
     """, (ot_id,))
     tasks = c.fetchall()
 
@@ -1037,7 +1044,7 @@ def page_picking():
     task_id, sku_expected, title_ml, title_tec, qty_total, qty_picked, status = current
 
     # Título exacto como viene del maestro (title_tec) o de ML (title_ml)
-    producto_show = (title_tec or title_ml or "").strip()
+    producto_show = (title_tec if title_tec not in (None, "") else (title_ml or ""))
 
 
     if "pick_state" not in st.session_state:
@@ -1075,7 +1082,7 @@ def page_picking():
     st.markdown(f"### SKU: {sku_expected}")
 
     st.markdown(
-        f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{producto_show}</div></div>',
+        f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{html.escape(str(producto_show))}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -1093,7 +1100,7 @@ def page_picking():
         )
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
     with col1:
         scan_label = "Escaneo"
@@ -1125,6 +1132,21 @@ def page_picking():
     with col3:
         if st.button("Sin EAN"):
             s["show_manual_confirm"] = True
+            st.rerun()
+
+    with col4:
+        if st.button("Surtido en venta"):
+            # Manda este SKU al final de la fila (se pickea al final dentro de la OT)
+            try:
+                c.execute(
+                    "UPDATE picking_tasks SET defer_rank=1, defer_at=? WHERE id=?",
+                    (now_iso(), task_id)
+                )
+                conn.commit()
+            except Exception:
+                pass
+            # limpiar estado UI de este task y seguir con el siguiente
+            state.pop(str(task_id), None)
             st.rerun()
 
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
