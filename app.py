@@ -1074,20 +1074,32 @@ def page_picking():
         s["qty_input"] = ""
         s["scan_value"] = ""
 
-    # Tarjeta principal: mostrar título COMPLETO (incluye UBC/ubicación) y permitir wrap
-    producto_full = with_location(strip_location_suffix(producto_base), title_tec or title_ml)
+    # Tarjeta principal (sin HTML) para que UBC siempre se vea
+    titulo_main, ubc = split_title_ubc(producto_show)
+    if not ubc:
+        _, ubc = split_title_ubc(title_tec if 'title_tec' in locals() else "")    # Encabezado: mostrar título COMPLETO (incluye UBC/ubicación aunque venga al inicio/medio/final)
+    full_title = (title_tec or title_ml or '').strip()
+    _title_no_ubc, ubc_any = split_title_ubc(full_title)  # ubc_any puede venir aunque esté al inicio
 
     st.caption(f"OT: {ot_code}")
     st.markdown(f"### SKU: {sku_expected}")
 
-    # Título con wrap garantizado (para ubicaciones/UBC al final)
+    # Mostrar UBC en línea separada para que SIEMPRE se vea, pero mantener el título completo tal cual.
+    if ubc_any:
+        st.markdown(f"**UBC:** {ubc_any}")
+
+    # Título con wrap garantizado (sin cortar)
     st.markdown(
-        f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{producto_full}</div></div>',
+        f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{full_title}</div></div>',
         unsafe_allow_html=True
     )
 
     st.markdown(f"### Solicitado: {qty_total}")
-    if s["scan_status"] == "ok":
+## {titulo_main}")
+    if ubc:
+        st.markdown(f"**UBC:** {ubc}")
+    st.markdown(f"### Solicitado: {qty_total}")
+if s["scan_status"] == "ok":
         st.markdown(f'<span class="scanok ok">✅ OK</span> {s["scan_msg"]}', unsafe_allow_html=True)
     elif s["scan_status"] == "bad":
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
