@@ -780,26 +780,80 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
 # IMPORTAR VENTAS (FLEX)
 # =========================
 def import_sales_excel(file) -> pd.DataFrame:
+    # Reporte "Ventas CL" de Mercado Libre (exportación Excel)
+    # Ojo: cuando hay "Paquete de X productos", el archivo trae:
+    #   - 1 fila "cabecera" con Estado = "Paquete de X productos" (sin SKU/qty útil)
+    #   - X filas siguientes con los ítems del paquete (con SKU/qty), pero sin totales.
+    #
+    # Para que el KPI "Ventas" represente "paquetes/envíos" (lo que tú cuentas por colores),
+    # agrupamos las filas de ítems bajo el ID de la cabecera del paquete.
     df = pd.read_excel(file, header=[4, 5])
     df.columns = [" | ".join([str(x) for x in col if str(x) != "nan"]) for col in df.columns]
 
     COLUMN_ORDER_ID = "Ventas | # de venta"
+    COLUMN_STATE = "Ventas | Estado"
     COLUMN_QTY = "Ventas | Unidades"
     COLUMN_SKU = "Publicaciones | SKU"
     COLUMN_TITLE = "Publicaciones | Título de la publicación"
     COLUMN_BUYER = "Compradores | Comprador"
 
-    required = [COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
+    required = [COLUMN_ORDER_ID, COLUMN_STATE, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Faltan columnas: {missing}")
 
-    work = df[[COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]].copy()
-    work.columns = ["ml_order_id", "qty", "sku_ml", "title_ml", "buyer"]
+    work = df[[COLUMN_ORDER_ID, COLUMN_STATE, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]].copy()
+    work.columns = ["raw_order_id", "raw_state", "qty", "sku_ml", "title_ml", "buyer"]
+
+    # normalizaciones
+    work["raw_order_id"] = work["raw_order_id"].astype(str).str.strip()
+    work["raw_state"] = work["raw_state"].astype(str).str.strip()
     work["qty"] = pd.to_numeric(work["qty"], errors="coerce").fillna(0).astype(int)
-    work = work[work["qty"] > 0]
     work["sku_ml"] = work["sku_ml"].apply(normalize_sku)
+
+    # Asignación de "ml_order_id" (venta/paquete)
+    ml_ids = []
+    pkg_id = None
+    pkg_remaining = 0
+
+    for _, row in work.iterrows():
+        state = (row["raw_state"] or "").strip()
+        oid = (row["raw_order_id"] or "").strip()
+
+        # Detecta cabecera de paquete: "Paquete de 2 productos"
+        if state.lower().startswith("paquete de"):
+            m = re.search(r"(\d+)", state)
+            n = int(m.group(1)) if m else 0
+            if n > 0:
+                pkg_id = oid
+                pkg_remaining = n
+            else:
+                pkg_id = None
+                pkg_remaining = 0
+            ml_ids.append(None)  # cabecera NO es ítem
+            continue
+
+        # Filas de ítems reales
+        if int(row["qty"]) > 0 and row["sku_ml"]:
+            if pkg_id and pkg_remaining > 0:
+                ml_ids.append(pkg_id)
+                pkg_remaining -= 1
+                if pkg_remaining <= 0:
+                    pkg_id = None
+            else:
+                ml_ids.append(oid)
+        else:
+            ml_ids.append(None)
+
+    work["ml_order_id"] = ml_ids
+
+    # Deja solo ítems válidos
+    work = work[(work["ml_order_id"].notna()) & (work["qty"] > 0)].copy()
+
+    # Salida estándar
+    work["ml_order_id"] = work["ml_order_id"].astype(str).str.strip()
     return work[["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"]]
+
 
 
 def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pickers: int):
@@ -2030,7 +2084,7 @@ def page_admin():
     st.subheader("Resumen")
     c.execute("SELECT COUNT(DISTINCT ml_order_id) FROM orders")
     n_orders = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM order_items")
+    c.execute("SELECT COALESCE(SUM(qty),0) FROM order_items")
     n_items = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM picking_ots")
     n_ots = c.fetchone()[0]
@@ -2039,7 +2093,7 @@ def page_admin():
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Ventas", n_orders)
-    col2.metric("Líneas", n_items)
+    col2.metric("Unidades", n_items)
     col3.metric("OTs", n_ots)
     col4.metric("Incidencias", n_inc)
 
