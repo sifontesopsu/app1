@@ -780,28 +780,104 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
 # IMPORTAR VENTAS (FLEX)
 # =========================
 def import_sales_excel(file) -> pd.DataFrame:
+    """Importa reporte de ventas ML.
+
+    Importante: en los reportes de ML, los envíos con varios productos vienen con una fila
+    de cabecera 'Paquete de X productos' (sin SKU / sin unidades) y luego X filas con los ítems.
+    Para que el KPI 'Ventas' refleje lo que tú ves por colores (paquetes/envíos), agrupamos esos
+    ítems bajo el ID de la fila cabecera.
+    """
     df = pd.read_excel(file, header=[4, 5])
     df.columns = [" | ".join([str(x) for x in col if str(x) != "nan"]) for col in df.columns]
 
     COLUMN_ORDER_ID = "Ventas | # de venta"
+    COLUMN_STATUS = "Ventas | Estado"
     COLUMN_QTY = "Ventas | Unidades"
     COLUMN_SKU = "Publicaciones | SKU"
     COLUMN_TITLE = "Publicaciones | Título de la publicación"
     COLUMN_BUYER = "Compradores | Comprador"
 
-    required = [COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
+    required = [COLUMN_ORDER_ID, COLUMN_STATUS, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Faltan columnas: {missing}")
 
-    work = df[[COLUMN_ORDER_ID, COLUMN_QTY, COLUMN_SKU, COLUMN_TITLE, COLUMN_BUYER]].copy()
-    work.columns = ["ml_order_id", "qty", "sku_ml", "title_ml", "buyer"]
-    work["qty"] = pd.to_numeric(work["qty"], errors="coerce").fillna(0).astype(int)
-    work = work[work["qty"] > 0]
-    work["sku_ml"] = work["sku_ml"].apply(normalize_sku)
-    return work[["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"]]
+    # Normalizamos a texto para trabajar seguro
+    work = df[required].copy()
+    work.columns = ["ml_order_id", "status", "qty", "sku_ml", "title_ml", "buyer"]
 
+    # Helpers
+    def _clean_str(x) -> str:
+        if pd.isna(x):
+            return ""
+        return str(x).strip()
 
+    records = []
+    current_pkg_id = None
+    current_pkg_buyer = ""
+    remaining_items = 0
+
+    pkg_re = re.compile(r"^Paquete\s+de\s+(\d+)\s+productos?$", re.IGNORECASE)
+
+    for _, r in work.iterrows():
+        status = _clean_str(r.get("status"))
+        ml_id = _clean_str(r.get("ml_order_id"))
+        buyer = _clean_str(r.get("buyer"))
+        sku = _clean_str(r.get("sku_ml"))
+        title = _clean_str(r.get("title_ml"))
+        qty = pd.to_numeric(r.get("qty"), errors="coerce")
+
+        # Detecta fila cabecera del paquete (no trae SKU/qty)
+        m = pkg_re.match(status)
+        if m:
+            try:
+                remaining_items = int(m.group(1))
+            except Exception:
+                remaining_items = 0
+            current_pkg_id = ml_id if ml_id else None
+            current_pkg_buyer = buyer
+            continue
+
+        # Filas sin SKU/qty -> se ignoran
+        if not sku or pd.isna(qty):
+            continue
+
+        qty_int = int(qty) if not pd.isna(qty) else 0
+        if qty_int <= 0:
+            continue
+
+        sku_norm = normalize_sku(sku)
+
+        # Si estamos dentro de un paquete, agrupamos bajo el ID del paquete
+        if current_pkg_id and remaining_items > 0:
+            records.append(
+                {
+                    "ml_order_id": current_pkg_id,
+                    "buyer": current_pkg_buyer or buyer,
+                    "sku_ml": sku_norm,
+                    "title_ml": title,
+                    "qty": qty_int,
+                }
+            )
+            remaining_items -= 1
+            if remaining_items <= 0:
+                current_pkg_id = None
+                current_pkg_buyer = ""
+            continue
+
+        # Venta normal (1 producto)
+        records.append(
+            {
+                "ml_order_id": ml_id,
+                "buyer": buyer,
+                "sku_ml": sku_norm,
+                "title_ml": title,
+                "qty": qty_int,
+            }
+        )
+
+    out = pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
+    return out
 def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pickers: int):
     conn = get_conn()
     c = conn.cursor()
