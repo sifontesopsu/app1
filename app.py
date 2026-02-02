@@ -2440,6 +2440,29 @@ def upsert_labels_to_db(manifest_id: int, pack_map: dict, raw: str):
     conn.commit()
     conn.close()
 
+
+def apply_labels_to_existing_items(manifest_id: int):
+    """Propaga shipment_id/buyer/address desde sorting_labels hacia sorting_run_items ya creados.
+    Útil cuando se cargan etiquetas DESPUÉS de crear corridas.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    # Solo actualizar campos vacíos o nulos para no pisar datos ya confirmados/manuales
+    c.execute(
+        """UPDATE sorting_run_items
+               SET shipment_id = COALESCE(shipment_id, (SELECT l.shipment_id FROM sorting_labels l
+                                                      WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id)),
+                   buyer       = CASE WHEN (buyer IS NULL OR buyer='') THEN (SELECT l.buyer FROM sorting_labels l
+                                                      WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id) ELSE buyer END,
+                   address     = CASE WHEN (address IS NULL OR address='') THEN (SELECT l.address FROM sorting_labels l
+                                                      WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id) ELSE address END
+             WHERE run_id IN (SELECT id FROM sorting_runs WHERE manifest_id=?);""",
+        (manifest_id, manifest_id, manifest_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_map_sku: dict, barcode_to_sku: dict):
     # assignments: page_no -> mesa
     conn = get_conn()
@@ -2514,6 +2537,10 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                 raw = raw_bytes.decode("utf-8", errors="ignore")
                 pack_map, ship_map = parse_zpl_labels(raw)
                 upsert_labels_to_db(mid, pack_map, raw)
+                apply_labels_to_existing_items(mid)
+                st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
+                apply_labels_to_existing_items(mid)
+                st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
                 st.session_state["sorting_last_zpl_hash"] = zpl_hash
                 st.success("Etiquetas cargadas/actualizadas para el manifiesto activo.")
             else:
@@ -2575,6 +2602,10 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                 raw = raw_bytes.decode("utf-8", errors="ignore")
                 pack_map, ship_map = parse_zpl_labels(raw)
                 upsert_labels_to_db(mid, pack_map, raw)
+                apply_labels_to_existing_items(mid)
+                st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
+                apply_labels_to_existing_items(mid)
+                st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
                 st.session_state["sorting_last_zpl_hash"] = zpl_hash
     mid = st.session_state.sorting_manifest_id
     pages = st.session_state.sorting_parsed_pages
