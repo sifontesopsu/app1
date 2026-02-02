@@ -2206,6 +2206,18 @@ def get_active_sorting_manifest():
         return None
     return {"id": row[0], "name": row[1], "created_at": row[2], "status": row[3]}
 
+
+def get_sorting_manifest_by_id(manifest_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, name, created_at, status FROM sorting_manifests WHERE id=?;", (int(manifest_id),))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "name": row[1], "created_at": row[2], "status": row[3]}
+
+
 def create_sorting_manifest(name: str):
     conn = get_conn()
     c = conn.cursor()
@@ -2382,51 +2394,72 @@ def upsert_labels_to_db(manifest_id: int, pack_map: dict, raw: str):
     conn.close()
 
 def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_map_sku: dict, barcode_to_sku: dict):
-    # assignments: page_no -> mesa
+    """Crea/actualiza corridas (1 página = 1 corrida) y sus items.
+
+    FIXES:
+    - UPSERT real: si ya existe (manifest_id,page_no) se actualiza mesa y se re-activa a PENDING.
+    - Limpia closed_at al reactivar.
+    """
     conn = get_conn()
     c = conn.cursor()
+
+    # asegurar manifiesto activo (si venía marcado DONE por un cierre prematuro)
+    try:
+        c.execute("UPDATE sorting_manifests SET status='ACTIVE' WHERE id=?;", (int(manifest_id),))
+    except Exception:
+        pass
+
     # load labels for this manifest
     c.execute("SELECT pack_id, shipment_id, buyer, address FROM sorting_labels WHERE manifest_id=?;", (manifest_id,))
     label_rows = c.fetchall()
     labels = {r[0]: {"shipment_id": r[1], "buyer": r[2], "address": r[3]} for r in label_rows}
 
     for page in pages:
-        pno = page["page_no"]
+        pno = int(page["page_no"])
         mesa = assignments.get(pno)
         if not mesa:
             continue
+        mesa = int(mesa)
+
+        # UPSERT: actualizar mesa/estado si ya existía
         c.execute(
             """INSERT INTO sorting_runs (manifest_id, page_no, mesa, status, created_at, closed_at)
-               VALUES (?,?,?,?,?,NULL)
-               ON CONFLICT(manifest_id, page_no) DO UPDATE SET
-                   mesa=excluded.mesa,
-                   status='PENDING',
-                   closed_at=NULL;""",
-            (manifest_id, pno, int(mesa), "PENDING", now_iso())
+                 VALUES (?,?,?,?,?,NULL)
+                 ON CONFLICT(manifest_id, page_no) DO UPDATE SET
+                    mesa=excluded.mesa,
+                    status='PENDING',
+                    closed_at=NULL;""",
+            (int(manifest_id), pno, mesa, "PENDING", now_iso())
         )
+
         c.execute("SELECT id FROM sorting_runs WHERE manifest_id=? AND page_no=?;", (manifest_id, pno))
         run_id = c.fetchone()[0]
-        # clear previous items if re-created
+
+        # clear previous items if re-created (misma corrida)
         c.execute("DELETE FROM sorting_run_items WHERE run_id=?;", (run_id,))
+
         for it in page["items"]:
             sku = str(it.get("sku") or "").strip()
             title_ml = (it.get("title_ml") or "").strip()
-            # translate using maestro
             title_tec = inv_map_sku.get(sku, "") if inv_map_sku else ""
+
             buyer = it.get("buyer") or ""
             pack_id = it.get("pack_id") or ""
+
             ship = labels.get(pack_id, {}).get("shipment_id") if pack_id else None
             addr = labels.get(pack_id, {}).get("address") if pack_id else None
             buyer2 = labels.get(pack_id, {}).get("buyer") if pack_id else None
             if buyer2 and not buyer:
                 buyer = buyer2
+
             c.execute(
                 """INSERT INTO sorting_run_items
                     (run_id, seq, ml_order_id, pack_id, sku, title_ml, title_tec, qty, buyer, address, shipment_id, status)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?, 'PENDING');""",
-                (run_id, it["seq"], it.get("ml_order_id"), pack_id, sku, title_ml, title_tec, int(it.get("qty") or 1),
-                 buyer, addr, ship)
+                (run_id, it["seq"], it.get("ml_order_id"), pack_id, sku, title_ml, title_tec,
+                 int(it.get("qty") or 1), buyer, addr, ship)
             )
+
     conn.commit()
     conn.close()
 
@@ -2435,6 +2468,13 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
     st.caption("Carga 1 manifiesto (Control PDF) y asigna TODAS las páginas a mesas. 1 página = 1 mesa.")
 
     active = get_active_sorting_manifest()
+
+    # Si por un bug anterior quedó un manifest_id en sesión pero en BD ya no está ACTIVE, limpiamos sesión
+    if not active and st.session_state.get("sorting_manifest_id"):
+        mrow = get_sorting_manifest_by_id(st.session_state.get("sorting_manifest_id"))
+        if (mrow is None) or (mrow.get("status") != "ACTIVE"):
+            for k in ["sorting_manifest_id", "sorting_parsed_pages", "sorting_manifest_name", "sorting_assignments", "sorting_last_zpl_hash"]:
+                st.session_state.pop(k, None)
 
     # Siempre permitir cargar etiquetas y/o continuar asignación para el manifiesto ACTIVO.
     if active:
@@ -2554,17 +2594,32 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
         st.rerun()
 
 def get_next_run_for_mesa(mesa: int):
+    """Devuelve la siguiente corrida NO terminada para una mesa.
+    Preferimos el manifiesto ACTIVE si existe (evita mezclar pendientes antiguos).
+    """
+    active = get_active_sorting_manifest()
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        """SELECT r.id, r.page_no, r.status, m.name
-             FROM sorting_runs r
-             JOIN sorting_manifests m ON m.id=r.manifest_id
-             WHERE r.mesa=? AND r.status!='DONE'
-             ORDER BY r.page_no ASC, r.id ASC
-             LIMIT 1;""",
-        (int(mesa),)
-    )
+    if active:
+        c.execute(
+            """SELECT r.id, r.page_no, r.status, m.name
+                 FROM sorting_runs r
+                 JOIN sorting_manifests m ON m.id=r.manifest_id
+                 WHERE r.mesa=? AND r.manifest_id=? AND r.status!='DONE'
+                 ORDER BY r.page_no ASC, r.id
+                 LIMIT 1;""",
+            (int(mesa), int(active["id"]))
+        )
+    else:
+        c.execute(
+            """SELECT r.id, r.page_no, r.status, m.name
+                 FROM sorting_runs r
+                 JOIN sorting_manifests m ON m.id=r.manifest_id
+                 WHERE r.mesa=? AND r.status!='DONE'
+                 ORDER BY r.page_no ASC, r.id
+                 LIMIT 1;""",
+            (int(mesa),)
+        )
     row = c.fetchone()
     conn.close()
     if not row:
@@ -2636,27 +2691,31 @@ def maybe_close_run(run_id: int):
     conn.close()
 
 def maybe_close_manifest_if_done():
-    """Cierra el manifiesto ACTIVO solo cuando:
-    - existen corridas creadas (total_runs > 0) y
-    - todas están en DONE (remaining_not_done == 0).
-    Evita el bug de cerrar manifiestos recién creados (0 corridas)."""
+    """Cierra el manifiesto activo SOLO cuando corresponde.
+
+    FIX:
+    - Antes se cerraba si rem==0, lo que incluye el caso 'aún no se han creado corridas' (total_runs==0).
+      Eso hacía que Camarero/Admin dijeran: 'No hay corridas' / 'No hay manifiesto activo'.
+    """
     active = get_active_sorting_manifest()
     if not active:
         return
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=?;", (active["id"],))
-    total = int(c.fetchone()[0] or 0)
-    if total == 0:
-        conn.close()
-        return
+    total_runs = int(c.fetchone()[0] or 0)
     c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=? AND status!='DONE';", (active["id"],))
-    rem = int(c.fetchone()[0] or 0)
+    remaining = int(c.fetchone()[0] or 0)
     conn.close()
-    if rem == 0:
+
+    # Si aún no se han creado corridas, NO cerrar el manifiesto.
+    if total_runs == 0:
+        return
+
+    if remaining == 0:
         mark_manifest_done(active["id"])
-        # clear session state (solo Sorting)
-        for k in ["sorting_manifest_id","sorting_parsed_pages","sorting_manifest_name","sorting_assignments","sorting_last_zpl_hash"]:
+        # clear session state
+        for k in ["sorting_manifest_id", "sorting_parsed_pages", "sorting_manifest_name", "sorting_assignments"]:
             st.session_state.pop(k, None)
 
 def page_sorting_camarero(inv_map_sku: dict, barcode_to_sku: dict):
