@@ -2222,6 +2222,33 @@ def mark_manifest_done(manifest_id: int):
     conn.commit()
     conn.close()
 
+from typing import Optional
+
+
+def reset_sorting_all(manifest_id: Optional[int] = None):
+    """Borra TODO lo relacionado a Sorting.
+    Si manifest_id es None, borra todas las tablas sorting_* (recuperación ante estados corruptos).
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        if manifest_id is None:
+            c.execute("DELETE FROM sorting_run_items;")
+            c.execute("DELETE FROM sorting_runs;")
+            c.execute("DELETE FROM sorting_labels;")
+            c.execute("DELETE FROM sorting_manifests;")
+        else:
+            # Primero items (dependen de runs)
+            c.execute("""DELETE FROM sorting_run_items
+                         WHERE run_id IN (SELECT id FROM sorting_runs WHERE manifest_id=?);""", (manifest_id,))
+            c.execute("DELETE FROM sorting_runs WHERE manifest_id=?;", (manifest_id,))
+            c.execute("DELETE FROM sorting_labels WHERE manifest_id=?;", (manifest_id,))
+            c.execute("DELETE FROM sorting_manifests WHERE id=?;", (manifest_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def decode_fh(text: str) -> str:
     # ZPL ^FH uses _HH hex escapes
     def repl(m):
@@ -2911,7 +2938,35 @@ def page_sorting_camarero(inv_map_sku: dict, barcode_to_sku: dict):
         st.rerun()
 def page_sorting_admin():
     st.header("📊 Admin")
+
+    # Reiniciar corrida (BORRA TODO) - SOLO Sorting
+    st.markdown("### 🧹 Reiniciar corrida")
+    st.caption("Borra el manifiesto activo y todas sus corridas/items/etiquetas. Úsalo solo si necesitas partir de cero.")
     active = get_active_sorting_manifest()
+
+    # Confirmación en 2 pasos para evitar clic accidental
+    if st.checkbox("Entiendo que esto borrará TODO el Sorting actual", key="sorting_reset_ack"):
+        if st.button("🗑️ Reiniciar corrida (BORRA TODO)", type="primary"):
+            try:
+                reset_sorting_all(active["id"] if active else None)
+            except Exception as e:
+                st.error(f"No pude reiniciar: {e}")
+                return
+
+            # Limpieza de estado en sesión (Sorting + Camarero)
+            for k in [
+                "sorting_assignments",
+                "sorting_last_zpl_hash",
+                "sorting_manifest_name",
+                "sorting_parsed_pages",
+                "camarero_label_scan",
+                "camarero_sku_scan",
+            ]:
+                st.session_state.pop(k, None)
+
+            st.success("Sorting reiniciado. Puedes cargar un manifiesto nuevo.")
+            st.rerun()
+
     if not active:
         st.info("No hay manifiesto activo.")
         return
