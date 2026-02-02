@@ -362,6 +362,16 @@ def init_db():
         UNIQUE(manifest_id, page_no)
     );
     """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS sorting_page_assignments (
+        manifest_id INTEGER,
+        page_no INTEGER,
+        mesa INTEGER,
+        created_at TEXT,
+        PRIMARY KEY (manifest_id, page_no)
+    );
+    """)
     c.execute("""
     CREATE TABLE IF NOT EXISTS sorting_run_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2254,6 +2264,35 @@ def mark_manifest_done(manifest_id: int):
     conn.commit()
     conn.close()
 
+
+def get_page_assignments(manifest_id: int) -> dict:
+    """Devuelve {page_no: mesa} persistido en DB para el manifiesto."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT page_no, mesa FROM sorting_page_assignments WHERE manifest_id=? ORDER BY page_no ASC;", (int(manifest_id),))
+    rows = c.fetchall()
+    conn.close()
+    return {int(p): int(m) for (p, m) in rows}
+
+def upsert_page_assignment(manifest_id: int, page_no: int, mesa: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO sorting_page_assignments (manifest_id, page_no, mesa, created_at)
+           VALUES (?,?,?,?)
+           ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""",
+        (int(manifest_id), int(page_no), int(mesa), now_iso())
+    )
+    conn.commit()
+    conn.close()
+
+def clear_page_assignments(manifest_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM sorting_page_assignments WHERE manifest_id=?;", (int(manifest_id),))
+    conn.commit()
+    conn.close()
+
 from typing import Optional
 
 
@@ -2265,6 +2304,8 @@ def reset_sorting_all(manifest_id: Optional[int] = None):
     c = conn.cursor()
     try:
         if manifest_id is None:
+            # Borrado total (recuperación)
+            c.execute("DELETE FROM sorting_page_assignments;")
             c.execute("DELETE FROM sorting_run_items;")
             c.execute("DELETE FROM sorting_runs;")
             c.execute("DELETE FROM sorting_labels;")
@@ -2616,8 +2657,6 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                 upsert_labels_to_db(mid, pack_map, raw)
                 apply_labels_to_existing_items(mid)
                 st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
-                apply_labels_to_existing_items(mid)
-                st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
                 st.session_state["sorting_last_zpl_hash"] = zpl_hash
                 st.success("Etiquetas cargadas/actualizadas para el manifiesto activo.")
             else:
@@ -2671,6 +2710,8 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
 
         # create manifest row now (robusto: no depender solo de session_state)
         mid = ensure_active_manifest(manifest_name)
+        st.session_state.sorting_manifest_id = mid
+        st.session_state.sorting_parsed_pages = pages
         # store labels if uploaded (sin bucles)
         if zpl is not None:
             raw_bytes = zpl.getvalue()
@@ -2681,34 +2722,39 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                 upsert_labels_to_db(mid, pack_map, raw)
                 apply_labels_to_existing_items(mid)
                 st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
-                apply_labels_to_existing_items(mid)
-                st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
                 st.session_state["sorting_last_zpl_hash"] = zpl_hash
+
+    # Manifest y páginas ya definidas
     mid = st.session_state.sorting_manifest_id
     pages = st.session_state.sorting_parsed_pages
 
     st.subheader("Asignación de páginas a mesas (obligatorio)")
     st.write(f"Páginas detectadas: **{len(pages)}**. Debes asignar TODAS para continuar.")
-    # assignment UI
-    assignments = st.session_state.get("sorting_assignments", {})
+
+    # Persistimos asignaciones en DB (para que un rerun al subir etiquetas NO las borre)
+    assignments = get_page_assignments(mid)
+
     used_pages = set(assignments.keys())
     cols = st.columns(3)
     with cols[0]:
         mesa_sel = st.selectbox("Mesa", list(range(1, NUM_MESAS+1)), key="mesa_sel")
     with cols[1]:
-        unassigned = [p["page_no"] for p in pages if p["page_no"] not in used_pages]
-        page_sel = st.selectbox("Página sin asignar", unassigned if unassigned else [p["page_no"] for p in pages], key="page_sel")
+        unassigned = [int(p["page_no"]) for p in pages if int(p["page_no"]) not in used_pages]
+        page_sel = st.selectbox(
+            "Página sin asignar",
+            unassigned if unassigned else [int(p["page_no"]) for p in pages],
+            key="page_sel"
+        )
     with cols[2]:
         if st.button("➕ Asignar"):
-            assignments[int(page_sel)] = int(mesa_sel)
-            st.session_state.sorting_assignments = assignments
+            upsert_page_assignment(mid, int(page_sel), int(mesa_sel))
             st.rerun()
 
     # show table
-    df_assign = pd.DataFrame([{"Página": p["page_no"], "Mesa": assignments.get(p["page_no"], "")} for p in pages])
+    df_assign = pd.DataFrame([{"Página": int(p["page_no"]), "Mesa": assignments.get(int(p["page_no"]), "")} for p in pages])
     st.dataframe(df_assign, use_container_width=True, hide_index=True)
 
-    missing = [p["page_no"] for p in pages if p["page_no"] not in assignments]
+    missing = [int(p["page_no"]) for p in pages if int(p["page_no"]) not in assignments]
     if missing:
         st.error(f"Faltan páginas por asignar: {missing}")
         st.stop()
