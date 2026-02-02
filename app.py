@@ -2396,7 +2396,13 @@ def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_
         if not mesa:
             continue
         c.execute(
-            "INSERT OR IGNORE INTO sorting_runs (manifest_id, page_no, mesa, status, created_at) VALUES (?,?,?,?,?);",
+            """INSERT INTO sorting_runs (manifest_id, page_no, mesa, status, created_at, closed_at)
+               VALUES (?,?,?,?,?,NULL)
+               ON CONFLICT(manifest_id, page_no) DO UPDATE SET
+                 mesa=excluded.mesa,
+                 status='PENDING',
+                 created_at=excluded.created_at,
+                 closed_at=NULL;""",
             (manifest_id, pno, int(mesa), "PENDING", now_iso())
         )
         c.execute("SELECT id FROM sorting_runs WHERE manifest_id=? AND page_no=?;", (manifest_id, pno))
@@ -2497,6 +2503,11 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
             return
 
         manifest_name = getattr(pdf, "name", "manifiesto.pdf")
+        # Bloqueo: si ya hay un manifiesto en curso en sesión, no permitimos cambiar el PDF por otro distinto
+        if "sorting_manifest_id" in st.session_state and st.session_state.get("sorting_manifest_name") and st.session_state.get("sorting_manifest_name") != manifest_name:
+            st.error("Ya hay un manifiesto en curso. No puedes cargar otro PDF distinto hasta finalizar el manifiesto actual.")
+            st.stop()
+
         if "sorting_parsed_pages" not in st.session_state or st.session_state.get("sorting_manifest_name") != manifest_name:
             st.session_state.sorting_parsed_pages = pages
             st.session_state.sorting_manifest_name = manifest_name
