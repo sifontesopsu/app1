@@ -11,7 +11,7 @@ import html
 # =========================
 # CONFIG
 # =========================
-DB_NAME = "aurora_ml.db"
+DB_NAME = os.path.join(os.path.dirname(__file__), "aurora_ml.db")
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
 
@@ -2647,8 +2647,14 @@ def maybe_close_manifest_if_done():
         return
     conn = get_conn()
     c = conn.cursor()
+    # Solo cerrar si EXISTEN corridas creadas.
+    c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=?;", (active["id"],))
+    total = int(c.fetchone()[0] or 0)
+    if total == 0:
+        conn.close()
+        return
     c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=? AND status!='DONE';", (active["id"],))
-    rem = c.fetchone()[0]
+    rem = int(c.fetchone()[0] or 0)
     conn.close()
     if rem == 0:
         mark_manifest_done(active["id"])
