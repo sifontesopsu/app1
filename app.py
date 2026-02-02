@@ -2318,12 +2318,20 @@ def parse_zpl_labels(raw: str):
     for b in blocks:
         if "^XZ" not in b:
             continue
-        # shipment id from barcode
+        # shipment id
         ship = None
-        m = re.search(r"\^FD>:\s*(\d{6,20})", b)
+        # 1) from printed 'Envio:' text (often split across fields in ZPL)
+        m = re.search(r"Envio:\s*([0-9 ]{6,30})", dec_b, flags=re.IGNORECASE)
         if m:
-            ship = m.group(1)
-        # shipment id from QR JSON
+            ship = re.sub(r"\s+", "", m.group(1))
+
+        # 2) from barcode payload (some formats use ^FD>:123...)
+        if not ship:
+            m = re.search(r"\^FD>:\s*(\d{6,20})", b)
+            if m:
+                ship = m.group(1)
+
+        # 3) from QR JSON payload
         if not ship:
             m = re.search(r'"id"\s*:\s*"(\d{6,20})"', b)
             if m:
@@ -2368,20 +2376,62 @@ def parse_zpl_labels(raw: str):
     return pack_map, ship_map
 
 def parse_control_pdf_by_page(pdf_file):
+    """
+    Parse Control.pdf by page into a list of dicts: [{"page_no":1,"items":[...]}]
+
+    IMPORTANT:
+    - Control.pdf often has *no* selectable text for extract_text(), but pdfplumber
+      can still return words via extract_words(). We therefore build "lines"
+      from words (grouped by y) as a fallback.
+    - We also capture the shipment_id (envío) line which is typically a 10-15 digit
+      number near the top of each block.
+    """
     if not HAS_PDF_LIB:
         st.error("Falta pdfplumber en el entorno.")
         return None
+
+    def _lines_from_words(page):
+        words = page.extract_words() or []
+        if not words:
+            return []
+        # group by y (top) rounded to reduce jitter
+        buckets = {}
+        for w in words:
+            y = int(round(float(w.get("top", 0)) / 3.0) * 3)  # 3px bins
+            buckets.setdefault(y, []).append(w)
+        lines = []
+        for y in sorted(buckets.keys()):
+            row = sorted(buckets[y], key=lambda x: float(x.get("x0", 0)))
+            txt = " ".join([str(w.get("text", "")).strip() for w in row if str(w.get("text", "")).strip()])
+            txt = re.sub(r"\s+", " ", txt).strip()
+            if txt:
+                lines.append(txt)
+        return lines
+
     pages = []
     with pdfplumber.open(pdf_file) as pdf:
         for pno, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            lines = [x.strip() for x in text.split("\n") if x.strip()]
+            raw_text = page.extract_text() or ""
+            lines = [x.strip() for x in raw_text.split("\n") if x.strip()]
+            if not lines:
+                lines = _lines_from_words(page)
+
             items = []
             seq = 0
             current_pack = None
             current_order = None
             current_buyer = None
+            current_shipment = None
+
             for ln in lines:
+                # shipment id (envío) usually appears as a standalone long number
+                mship = re.search(r"\b(\d{10,15})\b", ln)
+                if mship and (ln.strip() == mship.group(1) or ln.strip().startswith(mship.group(1))):
+                    # avoid accidentally capturing pack/order (they are longer ~ 14+ but context differs)
+                    # we accept if line has no 'Pack'/'Venta' text
+                    if "Pack" not in ln and "Venta" not in ln and "SKU" not in ln:
+                        current_shipment = mship.group(1)
+
                 # detect pack/order
                 m = re.search(r"Pack ID:\s*(\d+)", ln)
                 if m:
@@ -2395,6 +2445,7 @@ def parse_control_pdf_by_page(pdf_file):
                 if m:
                     current_buyer = m.group(1).strip()
                     continue
+
                 # SKU + qty line sometimes combined
                 msku = re.search(r"SKU:\s*([0-9A-Za-z]+)", ln)
                 mqty = re.search(r"Cantidad:\s*(\d+)", ln)
@@ -2406,20 +2457,22 @@ def parse_control_pdf_by_page(pdf_file):
                         "seq": seq,
                         "ml_order_id": current_order,
                         "pack_id": current_pack,
+                        "shipment_id": current_shipment,
                         "sku": sku,
                         "qty": qty,
                         "title_ml": "",
                         "buyer": current_buyer
                     })
                     continue
+
                 # title line heuristics: if line looks like product title and last item has empty title
                 if items and not items[-1]["title_ml"]:
-                    # avoid attribute lines like "Acabado: Mate"
                     if ":" in ln and not re.search(r"\bMELI\b", ln, re.IGNORECASE):
-                        # treat as attribute not title
+                        # attribute line
                         pass
                     else:
                         items[-1]["title_ml"] = ln[:200]
+
             pages.append({"page_no": pno, "items": items})
     return pages
 
@@ -2521,8 +2574,8 @@ def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_
             title_tec = inv_map_sku.get(sku, "") if inv_map_sku else ""
             buyer = it.get("buyer") or ""
             pack_id = it.get("pack_id") or ""
-            ship = labels.get(pack_id, {}).get("shipment_id") if pack_id else None
-            addr = labels.get(pack_id, {}).get("address") if pack_id else None
+            ship = (it.get("shipment_id") or (labels.get(pack_id, {}).get("shipment_id") if pack_id else None))
+            addr = (labels.get(pack_id, {}).get("address") if pack_id else None)
             buyer2 = labels.get(pack_id, {}).get("buyer") if pack_id else None
             if buyer2 and not buyer:
                 buyer = buyer2
