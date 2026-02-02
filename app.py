@@ -2576,7 +2576,7 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                 pack_map, ship_map = parse_zpl_labels(raw)
                 upsert_labels_to_db(mid, pack_map, raw)
                 st.session_state["sorting_last_zpl_hash"] = zpl_hash
- mid = st.session_state.sorting_manifest_id
+    mid = st.session_state.sorting_manifest_id
     pages = st.session_state.sorting_parsed_pages
 
     st.subheader("Asignación de páginas a mesas (obligatorio)")
