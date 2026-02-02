@@ -11,7 +11,7 @@ import html
 # =========================
 # CONFIG
 # =========================
-DB_NAME = os.path.join(os.path.dirname(__file__), "aurora_ml.db")
+DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
 
@@ -2399,10 +2399,9 @@ def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_
             """INSERT INTO sorting_runs (manifest_id, page_no, mesa, status, created_at, closed_at)
                VALUES (?,?,?,?,?,NULL)
                ON CONFLICT(manifest_id, page_no) DO UPDATE SET
-                 mesa=excluded.mesa,
-                 status='PENDING',
-                 created_at=excluded.created_at,
-                 closed_at=NULL;""",
+                   mesa=excluded.mesa,
+                   status='PENDING',
+                   closed_at=NULL;""",
             (manifest_id, pno, int(mesa), "PENDING", now_iso())
         )
         c.execute("SELECT id FROM sorting_runs WHERE manifest_id=? AND page_no=?;", (manifest_id, pno))
@@ -2503,11 +2502,6 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
             return
 
         manifest_name = getattr(pdf, "name", "manifiesto.pdf")
-        # Bloqueo: si ya hay un manifiesto en curso en sesión, no permitimos cambiar el PDF por otro distinto
-        if "sorting_manifest_id" in st.session_state and st.session_state.get("sorting_manifest_name") and st.session_state.get("sorting_manifest_name") != manifest_name:
-            st.error("Ya hay un manifiesto en curso. No puedes cargar otro PDF distinto hasta finalizar el manifiesto actual.")
-            st.stop()
-
         if "sorting_parsed_pages" not in st.session_state or st.session_state.get("sorting_manifest_name") != manifest_name:
             st.session_state.sorting_parsed_pages = pages
             st.session_state.sorting_manifest_name = manifest_name
@@ -2642,12 +2636,15 @@ def maybe_close_run(run_id: int):
     conn.close()
 
 def maybe_close_manifest_if_done():
+    """Cierra el manifiesto ACTIVO solo cuando:
+    - existen corridas creadas (total_runs > 0) y
+    - todas están en DONE (remaining_not_done == 0).
+    Evita el bug de cerrar manifiestos recién creados (0 corridas)."""
     active = get_active_sorting_manifest()
     if not active:
         return
     conn = get_conn()
     c = conn.cursor()
-    # Solo cerrar si EXISTEN corridas creadas.
     c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=?;", (active["id"],))
     total = int(c.fetchone()[0] or 0)
     if total == 0:
@@ -2658,8 +2655,8 @@ def maybe_close_manifest_if_done():
     conn.close()
     if rem == 0:
         mark_manifest_done(active["id"])
-        # clear session state
-        for k in ["sorting_manifest_id","sorting_parsed_pages","sorting_manifest_name","sorting_assignments"]:
+        # clear session state (solo Sorting)
+        for k in ["sorting_manifest_id","sorting_parsed_pages","sorting_manifest_name","sorting_assignments","sorting_last_zpl_hash"]:
             st.session_state.pop(k, None)
 
 def page_sorting_camarero(inv_map_sku: dict, barcode_to_sku: dict):
