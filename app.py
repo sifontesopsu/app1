@@ -2715,7 +2715,7 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
             raw_bytes = zpl.getvalue()
             zpl_hash = hashlib.md5(raw_bytes).hexdigest()
             if st.session_state.get("sorting_last_zpl_hash") != zpl_hash:
-                raw = raw_bytes.decode("utf-8", errors="ignore")
+                raw = raw_bytes.decode("utf-8", errors="ignore")ytes.decode("utf-8", errors="ignore")
                 pack_map, ship_map = parse_zpl_labels(raw)
                 upsert_labels_to_db(mid, pack_map, raw)
                 save_manifest_labels(mid, raw)
@@ -2811,7 +2811,7 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
             raw_bytes = zpl.getvalue()
             zpl_hash = hashlib.md5(raw_bytes).hexdigest()
             if st.session_state.get("sorting_last_zpl_hash") != zpl_hash:
-                raw = raw_bytes.decode("utf-8", errors="ignore")
+                raw = raw_bytes.decode("utf-8", errors="ignore")ytes.decode("utf-8", errors="ignore")
                 pack_map, ship_map = parse_zpl_labels(raw)
                 upsert_labels_to_db(mid, pack_map, raw)
                 save_manifest_labels(mid, raw)
@@ -2829,6 +2829,17 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
 
     # Persistimos asignaciones en DB (para que un rerun al subir etiquetas NO las borre)
     assignments = get_page_assignments(mid)
+
+    # Auto-asignación (estilo módulo Picking): si aún no hay asignaciones, asigna todas las páginas
+    # automáticamente en round-robin por mesas. Esto evita quedar "atrapado" tras reruns al subir archivos.
+    if not assignments:
+        rr = list(range(1, NUM_MESAS + 1))
+        for i, p in enumerate(pages):
+            page_no = int(p.get("page_no", i + 1))
+            mesa = rr[i % len(rr)]
+            upsert_page_assignment(int(mid), int(page_no), int(mesa))
+        assignments = get_page_assignments(mid)
+        st.success(f"Asignación automática aplicada: **{len(assignments)}** página(s). Puedes ajustar abajo si lo necesitas.")
 
     used_pages = set(assignments.keys())
     cols = st.columns(3)
