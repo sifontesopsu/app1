@@ -2343,76 +2343,86 @@ def clean_address(text: str) -> str:
     t = re.sub(r"\s*\(\s*Liberador.*$", "", t, flags=re.IGNORECASE).strip()
     return t
 
-def parse_zpl_labels(raw: str):
-    # Returns dict pack_id -> {shipment_id,buyer,address,raw}
-    # and dict shipment_id -> same (for FLEX QR)
+def parse_zpl_labels(raw):
+    """
+    Parse etiquetas ZPL/TXT de Mercado Libre (Flex/Colecta).
+
+    Soporta:
+    - Flex: QR JSON con {"id":"<digits>", ...}
+    - Colecta: barcode numérico (10-15 dígitos)
+    - ZPL con 'Envio:' partido en 2 campos ^FD (ej: 'Envio: 4636105' + '^FD9888')
+    Retorna:
+      pack_map: pack_id -> meta (buyer/address si existe)
+      ship_map: shipment_id -> meta
+    """
+    import re
+    import json
+
+    # Streamlit puede entregar bytes o str según rerun/carga
+    if raw is None:
+        txt = ""
+    elif isinstance(raw, (bytes, bytearray)):
+        try:
+            txt = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            txt = raw.decode("latin-1", errors="ignore")
+    else:
+        txt = str(raw)
+
     pack_map = {}
     ship_map = {}
 
-    # collect ^FD...^FS fields and decode ^FH content
-    fd = re.findall(r"\^FD(.*?)\^FS", raw, flags=re.DOTALL)
-    fd = [decode_fh(x.replace("\n"," ").replace("\r"," ").strip()) for x in fd if x]
-    joined = " ".join(fd)
+    def _clean(s):
+        return re.sub(r"\s+", " ", (s or "").strip())
 
-    # Split by ^XA/^XZ blocks
-    blocks = re.split(r"\^XA", raw)
-    for b in blocks:
-        if "^XZ" not in b:
-            continue
-        # shipment id
-        ship = None
-        # 1) from printed 'Envio:' text (often split across fields in ZPL)
-        m = re.search(r"Envio:\s*([0-9 ]{6,30})", dec_b, flags=re.IGNORECASE)
-        if m:
-            ship = re.sub(r"\s+", "", m.group(1))
+    # 1) QR JSON (Flex)
+    for jm in re.finditer(r"\{[^{}]*\"id\"\s*:\s*\"(\d{8,15})\"[^{}]*\}", txt):
+        sid = jm.group(1)
+        ship_map.setdefault(sid, {})
 
-        # 2) from barcode payload (some formats use ^FD>:123...)
-        if not ship:
-            m = re.search(r"\^FD>:\s*(\d{6,20})", b)
-            if m:
-                ship = m.group(1)
+    # 2) 'Envio:' (a veces partido)
+    for em in re.finditer(r"Envio:\s*([0-9 ]{6,30})", txt, flags=re.IGNORECASE):
+        chunk = em.group(1)
+        digits = re.sub(r"\D", "", chunk)
 
-        # 3) from QR JSON payload
-        if not ship:
-            m = re.search(r'"id"\s*:\s*"(\d{6,20})"', b)
-            if m:
-                ship = m.group(1)
+        # Ventana para buscar continuación (siguiente ^FD...^FS)
+        win = txt[em.end(): em.end() + 160]
+        cont = re.search(r"\^FD\s*([0-9 ]{2,15})\s*\^FS", win, flags=re.IGNORECASE)
+        if cont:
+            digits2 = re.sub(r"\D", "", cont.group(1))
+            if len(digits) < 10 and digits2:
+                digits = digits + digits2
 
-        # pack id (may be split across fields)
-        pack = None
-        # try "Pack ID:" with digits/spaces following
-        dec_b = decode_fh(b.replace("\n"," ").replace("\r"," "))
-        m = re.search(r"Pack ID:\s*([0-9 ]{6,30})", dec_b)
-        if m:
-            pack = re.sub(r"\s+", "", m.group(1))
-        # fallback: if we see a 17-18 digit starting with 20000
-        if not pack:
-            m = re.search(r"\b(20000\d{7,20})\b", dec_b)
-            if m:
-                pack = m.group(1)
+        if 10 <= len(digits) <= 15:
+            ship_map.setdefault(digits, {})
 
-        # buyer and address heuristics
-        buyer = None
-        addr = None
-        # buyer often appears after ' - ' near end
-        m = re.search(r"\b([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)?)\s*\(", dec_b)
-        if m:
-            buyer = m.group(1).strip()
-        # domicile/address text
-        m = re.search(r"Domicilio:\s*([^\^]+?)(?:Ciudad de destino:|\^FS|$)", dec_b, flags=re.IGNORECASE)
-        if m:
-            addr = clean_address(m.group(1))
-        else:
-            # try line that contains comuna / ciudad
-            m = re.search(r"(?:\bComuna\b|\bCiudad\b|\bRM\b).{10,200}", dec_b)
-            if m:
-                addr = clean_address(m.group(0))
+    # 3) Pack ID
+    for pm in re.finditer(r"Pack\s*ID\s*[:#]?\s*(\d{8,20})", txt, flags=re.IGNORECASE):
+        pid = pm.group(1)
+        pack_map.setdefault(pid, {})
 
-        rec = {"pack_id": pack, "shipment_id": ship, "buyer": buyer, "address": addr, "raw": b}
-        if pack:
-            pack_map[pack] = rec
-        if ship:
-            ship_map[ship] = rec
+    # 4) Buyer/Address (best-effort)
+    buyer = None
+    mb = re.search(r"(Destinatario|Cliente)\s*:\s*([^\n\^]+)", txt, flags=re.IGNORECASE)
+    if mb:
+        buyer = _clean(mb.group(2))
+
+    addr = None
+    ma = re.search(r"(Direccion|Domicilio)\s*:\s*([^\n\^]+)", txt, flags=re.IGNORECASE)
+    if ma:
+        addr = _clean(ma.group(2))
+
+    meta = {}
+    if buyer:
+        meta["buyer"] = buyer
+    if addr:
+        meta["address"] = addr
+
+    if meta:
+        for sid in list(ship_map.keys()):
+            ship_map[sid].update(meta)
+        for pid in list(pack_map.keys()):
+            pack_map[pid].update(meta)
 
     return pack_map, ship_map
 
