@@ -15,6 +15,52 @@ DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
 
+# =========================
+# Sorting file persistence
+# =========================
+
+def _sorting_storage_dir():
+    base = os.path.dirname(os.path.abspath(__file__))
+    d = os.path.join(base, "_sorting_storage")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _manifest_pdf_path(manifest_id: int) -> str:
+    return os.path.join(_sorting_storage_dir(), f"manifest_{int(manifest_id)}.pdf")
+
+def _manifest_zpl_path(manifest_id: int) -> str:
+    return os.path.join(_sorting_storage_dir(), f"labels_{int(manifest_id)}.txt")
+
+def save_manifest_pdf(manifest_id: int, pdf_bytes: bytes) -> None:
+    if not pdf_bytes:
+        return
+    with open(_manifest_pdf_path(manifest_id), "wb") as f:
+        f.write(pdf_bytes)
+
+def load_manifest_pdf(manifest_id: int) -> bytes | None:
+    p = _manifest_pdf_path(manifest_id)
+    if os.path.exists(p):
+        try:
+            return open(p, "rb").read()
+        except Exception:
+            return None
+    return None
+
+def save_manifest_labels(manifest_id: int, text: str) -> None:
+    if text is None:
+        return
+    with open(_manifest_zpl_path(manifest_id), "w", encoding="utf-8") as f:
+        f.write(text)
+
+def load_manifest_labels(manifest_id: int) -> str | None:
+    p = _manifest_zpl_path(manifest_id)
+    if os.path.exists(p):
+        try:
+            return open(p, "r", encoding="utf-8", errors="ignore").read()
+        except Exception:
+            return None
+    return None
+
 # Maestro SKU/EAN en la misma carpeta que app.py
 MASTER_FILE = "maestro_sku_ean.xlsx"
 
@@ -2653,8 +2699,15 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                    "No se permite crear un manifiesto nuevo hasta finalizar éste.")
         mid = active["id"]
         st.session_state.sorting_manifest_id = mid
-        # Para continuar (re)asignación, pedimos el PDF del manifiesto activo (para volver a parsear páginas si es necesario)
-        pdf = st.file_uploader("Control / Manifiesto ACTIVO (PDF)", type=["pdf"], key="sorting_pdf_active")
+
+        # Control del manifiesto activo: no obligar a re-subir en cada rerun.
+        # Si ya existe en disco/sesión, lo reutilizamos; si quieres reemplazarlo, puedes subir uno nuevo.
+        pdf = st.file_uploader("Control / Manifiesto ACTIVO (PDF) (opcional: reemplazar)", type=["pdf"], key="sorting_pdf_active_replace")
+        if pdf is not None:
+            pdf_bytes = pdf.getvalue()
+            save_manifest_pdf(mid, pdf_bytes)
+            st.session_state["sorting_control_pdf_bytes"] = pdf_bytes
+
         zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL) (puedes cargarlo ahora)", type=["txt"], key="sorting_zpl_active")
 
         # Permite cargar etiquetas en cualquier momento (sin bucles por rerun)
@@ -2665,6 +2718,8 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                 raw = raw_bytes.decode("utf-8", errors="ignore")
                 pack_map, ship_map = parse_zpl_labels(raw)
                 upsert_labels_to_db(mid, pack_map, raw)
+                save_manifest_labels(mid, raw)
+                save_manifest_labels(mid, raw)
                 apply_labels_to_existing_items(mid)
                 st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
                 st.session_state["sorting_last_zpl_hash"] = zpl_hash
@@ -2691,10 +2746,32 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                 st.info("Sube el PDF del manifiesto activo para asignar sus páginas a mesas.")
                 st.stop()
         else:
-            pages = parse_control_pdf_by_page(pdf)
+            pages = parse_control_pdf_by_page(pdf) if pdf is not None else []
         if not pages:
             st.error("No se pudo leer el PDF.")
             st.stop()
+
+        
+        # Fallback: si no hay PDF subido en este rerun, reutiliza el guardado (disco/sesión)
+        if "sorting_parsed_pages" not in st.session_state or not st.session_state.get("sorting_parsed_pages"):
+            stored = st.session_state.get("sorting_control_pdf_bytes") or load_manifest_pdf(mid)
+            if stored:
+                # parse_control_pdf_by_page acepta un objeto estilo UploadedFile; creamos un wrapper mínimo
+                from io import BytesIO
+                class _UF:
+                    def __init__(self, b):
+                        self._b = b
+                        self.name = active["name"]
+                    def getvalue(self):
+                        return self._b
+                    @property
+                    def type(self):
+                        return "application/pdf"
+                pages_f = parse_control_pdf_by_page(_UF(stored))
+                if pages_f:
+                    st.session_state.sorting_parsed_pages = pages_f
+            else:
+                st.info("PDF del manifiesto activo ya creado. Si necesitas re-parsear páginas, vuelve a subir el Control (opcional).")
 
         manifest_name = getattr(pdf, "name", active["name"]) or active["name"]
         st.session_state.sorting_parsed_pages = pages
@@ -2708,7 +2785,7 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
             st.info("Sube el PDF para continuar.")
             return
 
-        pages = parse_control_pdf_by_page(pdf)
+        pages = parse_control_pdf_by_page(pdf) if pdf is not None else []
         if not pages:
             st.error("No se pudo leer el PDF.")
             return
@@ -2720,6 +2797,13 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
 
         # create manifest row now (robusto: no depender solo de session_state)
         mid = ensure_active_manifest(manifest_name)
+        # Persistir PDF para que no se pierda en reruns al subir etiquetas
+        try:
+            pdf_bytes = pdf.getvalue()
+            save_manifest_pdf(mid, pdf_bytes)
+            st.session_state["sorting_control_pdf_bytes"] = pdf_bytes
+        except Exception:
+            pass
         st.session_state.sorting_manifest_id = mid
         st.session_state.sorting_parsed_pages = pages
         # store labels if uploaded (sin bucles)
@@ -2730,6 +2814,8 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
                 raw = raw_bytes.decode("utf-8", errors="ignore")
                 pack_map, ship_map = parse_zpl_labels(raw)
                 upsert_labels_to_db(mid, pack_map, raw)
+                save_manifest_labels(mid, raw)
+                save_manifest_labels(mid, raw)
                 apply_labels_to_existing_items(mid)
                 st.info(f"Etiquetas detectadas: {len(pack_map)} con Pack ID / {len(ship_map)} con envío (QR/barra).")
                 st.session_state["sorting_last_zpl_hash"] = zpl_hash
