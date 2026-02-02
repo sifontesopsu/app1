@@ -2444,21 +2444,45 @@ def upsert_labels_to_db(manifest_id: int, pack_map: dict, raw: str):
 def apply_labels_to_existing_items(manifest_id: int):
     """Propaga shipment_id/buyer/address desde sorting_labels hacia sorting_run_items ya creados.
     Útil cuando se cargan etiquetas DESPUÉS de crear corridas.
+
+    Nota: Streamlit hace reruns; esto debe ser idempotente y seguro.
     """
     conn = get_conn()
     c = conn.cursor()
-    # Solo actualizar campos vacíos o nulos para no pisar datos ya confirmados/manuales
+
+    # Actualiza solo cuando el campo destino está vacío/nulo, para no pisar trabajo del operador.
+    # - shipment_id: actualiza si es NULL o ''.
+    # - buyer/address: igual.
     c.execute(
         """UPDATE sorting_run_items
-               SET shipment_id = COALESCE(shipment_id, (SELECT l.shipment_id FROM sorting_labels l
-                                                      WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id)),
-                   buyer       = CASE WHEN (buyer IS NULL OR buyer='') THEN (SELECT l.buyer FROM sorting_labels l
-                                                      WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id) ELSE buyer END,
-                   address     = CASE WHEN (address IS NULL OR address='') THEN (SELECT l.address FROM sorting_labels l
-                                                      WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id) ELSE address END
+               SET shipment_id = CASE
+                                   WHEN (shipment_id IS NULL OR shipment_id='') THEN (
+                                       SELECT l.shipment_id
+                                         FROM sorting_labels l
+                                        WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id
+                                   )
+                                   ELSE shipment_id
+                                 END,
+                   buyer       = CASE
+                                   WHEN (buyer IS NULL OR buyer='') THEN (
+                                       SELECT l.buyer
+                                         FROM sorting_labels l
+                                        WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id
+                                   )
+                                   ELSE buyer
+                                 END,
+                   address     = CASE
+                                   WHEN (address IS NULL OR address='') THEN (
+                                       SELECT l.address
+                                         FROM sorting_labels l
+                                        WHERE l.manifest_id=? AND l.pack_id=sorting_run_items.pack_id
+                                   )
+                                   ELSE address
+                                 END
              WHERE run_id IN (SELECT id FROM sorting_runs WHERE manifest_id=?);""",
-        (manifest_id, manifest_id, manifest_id)
+        (manifest_id, manifest_id, manifest_id, manifest_id)
     )
+
     conn.commit()
     conn.close()
 
