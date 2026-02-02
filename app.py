@@ -2215,6 +2215,38 @@ def create_sorting_manifest(name: str):
     conn.close()
     return mid
 
+
+def ensure_active_manifest(manifest_name: str) -> int:
+    """Garantiza que exista un manifiesto ACTIVE en DB para este flujo.
+    Si session_state trae un id viejo (por reinicio/refresh), lo reemplaza.
+    """
+    active = get_active_sorting_manifest()
+    if active:
+        st.session_state.sorting_manifest_id = active["id"]
+        st.session_state.sorting_manifest_name = active["name"]
+        return active["id"]
+
+    # No hay ACTIVE en DB: si en sesión hay un id, validamos que exista y esté ACTIVE
+    mid = st.session_state.get("sorting_manifest_id")
+    if mid:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT id, status, name FROM sorting_manifests WHERE id=?;", (int(mid),))
+        row = c.fetchone()
+        conn.close()
+        if row and row[1] == "ACTIVE":
+            st.session_state.sorting_manifest_name = row[2]
+            return int(mid)
+
+    # Crear uno nuevo
+    mid = create_sorting_manifest(manifest_name)
+    st.session_state.sorting_manifest_id = mid
+    st.session_state.sorting_manifest_name = manifest_name
+    # Limpieza de estado de carga previo
+    st.session_state.pop("sorting_last_zpl_hash", None)
+    return mid
+
+
 def mark_manifest_done(manifest_id: int):
     conn = get_conn()
     c = conn.cursor()
@@ -2423,7 +2455,12 @@ def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_
         if not mesa:
             continue
         c.execute(
-            "INSERT OR IGNORE INTO sorting_runs (manifest_id, page_no, mesa, status, created_at) VALUES (?,?,?,?,?);",
+            """INSERT INTO sorting_runs (manifest_id, page_no, mesa, status, created_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(manifest_id, page_no) DO UPDATE SET
+                   mesa=excluded.mesa,
+                   status='PENDING',
+                   closed_at=NULL;""",
             (manifest_id, pno, int(mesa), "PENDING", now_iso())
         )
         c.execute("SELECT id FROM sorting_runs WHERE manifest_id=? AND page_no=?;", (manifest_id, pno))
@@ -2528,20 +2565,18 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
             st.session_state.sorting_parsed_pages = pages
             st.session_state.sorting_manifest_name = manifest_name
 
-        # create manifest row now
-        if "sorting_manifest_id" not in st.session_state:
-            mid = create_sorting_manifest(manifest_name)
-            st.session_state.sorting_manifest_id = mid
-            # store labels if uploaded (sin bucles)
-            if zpl is not None:
-                raw_bytes = zpl.getvalue()
-                zpl_hash = hashlib.md5(raw_bytes).hexdigest()
-                if st.session_state.get("sorting_last_zpl_hash") != zpl_hash:
-                    raw = raw_bytes.decode("utf-8", errors="ignore")
-                    pack_map, ship_map = parse_zpl_labels(raw)
-                    upsert_labels_to_db(mid, pack_map, raw)
-                    st.session_state["sorting_last_zpl_hash"] = zpl_hash
-        mid = st.session_state.sorting_manifest_id
+        # create manifest row now (robusto: no depender solo de session_state)
+        mid = ensure_active_manifest(manifest_name)
+        # store labels if uploaded (sin bucles)
+        if zpl is not None:
+            raw_bytes = zpl.getvalue()
+            zpl_hash = hashlib.md5(raw_bytes).hexdigest()
+            if st.session_state.get("sorting_last_zpl_hash") != zpl_hash:
+                raw = raw_bytes.decode("utf-8", errors="ignore")
+                pack_map, ship_map = parse_zpl_labels(raw)
+                upsert_labels_to_db(mid, pack_map, raw)
+                st.session_state["sorting_last_zpl_hash"] = zpl_hash
+ mid = st.session_state.sorting_manifest_id
     pages = st.session_state.sorting_parsed_pages
 
     st.subheader("Asignación de páginas a mesas (obligatorio)")
@@ -2571,9 +2606,21 @@ def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
         st.stop()
 
     if st.button("✅ Crear corridas"):
-        create_runs_and_items(mid, assignments, pages, inv_map_sku, barcode_to_sku)
-        st.success("Corridas creadas. Ve a 'Camarero'.")
-        st.rerun()
+        try:
+            create_runs_and_items(mid, assignments, pages, inv_map_sku, barcode_to_sku)
+            # Verificación rápida
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=?;", (mid,))
+            rc = int(c.fetchone()[0] or 0)
+            conn.close()
+            if rc <= 0:
+                st.error("No se crearon corridas (0). Revisa que el PDF tenga páginas parseadas y que estén asignadas a mesas.")
+            else:
+                st.success(f"Corridas creadas: **{rc}**. Ve a 'Camarero'.")
+                st.rerun()
+        except Exception as e:
+            st.exception(e)
 
 def get_next_run_for_mesa(mesa: int):
     conn = get_conn()
