@@ -2863,7 +2863,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     st.session_state["sorting_manifest_id"] = mid
 
     mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
-    st.session_state["s2_mesa"] = int(mesa)
+    st.session_state["s2_mesa_int"] = int(mesa)  # store separately; do not overwrite widget key
 
     # State: current sale
     if "s2_sale_open" not in st.session_state:
