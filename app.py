@@ -2550,6 +2550,25 @@ def _s2_create_tables():
         raw TEXT,
         PRIMARY KEY (manifest_id, shipment_id)
     );""")
+
+    # --- Migraciones suaves (SQLite) ---
+    try:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(s2_sales);").fetchall()]
+        if "pack_id" not in cols:
+            c.execute("ALTER TABLE s2_sales ADD COLUMN pack_id TEXT;")
+        if "customer" not in cols:
+            c.execute("ALTER TABLE s2_sales ADD COLUMN customer TEXT;")
+    except Exception:
+        pass
+
+    # Mapa Pack ID -> Shipment ID (necesario para Colecta)
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_pack_ship (
+        manifest_id INTEGER NOT NULL,
+        pack_id TEXT NOT NULL,
+        shipment_id TEXT NOT NULL,
+        PRIMARY KEY (manifest_id, pack_id)
+    );""")
+
     conn.commit()
     conn.close()
 
@@ -2591,20 +2610,19 @@ def _s2_extract_shipment_id(scan_raw: str):
 def _s2_parse_control_pdf(pdf_bytes: bytes):
     """Parse Control.pdf (Flex/Colecta) into sales with items.
 
-    This parser is robust to the typical Control layout where multiple fields
-    appear on the same line, e.g.:
-      46361059888 <titulo producto>
-      Venta: 20000... SKU:1406...
-      <cliente> Cantidad: 1
+    Importante (Colecta): el Control a veces NO trae shipment_id al inicio de línea.
+    Por eso este parser NO exige shipment_id para contar ventas; lo completa luego
+    usando Etiquetas (por Pack ID o por shipment_id cuando venga en el Control).
 
     Returns: list of dicts:
-      {page_no:int, shipment_id:str, sale_id:str, pack_id:str|None, customer:str|None,
+      {page_no:int, shipment_id:str|None, sale_id:str, pack_id:str|None, customer:str|None,
        items:[{sku:str, qty:int}]}
     """
     import io, re, pdfplumber
 
     def ship_from_line(s: str):
-        m = re.match(r"^(\d{8,14})\b", s or "")
+        # Flex suele venir como número al inicio (p.ej. 4636...)
+        m = re.match(r"^(\d{8,15})\b", s or "")
         return m.group(1) if m else None
 
     def sale_from_line(s: str):
@@ -2616,11 +2634,20 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
         return m.group(1) if m else None
 
     def skus_from_line(s: str):
-        return re.findall(r"\bSKU\s*:\s*(\d{6,20})\b", s or "", flags=re.IGNORECASE)
+        # SKU puede venir con guiones/letras en algunos casos internos, pero en Control suele ser numérico
+        return re.findall(r"\bSKU\s*:\s*([0-9A-Za-z_-]{6,20})\b", s or "", flags=re.IGNORECASE)
 
     def qty_from_line(s: str):
         m = re.search(r"\bCantidad\s*:\s*(\d+)\b", s or "", flags=re.IGNORECASE)
         return int(m.group(1)) if m else None
+
+    def looks_like_name(s: str):
+        s = (s or "").strip()
+        if not s or len(s) > 70:
+            return False
+        if re.search(r"\b(color|acabado|modelo|di[aá]metro|voltaje|dise[nñ]o|tipo)\b\s*:", s, flags=re.I):
+            return False
+        return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", s))
 
     sales = []
     cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None, "customer": None, "items": []}
@@ -2628,7 +2655,8 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
 
     def flush():
         nonlocal cur, sku_queue
-        if cur["shipment_id"] and cur["sale_id"] and cur["items"]:
+        if cur.get("sale_id") and cur.get("items"):
+            # sale_id + items es suficiente para contar venta
             sales.append(cur)
         cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None, "customer": None, "items": []}
         sku_queue = []
@@ -2636,80 +2664,135 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pidx, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            lines = [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
             for ln in lines:
                 low = ln.lower()
                 if low.startswith("despacha ") or low.startswith("identifi"):
                     continue
 
+                # Flex shipment id en línea
                 ship = ship_from_line(ln)
                 if ship:
-                    if cur["shipment_id"] and ship != cur["shipment_id"]:
+                    if cur.get("shipment_id") and ship != cur.get("shipment_id") and cur.get("sale_id"):
                         flush()
-                    if not cur["shipment_id"]:
+                    if not cur.get("shipment_id"):
                         cur["shipment_id"] = ship
-                        cur["page_no"] = pidx
-                    # keep parsing same line (often contains title)
+                        if not cur.get("page_no"):
+                            cur["page_no"] = pidx
 
+                # Pack ID
                 pid = pack_from_line(ln)
                 if pid:
                     cur["pack_id"] = pid
+                    if not cur.get("page_no"):
+                        cur["page_no"] = pidx
 
+                # Venta (si cambia, flush)
                 sid = sale_from_line(ln)
                 if sid:
+                    if cur.get("sale_id") and sid != cur.get("sale_id") and cur.get("items"):
+                        flush()
                     cur["sale_id"] = sid
+                    if not cur.get("page_no"):
+                        cur["page_no"] = pidx
 
+                # SKU en línea
                 skus = skus_from_line(ln)
                 if skus:
                     sku_queue.extend(skus)
 
+                # Cantidad: asigna a primer SKU pendiente
                 q = qty_from_line(ln)
                 if q is not None:
-                    # Customer sometimes comes in the same line as qty
-                    if cur["sale_id"] and not cur["customer"] and ("venta" not in low) and ("pack" not in low):
+                    # cliente a veces viene junto a Cantidad
+                    if cur.get("sale_id") and not cur.get("customer") and ("venta" not in low) and ("pack" not in low):
                         pre = re.split(r"Cantidad\s*:", ln, flags=re.IGNORECASE)[0].strip()
-                        pre = re.sub(r"\bSKU\s*:\s*\d{6,20}\b", "", pre, flags=re.IGNORECASE).strip()
-                        pre = re.sub(r"^\d{8,14}\b", "", pre).strip()
-                        # heuristic: keep short-ish names only
-                        if pre and len(pre) <= 60:
+                        pre = re.sub(r"\bSKU\s*:\s*[0-9A-Za-z_-]{6,20}\b", "", pre, flags=re.IGNORECASE).strip()
+                        pre = re.sub(r"^\d{8,15}\b", "", pre).strip()
+                        if pre and len(pre) <= 70 and looks_like_name(pre):
                             cur["customer"] = pre
 
                     if sku_queue:
                         sku = sku_queue.pop(0)
                         cur["items"].append({"sku": sku, "qty": int(q)})
+                else:
+                    # nombre en línea sola después de Venta
+                    if cur.get("sale_id") and not cur.get("customer") and looks_like_name(ln):
+                        cur["customer"] = ln[:70]
 
     flush()
     return sales
 
 def _s2_parse_labels_txt(raw_bytes: bytes):
+    """Parsea etiquetas TXT/ZPL de Flex y Colecta.
+
+    Devuelve:
+      - pack_to_ship: dict {pack_id(str) -> shipment_id(str)}
+      - shipment_ids: sorted list de shipment_id detectados
+
+    Nota: En Colecta el Pack ID suele venir PARTIDO en dos ^FD:
+        ^FDPack ID: 20000^FS  y luego ^FD1128....^FS
+    """
     import re, json
+
     try:
         txt = raw_bytes.decode("utf-8", errors="ignore")
     except Exception:
         txt = str(raw_bytes)
+
+    # separar etiquetas por bloque ^XA ... ^XZ
+    blocks = re.split(r"\^XA", txt)
+    pack_to_ship = {}
     shipment_ids = set()
 
-    # JSON id fields
-    for jm in re.finditer(r"\"id\"\s*:\s*\"(\d{8,15})\"", txt):
-        shipment_ids.add(jm.group(1))
+    def clean_num(s):
+        return re.sub(r"\D", "", s or "")
 
-    # Envio: possibly split
-    for em in re.finditer(r"Envio:\s*([0-9 ]{6,30})", txt, flags=re.IGNORECASE):
-        chunk = re.sub(r"\D", "", em.group(1))
-        win = txt[em.end(): em.end() + 160]
-        cont = re.search(r"\^FD\s*([0-9 ]{2,15})\s*\^FS", win)
-        if cont and len(chunk) < 10:
-            chunk2 = re.sub(r"\D", "", cont.group(1))
-            chunk = chunk + chunk2
-        if 10 <= len(chunk) <= 15:
-            shipment_ids.add(chunk)
+    for b in blocks:
+        if not b.strip():
+            continue
+        # reconstruir pack id (partido)
+        pack_full = None
 
-    # Any other long number near 'Envío' lines
-    for m in re.finditer(r"\b(\d{10,15})\b", txt):
-        shipment_ids.add(m.group(1))
+        # caso completo en una sola línea
+        m_full = re.search(r"Pack\s*ID\s*:\s*(\d{10,20})", b, flags=re.I)
+        if m_full:
+            pack_full = m_full.group(1)
 
-    return sorted(shipment_ids)
+        # caso partido: "Pack ID: 20000" + siguiente ^FD con resto
+        if not pack_full:
+            m_part = re.search(r"Pack\s*ID\s*:\s*(\d{4,10})\s*\^FS", b, flags=re.I)
+            if m_part:
+                head = clean_num(m_part.group(1))
+                # buscar siguiente ^FD numérico cercano
+                tailm = re.search(r"\^FD\s*([0-9 ]{6,20})\s*\^FS", b[m_part.end():])
+                if tailm:
+                    tail = clean_num(tailm.group(1))
+                    cand = head + tail
+                    if 10 <= len(cand) <= 20:
+                        pack_full = cand
 
+        # shipment id: preferir números 10-15 dígitos (en Colecta/Flex suelen ser 4636...)
+        # En Flex también hay JSON con "id":"4638..."
+        ship = None
+        jm = re.search(r"\"id\"\s*:\s*\"(\d{8,15})\"", b)
+        if jm:
+            ship = jm.group(1)
+
+        if not ship:
+            # buscar números candidatos, priorizando 10-15 dígitos y que empiecen por 46
+            nums = re.findall(r"\b\d{10,15}\b", b)
+            if nums:
+                # prioriza 46.. luego el más largo
+                nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
+                ship = nums_sorted[0]
+
+        if ship:
+            shipment_ids.add(ship)
+        if pack_full and ship:
+            pack_to_ship[str(pack_full)] = str(ship)
+
+    return pack_to_ship, sorted(shipment_ids)
 def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
     pages_sales = _s2_parse_control_pdf(pdf_bytes)
     conn = get_conn()
@@ -2724,31 +2807,55 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
     # clear previous parsed sales/items
     c.execute("DELETE FROM s2_items WHERE manifest_id=?;", (mid,))
     c.execute("DELETE FROM s2_sales WHERE manifest_id=?;", (mid,))
-    # insert new
+
+    n_sales = 0
     for s in pages_sales:
-        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, status)
-                     VALUES(?,?,?,?, 'NEW')
+        sale_id = str(s.get("sale_id") or "")
+        if not sale_id:
+            continue
+        n_sales += 1
+        shipment_id = s.get("shipment_id")
+        page_no = int(s.get("page_no") or 1)
+        pack_id = s.get("pack_id")
+        customer = s.get("customer")
+
+        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, status, pack_id, customer)
+                     VALUES(?,?,?,?, 'NEW', ?, ?)
                      ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
                         shipment_id=excluded.shipment_id,
                         page_no=excluded.page_no,
                         status='NEW',
                         mesa=NULL,
                         opened_at=NULL,
-                        closed_at=NULL;""", (mid, s["sale_id"], s["shipment_id"], int(s["page_no"])))
-        for it in s["items"]:
+                        closed_at=NULL,
+                        pack_id=excluded.pack_id,
+                        customer=excluded.customer;""",
+                  (mid, sale_id, (str(shipment_id) if shipment_id else None), page_no,
+                   (str(pack_id) if pack_id else None), (str(customer) if customer else None)))
+
+        for it in s.get("items", []):
+            try:
+                sku = str(it.get("sku"))
+                qty = int(it.get("qty") or 0)
+            except Exception:
+                continue
+            if not sku or qty <= 0:
+                continue
             c.execute("""INSERT INTO s2_items(manifest_id, sale_id, sku, description, qty, picked, status)
                          VALUES(?,?,?,?,?,0,'PENDING')
                          ON CONFLICT(manifest_id, sale_id, sku) DO UPDATE SET
                             description=excluded.description,
                             qty=excluded.qty,
                             picked=0,
-                            status='PENDING';""", (mid, s["sale_id"], str(it["sku"]), it.get("desc",""), int(it["qty"])))
+                            status='PENDING';""", (mid, sale_id, sku, it.get("desc",""), qty))
+
     conn.commit()
     conn.close()
-    return len(pages_sales)
+    return n_sales
+
 
 def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
-    shipment_ids = _s2_parse_labels_txt(labels_bytes)
+    pack_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
@@ -2757,10 +2864,29 @@ def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
                     labels_txt=excluded.labels_txt,
                     labels_name=excluded.labels_name,
                     updated_at=excluded.updated_at;""", (mid, labels_bytes, labels_name, _s2_now_iso()))
+
+    # limpiar y reinsertar shipment ids
+    c.execute("DELETE FROM s2_labels WHERE manifest_id=?;", (mid,))
     for sid in shipment_ids:
-        c.execute("""INSERT INTO s2_labels(manifest_id, shipment_id, raw)
-                     VALUES(?,?,?)
-                     ON CONFLICT(manifest_id, shipment_id) DO UPDATE SET raw=excluded.raw;""", (mid, sid, labels_name))
+        c.execute("INSERT OR REPLACE INTO s2_labels(manifest_id, shipment_id, raw) VALUES(?,?,NULL);", (mid, str(sid)))
+
+    # guardar pack->ship para Colecta
+    if pack_to_ship:
+        for pack_id, ship_id in pack_to_ship.items():
+            c.execute("INSERT OR REPLACE INTO s2_pack_ship(manifest_id, pack_id, shipment_id) VALUES(?,?,?);",
+                      (mid, str(pack_id), str(ship_id)))
+
+        # completar shipment_id en ventas usando pack_id si falta
+        try:
+            c.execute("""UPDATE s2_sales
+                           SET shipment_id = (
+                               SELECT ps.shipment_id FROM s2_pack_ship ps
+                               WHERE ps.manifest_id=s2_sales.manifest_id AND ps.pack_id=s2_sales.pack_id
+                           )
+                           WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') AND pack_id IS NOT NULL;""", (mid,))
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
     return len(shipment_ids)
