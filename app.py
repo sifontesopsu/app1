@@ -3129,7 +3129,7 @@ def main():
         elif page.startswith("2"):
             page_sorting_camarero(inv_map_sku, barcode_to_sku)
         else:
-            page_sorting_admin()
+            page_sorting_admin(inv_map_sku, barcode_to_sku)
 
     # ==========
     # MODO FULL (nuevo módulo completo)
