@@ -2545,81 +2545,99 @@ def _s2_extract_shipment_id(scan_raw: str):
     m = re.search(r"(\d{10,15})", s)
     return m.group(1) if m else None
 
+
 def _s2_parse_control_pdf(pdf_bytes: bytes):
-    """Parse Control.pdf into a list of sales with items.
-    Returns: pages_sales: list of dicts {page_no, shipment_id, sale_id, items:[{sku,qty,desc}]}
+    """Parse Control.pdf (Flex/Colecta) into sales with items.
+
+    This parser is robust to the typical Control layout where multiple fields
+    appear on the same line, e.g.:
+      46361059888 <titulo producto>
+      Venta: 20000... SKU:1406...
+      <cliente> Cantidad: 1
+
+    Returns: list of dicts:
+      {page_no:int, shipment_id:str, sale_id:str, pack_id:str|None, customer:str|None,
+       items:[{sku:str, qty:int}]}
     """
-    import pdfplumber, re, io
-    pages_sales = []
+    import io, re, pdfplumber
+
+    def ship_from_line(s: str):
+        m = re.match(r"^(\d{8,14})\b", s or "")
+        return m.group(1) if m else None
+
+    def sale_from_line(s: str):
+        m = re.search(r"\bVenta\s*:\s*(\d{10,20})\b", s or "", flags=re.IGNORECASE)
+        return m.group(1) if m else None
+
+    def pack_from_line(s: str):
+        m = re.search(r"\bPack\s*ID\s*:\s*(\d{10,20})\b", s or "", flags=re.IGNORECASE)
+        return m.group(1) if m else None
+
+    def skus_from_line(s: str):
+        return re.findall(r"\bSKU\s*:\s*(\d{6,20})\b", s or "", flags=re.IGNORECASE)
+
+    def qty_from_line(s: str):
+        m = re.search(r"\bCantidad\s*:\s*(\d+)\b", s or "", flags=re.IGNORECASE)
+        return int(m.group(1)) if m else None
+
+    sales = []
+    cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None, "customer": None, "items": []}
+    sku_queue = []
+
+    def flush():
+        nonlocal cur, sku_queue
+        if cur["shipment_id"] and cur["sale_id"] and cur["items"]:
+            sales.append(cur)
+        cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None, "customer": None, "items": []}
+        sku_queue = []
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pidx, page in enumerate(pdf.pages, start=1):
-            words = page.extract_words() or []
-            # Build lines by grouping similar 'top' (y)
-            # Sort by y then x
-            words_sorted = sorted(words, key=lambda w: (round(float(w.get("top", 0)), 1), float(w.get("x0", 0))))
-            lines = []
-            cur_y = None
-            cur = []
-            for w in words_sorted:
-                y = round(float(w.get("top", 0)), 1)
-                text = w.get("text", "")
-                if cur_y is None or abs(y - cur_y) <= 2.0:
-                    cur.append(text)
-                    cur_y = y if cur_y is None else cur_y
-                else:
-                    if cur:
-                        lines.append(" ".join(cur))
-                    cur = [text]
-                    cur_y = y
-            if cur:
-                lines.append(" ".join(cur))
-
-            # Normalize lines
-            lines = [re.sub(r"\s+", " ", (ln or "").strip()) for ln in lines if (ln or "").strip()]
-
-            shipment_id = None
-            sale_id = None
-            items = []
-            # First: detect shipment_id (first long number line)
-            for ln in lines[:30]:
-                m = re.search(r"\b(\d{10,15})\b", ln)
-                if m:
-                    shipment_id = m.group(1)
-                    break
-            # Detect sale_id
+            text = page.extract_text() or ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             for ln in lines:
-                m = re.search(r"\bVenta\s*:\s*(\d{10,25})\b", ln, flags=re.IGNORECASE)
-                if m:
-                    sale_id = m.group(1)
-                    break
-
-            # Items: look for patterns containing qty + sku
-            for ln in lines:
-                # Typical: "1 11080110100 COMBINACION ..."
-                m = re.match(r"^(\d{1,4})\s+(\d{6,20})\s+(.*)$", ln)
-                if m:
-                    qty = int(m.group(1))
-                    sku = m.group(2)
-                    desc = m.group(3).strip()
-                    if qty > 0:
-                        items.append({"sku": sku, "qty": qty, "desc": desc})
+                low = ln.lower()
+                if low.startswith("despacha ") or low.startswith("identifi"):
                     continue
-                # Alternative: sku then qty
-                m2 = re.match(r"^(\d{6,20})\s+(\d{1,4})\b(.*)$", ln)
-                if m2:
-                    sku = m2.group(1)
-                    qty = int(m2.group(2))
-                    desc = (m2.group(3) or "").strip()
-                    if qty > 0:
-                        items.append({"sku": sku, "qty": qty, "desc": desc})
-            if sale_id and items:
-                pages_sales.append({
-                    "page_no": pidx,
-                    "shipment_id": shipment_id,
-                    "sale_id": sale_id,
-                    "items": items
-                })
-    return pages_sales
+
+                ship = ship_from_line(ln)
+                if ship:
+                    if cur["shipment_id"] and ship != cur["shipment_id"]:
+                        flush()
+                    if not cur["shipment_id"]:
+                        cur["shipment_id"] = ship
+                        cur["page_no"] = pidx
+                    # keep parsing same line (often contains title)
+
+                pid = pack_from_line(ln)
+                if pid:
+                    cur["pack_id"] = pid
+
+                sid = sale_from_line(ln)
+                if sid:
+                    cur["sale_id"] = sid
+
+                skus = skus_from_line(ln)
+                if skus:
+                    sku_queue.extend(skus)
+
+                q = qty_from_line(ln)
+                if q is not None:
+                    # Customer sometimes comes in the same line as qty
+                    if cur["sale_id"] and not cur["customer"] and ("venta" not in low) and ("pack" not in low):
+                        pre = re.split(r"Cantidad\s*:", ln, flags=re.IGNORECASE)[0].strip()
+                        pre = re.sub(r"\bSKU\s*:\s*\d{6,20}\b", "", pre, flags=re.IGNORECASE).strip()
+                        pre = re.sub(r"^\d{8,14}\b", "", pre).strip()
+                        # heuristic: keep short-ish names only
+                        if pre and len(pre) <= 60:
+                            cur["customer"] = pre
+
+                    if sku_queue:
+                        sku = sku_queue.pop(0)
+                        cur["items"].append({"sku": sku, "qty": int(q)})
+
+    flush()
+    return sales
 
 def _s2_parse_labels_txt(raw_bytes: bytes):
     import re, json
