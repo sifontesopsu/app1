@@ -2425,146 +2425,543 @@ def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_
     conn.commit()
     conn.close()
 
-def page_sorting_upload(inv_map_sku: dict, barcode_to_sku: dict):
-    st.header("🧾 Sorting pedidos Flex y Colecta")
-    st.caption("Carga 1 manifiesto (Control PDF) y asigna TODAS las páginas a mesas. 1 página = 1 mesa.")
 
-    active = get_active_sorting_manifest()
 
-    # Siempre permitir cargar etiquetas y/o continuar asignación para el manifiesto ACTIVO.
-    if active:
-        st.info(f"Manifiesto ACTIVO: **{active['name']}** (creado: {to_chile_display(active['created_at'])})")
-        st.warning("Este manifiesto sigue en proceso. Puedes cargar etiquetas y/o terminar la asignación de páginas. "
-                   "No se permite crear un manifiesto nuevo hasta finalizar éste.")
-        mid = active["id"]
-        st.session_state.sorting_manifest_id = mid
-        # Para continuar (re)asignación, pedimos el PDF del manifiesto activo (para volver a parsear páginas si es necesario)
-        pdf = st.file_uploader("Control / Manifiesto ACTIVO (PDF)", type=["pdf"], key="sorting_pdf_uploader")
-        zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL) (puedes cargarlo ahora)", type=["txt"], key="sorting_zpl_uploader")
+def _s2_now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
-        # --- Persistencia de etiquetas (no depende del uploader) ---
-        if "sorting_labels_loaded" not in st.session_state:
-            st.session_state.sorting_labels_loaded = False
-        if "sorting_labels_name" not in st.session_state:
-            st.session_state.sorting_labels_name = ""
-        if "sorting_labels_bytes" not in st.session_state:
-            st.session_state.sorting_labels_bytes = b""
+def _s2_create_tables():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_manifests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        created_at TEXT NOT NULL
+    );""")
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_files (
+        manifest_id INTEGER PRIMARY KEY,
+        control_pdf BLOB,
+        labels_txt BLOB,
+        control_name TEXT,
+        labels_name TEXT,
+        updated_at TEXT NOT NULL
+    );""")
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_page_assign (
+        manifest_id INTEGER NOT NULL,
+        page_no INTEGER NOT NULL,
+        mesa INTEGER NOT NULL,
+        PRIMARY KEY (manifest_id, page_no)
+    );""")
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_sales (
+        manifest_id INTEGER NOT NULL,
+        sale_id TEXT NOT NULL,
+        shipment_id TEXT,
+        page_no INTEGER NOT NULL,
+        mesa INTEGER,
+        status TEXT NOT NULL DEFAULT 'NEW',
+        opened_at TEXT,
+        closed_at TEXT,
+        PRIMARY KEY (manifest_id, sale_id)
+    );""")
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_items (
+        manifest_id INTEGER NOT NULL,
+        sale_id TEXT NOT NULL,
+        sku TEXT NOT NULL,
+        description TEXT,
+        qty INTEGER NOT NULL,
+        picked INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        PRIMARY KEY (manifest_id, sale_id, sku)
+    );""")
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_labels (
+        manifest_id INTEGER NOT NULL,
+        shipment_id TEXT NOT NULL,
+        raw TEXT,
+        PRIMARY KEY (manifest_id, shipment_id)
+    );""")
+    conn.commit()
+    conn.close()
 
-        # Permite cargar etiquetas en cualquier momento (sin bucles por rerun)
-        if zpl is not None:
-            raw_bytes = zpl.getvalue()
-            zpl_hash = hashlib.md5(raw_bytes).hexdigest()
-            if st.session_state.get("sorting_last_zpl_hash") != zpl_hash:
-                raw = raw_bytes.decode("utf-8", errors="ignore")
-                pack_map, ship_map = parse_zpl_labels(raw)
-                upsert_labels_to_db(mid, pack_map, raw)
-                st.session_state["sorting_last_zpl_hash"] = zpl_hash
-                st.success("Etiquetas cargadas/actualizadas para el manifiesto activo.")
-            else:
-                st.info("Etiquetas ya procesadas (sin cambios).")
-
-        # Si ya existen corridas creadas, solo mostramos resumen y enviamos a Camarero
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=?;", (mid,))
-        run_count = int(c.fetchone()[0] or 0)
+def _s2_get_active_manifest_id():
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id FROM s2_manifests WHERE status='ACTIVE' ORDER BY id DESC LIMIT 1;")
+    row = c.fetchone()
+    if row:
+        mid = int(row[0])
         conn.close()
+        return mid
+    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES('ACTIVE', ?);", (_s2_now_iso(),))
+    mid = int(c.lastrowid)
+    conn.commit()
+    conn.close()
+    return mid
 
-        if run_count > 0:
-            st.success(f"Corridas ya creadas para este manifiesto: **{run_count}**. Ve a 'Camarero' para completarlas.")
-            st.stop()
+def _s2_extract_shipment_id(scan_raw: str):
+    import re, json
+    if not scan_raw:
+        return None
+    s = str(scan_raw).strip()
+    # JSON (Flex QR)
+    if s.startswith("{") and "id" in s:
+        try:
+            obj = json.loads(s)
+            sid = obj.get("id")
+            if sid and re.fullmatch(r"\d{8,15}", str(sid)):
+                return str(sid)
+        except Exception:
+            pass
+    # any long digit group (Colecta barcode or text)
+    m = re.search(r"(\d{10,15})", s)
+    return m.group(1) if m else None
 
-        # Si aún no hay corridas, necesitamos páginas del PDF para asignarlas.
-        # Si ya las tenemos en sesión (por una carga previa), NO obligamos a re-subir el PDF.
-        if not pdf:
-            pages = st.session_state.get("sorting_parsed_pages")
-            if not pages:
-                st.info("Sube el PDF del manifiesto activo para asignar sus páginas a mesas.")
-                st.stop()
-        else:
-            pages = parse_control_pdf_by_page(pdf)
-        if not pages:
-            st.error("No se pudo leer el PDF.")
-            st.stop()
+def _s2_parse_control_pdf(pdf_bytes: bytes):
+    """Parse Control.pdf into a list of sales with items.
+    Returns: pages_sales: list of dicts {page_no, shipment_id, sale_id, items:[{sku,qty,desc}]}
+    """
+    import pdfplumber, re, io
+    pages_sales = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for pidx, page in enumerate(pdf.pages, start=1):
+            words = page.extract_words() or []
+            # Build lines by grouping similar 'top' (y)
+            # Sort by y then x
+            words_sorted = sorted(words, key=lambda w: (round(float(w.get("top", 0)), 1), float(w.get("x0", 0))))
+            lines = []
+            cur_y = None
+            cur = []
+            for w in words_sorted:
+                y = round(float(w.get("top", 0)), 1)
+                text = w.get("text", "")
+                if cur_y is None or abs(y - cur_y) <= 2.0:
+                    cur.append(text)
+                    cur_y = y if cur_y is None else cur_y
+                else:
+                    if cur:
+                        lines.append(" ".join(cur))
+                    cur = [text]
+                    cur_y = y
+            if cur:
+                lines.append(" ".join(cur))
 
-        manifest_name = getattr(pdf, "name", active["name"]) or active["name"]
-        st.session_state.sorting_parsed_pages = pages
-        st.session_state.sorting_manifest_name = manifest_name
+            # Normalize lines
+            lines = [re.sub(r"\s+", " ", (ln or "").strip()) for ln in lines if (ln or "").strip()]
 
-    else:
-        pdf = st.file_uploader("Control / Manifiesto (PDF)", type=["pdf"], key="sorting_pdf_uploader")
-        zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL) (opcional pero recomendado)", type=["txt"], key="sorting_zpl_uploader")
+            shipment_id = None
+            sale_id = None
+            items = []
+            # First: detect shipment_id (first long number line)
+            for ln in lines[:30]:
+                m = re.search(r"\b(\d{10,15})\b", ln)
+                if m:
+                    shipment_id = m.group(1)
+                    break
+            # Detect sale_id
+            for ln in lines:
+                m = re.search(r"\bVenta\s*:\s*(\d{10,25})\b", ln, flags=re.IGNORECASE)
+                if m:
+                    sale_id = m.group(1)
+                    break
 
-        if not pdf:
-            st.info("Sube el PDF para continuar.")
-            return
+            # Items: look for patterns containing qty + sku
+            for ln in lines:
+                # Typical: "1 11080110100 COMBINACION ..."
+                m = re.match(r"^(\d{1,4})\s+(\d{6,20})\s+(.*)$", ln)
+                if m:
+                    qty = int(m.group(1))
+                    sku = m.group(2)
+                    desc = m.group(3).strip()
+                    if qty > 0:
+                        items.append({"sku": sku, "qty": qty, "desc": desc})
+                    continue
+                # Alternative: sku then qty
+                m2 = re.match(r"^(\d{6,20})\s+(\d{1,4})\b(.*)$", ln)
+                if m2:
+                    sku = m2.group(1)
+                    qty = int(m2.group(2))
+                    desc = (m2.group(3) or "").strip()
+                    if qty > 0:
+                        items.append({"sku": sku, "qty": qty, "desc": desc})
+            if sale_id and items:
+                pages_sales.append({
+                    "page_no": pidx,
+                    "shipment_id": shipment_id,
+                    "sale_id": sale_id,
+                    "items": items
+                })
+    return pages_sales
 
-        pages = parse_control_pdf_by_page(pdf)
-        if not pages:
-            st.error("No se pudo leer el PDF.")
-            return
+def _s2_parse_labels_txt(raw_bytes: bytes):
+    import re, json
+    try:
+        txt = raw_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        txt = str(raw_bytes)
+    shipment_ids = set()
 
-        manifest_name = getattr(pdf, "name", "manifiesto.pdf")
-        if "sorting_parsed_pages" not in st.session_state or st.session_state.get("sorting_manifest_name") != manifest_name:
-            st.session_state.sorting_parsed_pages = pages
-            st.session_state.sorting_manifest_name = manifest_name
+    # JSON id fields
+    for jm in re.finditer(r"\"id\"\s*:\s*\"(\d{8,15})\"", txt):
+        shipment_ids.add(jm.group(1))
 
-        # create manifest row now
-        if "sorting_manifest_id" not in st.session_state:
-            mid = create_sorting_manifest(manifest_name)
-            st.session_state.sorting_manifest_id = mid
+    # Envio: possibly split
+    for em in re.finditer(r"Envio:\s*([0-9 ]{6,30})", txt, flags=re.IGNORECASE):
+        chunk = re.sub(r"\D", "", em.group(1))
+        win = txt[em.end(): em.end() + 160]
+        cont = re.search(r"\^FD\s*([0-9 ]{2,15})\s*\^FS", win)
+        if cont and len(chunk) < 10:
+            chunk2 = re.sub(r"\D", "", cont.group(1))
+            chunk = chunk + chunk2
+        if 10 <= len(chunk) <= 15:
+            shipment_ids.add(chunk)
 
-            # Persistir etiquetas si se subieron (no requiere re-subir tras rerun)
-            if zpl is not None:
-                raw_bytes = zpl.getvalue()
-                if raw_bytes:
-                    st.session_state.sorting_labels_loaded = True
-                    st.session_state.sorting_labels_name = getattr(zpl, "name", "etiquetas.txt")
-                    st.session_state.sorting_labels_bytes = raw_bytes
+    # Any other long number near 'Envío' lines
+    for m in re.finditer(r"\b(\d{10,15})\b", txt):
+        shipment_ids.add(m.group(1))
 
-            # Procesar etiquetas si están cargadas
-            if st.session_state.get("sorting_labels_loaded") and st.session_state.get("sorting_labels_bytes"):
-                raw_bytes = st.session_state.sorting_labels_bytes
-                zpl_hash = hashlib.md5(raw_bytes).hexdigest()
-                if st.session_state.get("sorting_last_zpl_hash") != zpl_hash:
-                    raw = raw_bytes.decode("utf-8", errors="ignore")
-                    pack_map, ship_map = parse_zpl_labels(raw)
-                    upsert_labels_to_db(mid, pack_map, raw)
-                    st.session_state["sorting_last_zpl_hash"] = zpl_hash
-                    st.success("Etiquetas cargadas.")
-        mid = st.session_state.sorting_manifest_id
-    pages = st.session_state.sorting_parsed_pages
+    return sorted(shipment_ids)
 
-    st.subheader("Asignación de páginas a mesas (obligatorio)")
-    st.write(f"Páginas detectadas: **{len(pages)}**. Debes asignar TODAS para continuar.")
-    # assignment UI
-    assignments = st.session_state.get("sorting_assignments", {})
-    used_pages = set(assignments.keys())
-    cols = st.columns(3)
-    with cols[0]:
-        mesa_sel = st.selectbox("Mesa", list(range(1, NUM_MESAS+1)), key="mesa_sel")
-    with cols[1]:
-        unassigned = [p["page_no"] for p in pages if p["page_no"] not in used_pages]
-        page_sel = st.selectbox("Página sin asignar", unassigned if unassigned else [p["page_no"] for p in pages], key="page_sel")
-    with cols[2]:
-        if st.button("➕ Asignar"):
-            assignments[int(page_sel)] = int(mesa_sel)
-            st.session_state.sorting_assignments = assignments
+def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
+    pages_sales = _s2_parse_control_pdf(pdf_bytes)
+    conn = get_conn()
+    c = conn.cursor()
+    # store file
+    c.execute("""INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
+                 VALUES(?, ?, ?, ?)
+                 ON CONFLICT(manifest_id) DO UPDATE SET
+                    control_pdf=excluded.control_pdf,
+                    control_name=excluded.control_name,
+                    updated_at=excluded.updated_at;""", (mid, pdf_bytes, pdf_name, _s2_now_iso()))
+    # clear previous parsed sales/items
+    c.execute("DELETE FROM s2_items WHERE manifest_id=?;", (mid,))
+    c.execute("DELETE FROM s2_sales WHERE manifest_id=?;", (mid,))
+    # insert new
+    for s in pages_sales:
+        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, status)
+                     VALUES(?,?,?,?, 'NEW')
+                     ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
+                        shipment_id=excluded.shipment_id,
+                        page_no=excluded.page_no,
+                        status='NEW',
+                        mesa=NULL,
+                        opened_at=NULL,
+                        closed_at=NULL;""", (mid, s["sale_id"], s["shipment_id"], int(s["page_no"])))
+        for it in s["items"]:
+            c.execute("""INSERT INTO s2_items(manifest_id, sale_id, sku, description, qty, picked, status)
+                         VALUES(?,?,?,?,?,0,'PENDING')
+                         ON CONFLICT(manifest_id, sale_id, sku) DO UPDATE SET
+                            description=excluded.description,
+                            qty=excluded.qty,
+                            picked=0,
+                            status='PENDING';""", (mid, s["sale_id"], str(it["sku"]), it.get("desc",""), int(it["qty"])))
+    conn.commit()
+    conn.close()
+    return len(pages_sales)
+
+def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
+    shipment_ids = _s2_parse_labels_txt(labels_bytes)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
+                 VALUES(?, ?, ?, ?)
+                 ON CONFLICT(manifest_id) DO UPDATE SET
+                    labels_txt=excluded.labels_txt,
+                    labels_name=excluded.labels_name,
+                    updated_at=excluded.updated_at;""", (mid, labels_bytes, labels_name, _s2_now_iso()))
+    for sid in shipment_ids:
+        c.execute("""INSERT INTO s2_labels(manifest_id, shipment_id, raw)
+                     VALUES(?,?,?)
+                     ON CONFLICT(manifest_id, shipment_id) DO UPDATE SET raw=excluded.raw;""", (mid, sid, labels_name))
+    conn.commit()
+    conn.close()
+    return len(shipment_ids)
+
+def _s2_get_pages(mid:int):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("SELECT DISTINCT page_no FROM s2_sales WHERE manifest_id=? ORDER BY page_no;", (mid,))
+    pages=[int(r[0]) for r in c.fetchall()]
+    conn.close()
+    return pages
+
+def _s2_auto_assign_pages(mid:int, num_mesas:int=10):
+    pages=_s2_get_pages(mid)
+    if not pages:
+        return 0
+    conn=get_conn()
+    c=conn.cursor()
+    for i,p in enumerate(pages):
+        mesa = (i % num_mesas) + 1
+        c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
+                     VALUES(?,?,?)
+                     ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (mid, p, mesa))
+    conn.commit()
+    conn.close()
+    return len(pages)
+
+def _s2_get_assignments(mid:int):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("SELECT page_no, mesa FROM s2_page_assign WHERE manifest_id=? ORDER BY page_no;", (mid,))
+    rows=[(int(r[0]), int(r[1])) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+def _s2_set_assignment(mid:int, page_no:int, mesa:int):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("""INSERT INTO s2_page_assign(manifest_id, page_no, mesa)
+                 VALUES(?,?,?)
+                 ON CONFLICT(manifest_id, page_no) DO UPDATE SET mesa=excluded.mesa;""", (mid, int(page_no), int(mesa)))
+    conn.commit()
+    conn.close()
+
+def _s2_create_corridas(mid:int):
+    # apply mesa from page assignments to sales
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("SELECT page_no, mesa FROM s2_page_assign WHERE manifest_id=?;", (mid,))
+    page_to_mesa = {int(p): int(m) for p,m in c.fetchall()}
+    # update sales
+    c.execute("SELECT sale_id, page_no FROM s2_sales WHERE manifest_id=?;", (mid,))
+    sales = c.fetchall()
+    updated=0
+    for sale_id, page_no in sales:
+        mesa = page_to_mesa.get(int(page_no))
+        if mesa is None:
+            continue
+        c.execute("""UPDATE s2_sales
+                     SET mesa=?, status='PENDING', opened_at=NULL, closed_at=NULL
+                     WHERE manifest_id=? AND sale_id=?;""", (mesa, mid, sale_id))
+        updated += 1
+    conn.commit()
+    conn.close()
+    return updated
+
+def _s2_find_sale_for_scan(mid:int, mesa:int, shipment_id:str):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("""SELECT sale_id FROM s2_sales
+                 WHERE manifest_id=? AND mesa=? AND shipment_id=? AND status='PENDING'
+                 ORDER BY page_no, sale_id
+                 LIMIT 1;""", (mid, int(mesa), str(shipment_id)))
+    row=c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def _s2_sale_items(mid:int, sale_id:str):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("""SELECT sku, description, qty, picked, status
+                 FROM s2_items WHERE manifest_id=? AND sale_id=? ORDER BY sku;""", (mid, sale_id))
+    rows=c.fetchall()
+    conn.close()
+    return rows
+
+def _s2_apply_pick(mid:int, sale_id:str, sku:str, add_qty:int):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("""SELECT qty, picked FROM s2_items
+                 WHERE manifest_id=? AND sale_id=? AND sku=?;""", (mid, sale_id, sku))
+    row=c.fetchone()
+    if not row:
+        conn.close()
+        return False, "SKU no pertenece a esta venta"
+    qty, picked = int(row[0]), int(row[1])
+    new_picked = min(qty, picked + int(add_qty))
+    status = "DONE" if new_picked >= qty else "PENDING"
+    c.execute("""UPDATE s2_items SET picked=?, status=? WHERE manifest_id=? AND sale_id=? AND sku=?;""", 
+              (new_picked, status, mid, sale_id, sku))
+    # if all done, allow close
+    conn.commit()
+    conn.close()
+    return True, None
+
+def _s2_is_sale_done(mid:int, sale_id:str):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("""SELECT COUNT(1) FROM s2_items WHERE manifest_id=? AND sale_id=? AND status!='DONE';""", (mid, sale_id))
+    rem=int(c.fetchone()[0] or 0)
+    conn.close()
+    return rem==0
+
+def _s2_close_sale(mid:int, sale_id:str):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("""UPDATE s2_sales SET status='DONE', closed_at=? WHERE manifest_id=? AND sale_id=?;""", (_s2_now_iso(), mid, sale_id))
+    conn.commit()
+    conn.close()
+
+def _s2_reset_all():
+    conn=get_conn()
+    c=conn.cursor()
+    for t in ["s2_labels","s2_items","s2_sales","s2_page_assign","s2_files","s2_manifests"]:
+        c.execute(f"DROP TABLE IF EXISTS {t};")
+    conn.commit()
+    conn.close()
+
+def page_sorting_upload(inv_map_sku, barcode_to_sku):
+    _s2_create_tables()
+    st.title("Sorting - Carga y Corridas")
+
+    mid = _s2_get_active_manifest_id()
+    st.session_state["sorting_manifest_id"] = mid
+
+    st.caption(f"Manifiesto activo: {mid}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf")
+    with col2:
+        zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt","zpl"], key="s2_labels_txt")
+
+    if pdf is not None:
+        n_sales = _s2_upsert_control(mid, getattr(pdf,"name","control.pdf"), pdf.getvalue())
+        st.success(f"Control cargado. Ventas detectadas: {n_sales}")
+        _s2_auto_assign_pages(mid, num_mesas=10)
+
+    if zpl is not None:
+        n_labels = _s2_upsert_labels(mid, getattr(zpl,"name","etiquetas.txt"), zpl.getvalue())
+        st.success(f"Etiquetas cargadas. IDs detectados: {n_labels}")
+
+    pages = _s2_get_pages(mid)
+    if not pages:
+        st.info("Sube el Control.pdf para continuar.")
+        return
+
+    st.subheader("Asignación Página → Mesa")
+    assigns = dict(_s2_get_assignments(mid))
+    for p in pages:
+        cur = assigns.get(p, 1)
+        new_mesa = st.number_input(f"Página {p} → Mesa", min_value=1, max_value=50, value=int(cur), key=f"s2_mesa_{p}")
+        if int(new_mesa) != int(cur):
+            _s2_set_assignment(mid, p, int(new_mesa))
+
+    # Validate all pages assigned
+    assigns = dict(_s2_get_assignments(mid))
+    missing = [p for p in pages if p not in assigns]
+    if missing:
+        st.warning(f"Faltan páginas por asignar: {missing}")
+        if st.button("Auto-asignar faltantes", use_container_width=True):
+            _s2_auto_assign_pages(mid, num_mesas=10)
             st.rerun()
 
-    # show table
-    df_assign = pd.DataFrame([{"Página": p["page_no"], "Mesa": assignments.get(p["page_no"], "")} for p in pages])
-    st.dataframe(df_assign, use_container_width=True, hide_index=True)
+    st.divider()
+    if st.button("✅ Crear corridas", use_container_width=True):
+        created = _s2_create_corridas(mid)
+        if created <= 0:
+            st.error("No se crearon corridas. Revisa asignación de páginas.")
+        else:
+            st.success(f"Corridas creadas/actualizadas: {created}")
+            st.session_state["s2_last_created"] = created
 
-    missing = [p["page_no"] for p in pages if p["page_no"] not in assignments]
-    if missing:
-        st.error(f"Faltan páginas por asignar: {missing}")
-        st.stop()
+def page_sorting_camarero(inv_map_sku, barcode_to_sku):
+    _s2_create_tables()
+    st.title("Sorting - Camarero (por etiqueta)")
+    mid = _s2_get_active_manifest_id()
+    st.session_state["sorting_manifest_id"] = mid
 
-    if st.button("✅ Crear corridas"):
-        create_runs_and_items(mid, assignments, pages, inv_map_sku, barcode_to_sku)
-        st.success("Corridas creadas. Ve a 'Camarero'.")
+    mesa = st.number_input("Mesa", min_value=1, max_value=50, value=int(st.session_state.get("s2_mesa", 1)), key="s2_mesa")
+    st.session_state["s2_mesa"] = int(mesa)
+
+    # State: current sale
+    if "s2_sale_open" not in st.session_state:
+        st.session_state["s2_sale_open"] = None
+
+    if st.session_state["s2_sale_open"] is None:
+        st.subheader("Escanea etiqueta (QR Flex o barra Colecta)")
+        scan = st.text_input("Etiqueta", key="s2_label_scan")
+        if scan:
+            sid = _s2_extract_shipment_id(scan)
+            if not sid:
+                st.error("No pude leer el ID de envío desde el escaneo.")
+            else:
+                sale_id = _s2_find_sale_for_scan(mid, int(mesa), sid)
+                if not sale_id:
+                    # debug: exists in other mesa?
+                    conn=get_conn(); c=conn.cursor()
+                    c.execute("SELECT mesa, status FROM s2_sales WHERE manifest_id=? AND shipment_id=? LIMIT 5;", (mid, sid))
+                    info=c.fetchall(); conn.close()
+                    if info:
+                        st.warning(f"Etiqueta encontrada pero no pendiente en mesa {mesa}. Coincidencias: {info}")
+                    else:
+                        st.error("No encontré esta etiqueta en corridas pendientes.")
+                else:
+                    st.session_state["s2_sale_open"] = sale_id
+                    st.session_state["s2_label_scan"] = ""
+                    st.rerun()
+        return
+
+    sale_id = st.session_state["s2_sale_open"]
+    st.info(f"Venta abierta: {sale_id}")
+
+    items = _s2_sale_items(mid, sale_id)
+    # show items
+    for sku, desc, qty, picked, status in items:
+        st.write(f"- **{sku}** | {desc} | {picked}/{qty} [{status}]")
+
+    st.subheader("Escanea SKU/EAN del producto")
+    sku_scan = st.text_input("Producto", key="s2_prod_scan")
+    qty_add = st.number_input("Cantidad", min_value=1, max_value=999, value=1, key="s2_prod_qty")
+    if st.button("✅ Confirmar", use_container_width=True):
+        raw = sku_scan.strip()
+        if not raw:
+            st.warning("Escanea un código primero.")
+        else:
+            # map barcode -> sku if needed
+            sku = barcode_to_sku.get(raw, raw) if isinstance(barcode_to_sku, dict) else raw
+            ok, msg = _s2_apply_pick(mid, sale_id, str(sku), int(qty_add))
+            if not ok:
+                st.error(msg)
+            else:
+                st.session_state["s2_prod_scan"] = ""
+                st.session_state["s2_prod_qty"] = 1
+                st.rerun()
+
+    done = _s2_is_sale_done(mid, sale_id)
+    if done:
+        if st.button("✅ Cerrar venta", use_container_width=True):
+            _s2_close_sale(mid, sale_id)
+            st.session_state["s2_sale_open"] = None
+            st.session_state["s2_prod_scan"] = ""
+            st.session_state["s2_label_scan"] = ""
+            st.success("Venta cerrada.")
+            st.rerun()
+    else:
+        st.caption("Cierra la venta cuando todos los ítems estén completos.")
+
+def page_sorting_admin(inv_map_sku, barcode_to_sku):
+    _s2_create_tables()
+    st.title("Sorting - Admin")
+    mid = _s2_get_active_manifest_id()
+    st.session_state["sorting_manifest_id"] = mid
+
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("SELECT COUNT(1) FROM s2_sales WHERE manifest_id=?;", (mid,))
+    sales=int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(1) FROM s2_sales WHERE manifest_id=? AND status='PENDING';", (mid,))
+    pending=int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(1) FROM s2_sales WHERE manifest_id=? AND status='DONE';", (mid,))
+    done=int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(1) FROM s2_labels WHERE manifest_id=?;", (mid,))
+    labels=int(c.fetchone()[0] or 0)
+    conn.close()
+
+    st.write(f"Manifiesto activo: **{mid}**")
+    st.write(f"Ventas: **{sales}** | Pendientes: **{pending}** | Cerradas: **{done}** | Etiquetas: **{labels}**")
+
+    st.subheader("🗑️ Reiniciar corrida (BORRA TODO Sorting)")
+    if st.button("BORRAR TODO Sorting (confirmado)", type="primary", use_container_width=True):
+        _s2_reset_all()
+        # clear session
+        for k in list(st.session_state.keys()):
+            if k.startswith("s2_") or k.startswith("sorting_"):
+                del st.session_state[k]
+        st.success("Sorting reiniciado. Vuelve a cargar Control y etiquetas.")
         st.rerun()
+
 
 def get_next_run_for_mesa(mesa: int):
     conn = get_conn()
@@ -2663,115 +3060,8 @@ def maybe_close_manifest_if_done():
         for k in ["sorting_manifest_id","sorting_parsed_pages","sorting_manifest_name","sorting_assignments"]:
             st.session_state.pop(k, None)
 
-def page_sorting_camarero(inv_map_sku: dict, barcode_to_sku: dict):
-    st.header("👷 Camarero")
-    mesa = st.selectbox("Selecciona tu mesa", list(range(1, NUM_MESAS+1)), key="camarero_mesa")
 
-    run = get_next_run_for_mesa(mesa)
-    if not run:
-        st.success("No hay corridas pendientes para esta mesa.")
-        maybe_close_manifest_if_done()
-        return
 
-    run_id = run["run_id"]
-    group = get_next_group(run_id)
-    if not group:
-        maybe_close_run(run_id)
-        st.rerun()
-
-    # group metrics
-    items = group["items"]
-    cnt_lines = len(items)
-    cnt_units = sum(int(x["qty"] or 1) for x in items)
-    done_lines = sum(1 for x in items if x["status"]=='DONE')
-    # global progress for run
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT SUM(CASE WHEN status='DONE' THEN 1 ELSE 0 END), COUNT(1) FROM sorting_run_items WHERE run_id=?;", (run_id,))
-    g_done, g_total = c.fetchone()
-    conn.close()
-    g_done = g_done or 0
-    g_total = g_total or 0
-
-    # Header big
-    st.markdown(f"### Mesa {mesa} • Corrida Página {run['page_no']} • {run['manifest_name']}")
-    ship = items[0].get("shipment_id") or "-"
-    buyer = items[0].get("buyer") or "-"
-    addr = clean_address(items[0].get("address") or "") or "-"
-    st.markdown(f"## VENTA: {group['ml_order_id']}")
-    st.markdown(f"### Pack ID: {group['pack_id']} • Etiqueta/Envío: {ship}")
-    st.markdown(f"### En esta etiqueta: **{cnt_lines}** producto(s) / **{cnt_units}** unidad(es) • Progreso: **{done_lines}/{cnt_lines}** • Corrida: **{g_done}/{g_total}**")
-    st.markdown(f"**Cliente:** {buyer}")
-    st.markdown(f"**Dirección:** {addr}")
-
-    st.markdown("---")
-    st.subheader("Productos de esta venta/etiqueta")
-
-    # List items with scan input per item
-    for idx, it in enumerate(items):
-        title = it["title_tec"] or it["title_ml"] or "(Sin nombre)"
-        st.markdown(f"**SKU:** {it['sku']}  {'✅' if it['status']=='DONE' else '🟠 PENDIENTE'}")
-        st.markdown(f"### {title}")
-        st.markdown(f"### Requiere: **{it['qty']}** unidad(es)")
-        key_scan = f"scan_{run_id}_{group['ml_order_id']}_{group['pack_id']}_{it['id']}"
-        val = st.text_input("Escaneo", value="", key=key_scan, label_visibility="collapsed", placeholder="Escanea SKU/EAN aquí")
-        col1, col2, col3 = st.columns([1,1,1])
-        with col1:
-            if st.button("Validar", key=f"btn_val_{it['id']}"):
-                scanned = (val or "").strip()
-                ok = False
-                if scanned:
-                    # Map EAN to SKU if possible
-                    sku_scanned = barcode_to_sku.get(scanned, scanned)
-                    ok = (sku_scanned == str(it["sku"]))
-                if ok or not scanned:
-                    mark_item_done(it["id"])
-                    st.success("OK")
-                    st.rerun()
-                else:
-                    st.error("Código no corresponde a este SKU.")
-        with col2:
-            if st.button("Sin EAN", key=f"btn_noean_{it['id']}"):
-                mark_item_done(it["id"])
-                st.rerun()
-        with col3:
-            if st.button("Incidencia (faltante)", key=f"btn_inc_{it['id']}"):
-                mark_item_incidence(it["id"], "Faltante")
-                st.rerun()
-        st.markdown("---")
-
-    # If all done, move next group
-    if all(x["status"]=='DONE' for x in get_next_group(run_id)["items"]):
-        maybe_close_run(run_id)
-        maybe_close_manifest_if_done()
-        st.success("✅ Venta/Etiqueta completada. Pasando a la siguiente…")
-        st.rerun()
-
-def page_sorting_admin():
-    st.header("📊 Admin")
-    active = get_active_sorting_manifest()
-    if not active:
-        st.info("No hay manifiesto activo.")
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        """SELECT page_no, mesa, status,
-                   (SELECT SUM(CASE WHEN status='DONE' THEN 1 ELSE 0 END) FROM sorting_run_items i WHERE i.run_id=r.id) as done,
-                   (SELECT COUNT(1) FROM sorting_run_items i WHERE i.run_id=r.id) as total
-             FROM sorting_runs r
-             WHERE manifest_id=?
-             ORDER BY page_no ASC;""",
-        (active["id"],)
-    )
-    rows = c.fetchall()
-    conn.close()
-    df = pd.DataFrame(rows, columns=["Página","Mesa","Estado","OK","Total"])
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-# =========================
-# MAIN
-# =========================
 def main():
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
     init_db()
