@@ -2309,61 +2309,89 @@ def parse_zpl_labels(raw: str):
     return pack_map, ship_map
 
 def parse_control_pdf_by_page(pdf_file):
+    """Parsea Control.pdf (Flex/Colecta) por página.
+
+    Devuelve lista de páginas:
+      [{"page_no": int, "items": [ {shipment_id, ml_order_id, pack_id, sku, qty, title_ml, buyer} ... ]}]
+    """
     if not HAS_PDF_LIB:
         st.error("Falta pdfplumber en el entorno.")
         return None
+
     pages = []
     with pdfplumber.open(pdf_file) as pdf:
         for pno, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
-            lines = [x.strip() for x in text.split("\n") if x.strip()]
-            items = []
-            seq = 0
-            current_pack = None
-            current_order = None
-            current_buyer = None
-            for ln in lines:
-                # detect pack/order
-                m = re.search(r"Pack ID:\s*(\d+)", ln)
-                if m:
-                    current_pack = m.group(1)
-                    continue
-                m = re.search(r"Venta:\s*(\d+)", ln)
-                if m:
-                    current_order = m.group(1)
-                    continue
-                m = re.search(r"Nombre\s+Cantidad:\s*(.+)$", ln)
-                if m:
-                    current_buyer = m.group(1).strip()
-                    continue
-                # SKU + qty line sometimes combined
-                msku = re.search(r"SKU:\s*([0-9A-Za-z]+)", ln)
-                mqty = re.search(r"Cantidad:\s*(\d+)", ln)
-                if msku and mqty:
-                    sku = msku.group(1)
-                    qty = int(mqty.group(1))
-                    seq += 1
-                    items.append({
-                        "seq": seq,
-                        "ml_order_id": current_order,
-                        "pack_id": current_pack,
-                        "sku": sku,
-                        "qty": qty,
-                        "title_ml": "",
-                        "buyer": current_buyer
-                    })
-                    continue
-                # title line heuristics: if line looks like product title and last item has empty title
-                if items and not items[-1]["title_ml"]:
-                    # avoid attribute lines like "Acabado: Mate"
-                    if ":" in ln and not re.search(r"\bMELI\b", ln, re.IGNORECASE):
-                        # treat as attribute not title
-                        pass
-                    else:
-                        items[-1]["title_ml"] = ln[:200]
-            pages.append({"page_no": pno, "items": items})
-    return pages
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
+            items = []
+            cur = None
+
+            def finalize():
+                nonlocal cur
+                if not cur:
+                    return
+                if cur.get("ml_order_id") and cur.get("sku") and cur.get("qty"):
+                    items.append({
+                        "shipment_id": cur.get("shipment_id", ""),
+                        "ml_order_id": cur.get("ml_order_id"),
+                        "pack_id": cur.get("pack_id"),
+                        "sku": cur.get("sku"),
+                        "qty": int(cur.get("qty")),
+                        "title_ml": (cur.get("title_ml") or cur.get("product") or "")[:200],
+                        "buyer": (cur.get("buyer") or "")[:120],
+                    })
+                cur = None
+
+            for ln in lines:
+                m_ship = re.match(r"^(\d{8,15})\s+(.+)$", ln)
+                if m_ship and not ln.lower().startswith("venta"):
+                    finalize()
+                    cur = {
+                        "shipment_id": m_ship.group(1),
+                        "product": m_ship.group(2).strip(),
+                        "title_ml": m_ship.group(2).strip(),
+                    }
+                    continue
+
+                if cur is None:
+                    if re.search(r"\bVenta:\s*\d+", ln, flags=re.I) or re.search(r"\bPack\s*ID:", ln, flags=re.I):
+                        cur = {}
+                    else:
+                        continue
+
+                m_pack = re.match(r"^Pack\s*ID:\s*(\d{8,20})(?:\s+SKU:([0-9A-Za-z_-]+))?", ln, flags=re.I)
+                if m_pack:
+                    cur["pack_id"] = m_pack.group(1)
+                    if m_pack.group(2):
+                        cur["sku"] = m_pack.group(2)
+                    continue
+
+                m_sale = re.match(r"^Venta:\s*(\d{8,20})(?:\s+SKU:([0-9A-Za-z_-]+))?(?:\s+Cantidad:\s*(\d+))?", ln, flags=re.I)
+                if m_sale:
+                    cur["ml_order_id"] = m_sale.group(1)
+                    if m_sale.group(2):
+                        cur["sku"] = m_sale.group(2)
+                    if m_sale.group(3):
+                        cur["qty"] = int(m_sale.group(3))
+                    continue
+
+                m_qty = re.search(r"\bCantidad:\s*(\d+)\b", ln, flags=re.I)
+                if m_qty and not cur.get("qty"):
+                    cur["qty"] = int(m_qty.group(1))
+                    buyer = ln[:m_qty.start()].strip(" -•\t")
+                    if buyer and len(buyer) <= 120 and not re.search(r"\bColor\b|\bAcabado\b|\bModelo\b|\bTama", buyer, flags=re.I):
+                        cur["buyer"] = buyer
+                    continue
+
+                if not cur.get("title_ml"):
+                    if ":" not in ln and len(ln) >= 8 and not re.match(r"^(Despacha|Identif|Pack\s*ID|Venta:)", ln, flags=re.I):
+                        cur["title_ml"] = ln[:200]
+
+            finalize()
+            pages.append({"page_no": pno, "items": items})
+
+    return pages
 def upsert_labels_to_db(manifest_id: int, pack_map: dict, raw: str):
     conn = get_conn()
     c = conn.cursor()
