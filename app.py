@@ -2588,6 +2588,42 @@ def _s2_get_active_manifest_id():
     conn.close()
     return mid
 
+
+def _s2_parse_label_raw_info(raw: str):
+    """Extrae info visible de una etiqueta (nombre, dirección, comuna, etc.) desde el texto raw."""
+    import re
+    if not raw:
+        return {}
+    s = str(raw).replace("\r", "\n")
+    info = {}
+    m = re.search(r"Destinatario\s*:\s*(.+)", s, flags=re.IGNORECASE)
+    if m:
+        info["destinatario"] = m.group(1).strip()
+    m = re.search(r"Direccion\s*:\s*(.+)", s, flags=re.IGNORECASE)
+    if m:
+        info["direccion"] = m.group(1).strip()
+    m = re.search(r"Comuna\s*:\s*(.+)", s, flags=re.IGNORECASE)
+    if m:
+        info["comuna"] = m.group(1).strip()
+    m = re.search(r"Ciudad\s*de\s*destino\s*:\s*(.+)", s, flags=re.IGNORECASE)
+    if m:
+        info["ciudad_destino"] = m.group(1).strip()
+    m = re.search(r"Domicilio\s*:\s*(.+)", s, flags=re.IGNORECASE)
+    if m and "direccion" not in info:
+        info["direccion"] = m.group(1).strip()
+    if "destinatario" not in info:
+        m = re.search(r"^\s*([A-ZÁÉÍÓÚÑ][^\n]{3,60})\s*\(([^\n]{2,30})\)\s*$", s, flags=re.M)
+        if m:
+            info["destinatario"] = m.group(1).strip()
+    return info
+
+def _s2_get_label_raw(mid:int, shipment_id:str):
+    conn=get_conn()
+    c=conn.cursor()
+    row=c.execute("SELECT raw FROM s2_labels WHERE manifest_id=? AND shipment_id=?;", (mid, str(shipment_id))).fetchone()
+    conn.close()
+    return row[0] if row else ""
+
 def _s2_extract_shipment_id(scan_raw: str):
     import re, json
     if not scan_raw:
@@ -3277,7 +3313,8 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
 
 def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
-    st.title("Sorting - Camarero (por etiqueta)")
+    st.title("Camarero")
+    st.caption("Escaneo por etiqueta (Flex/Colecta) y productos por SKU/EAN")
     mid = _s2_get_active_manifest_id()
     st.session_state["sorting_manifest_id"] = mid
 
@@ -3321,10 +3358,68 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     sale_id = st.session_state["s2_sale_open"]
     st.info(f"Venta abierta: {sale_id}")
 
+
+    # Información de la etiqueta / envío
+    conn=get_conn(); c=conn.cursor()
+    sale_row = c.execute("SELECT shipment_id, pack_id, customer, page_no, mesa, status FROM s2_sales WHERE manifest_id=? AND sale_id=?;", (mid, sale_id)).fetchone()
+    conn.close()
+    shipment_id = sale_row[0] if sale_row else ""
+    pack_id = sale_row[1] if sale_row else ""
+    customer = sale_row[2] if sale_row else ""
+    page_no = sale_row[3] if sale_row else ""
+    mesa_db = sale_row[4] if sale_row else ""
+
+    raw_label = _s2_get_label_raw(mid, shipment_id) if shipment_id else ""
+    info = _s2_parse_label_raw_info(raw_label)
+
+    st.markdown("### Etiqueta / Envío")
+    a,b,cx = st.columns(3)
+    a.metric("Envío", str(shipment_id) if shipment_id else "-")
+    b.metric("Pack ID", str(pack_id) if pack_id else "-")
+    cx.metric("Mesa / Página", f"{mesa_db}/{page_no}" if page_no else str(mesa_db))
+
+    name = info.get("destinatario") or customer or "-"
+    addr = info.get("direccion") or "-"
+    comuna = info.get("comuna") or info.get("ciudad_destino") or "-"
+    st.write(f"**Destinatario:** {name}")
+    st.write(f"**Dirección:** {addr}")
+    st.write(f"**Comuna/Ciudad:** {comuna}")
+
     items = _s2_sale_items(mid, sale_id)
-    # show items
+
+    st.markdown("### Productos de la venta")
+    total_items = len(items)
+    done_items = sum(1 for _sku,_d,_q,_p,stx in items if stx in ("DONE","INCIDENCE"))
+    st.progress(0 if total_items==0 else done_items/total_items)
+    st.caption(f"{done_items}/{total_items} ítems finalizados (DONE o INCIDENCE)")
+
     for sku, desc, qty, picked, status in items:
-        st.write(f"- **{sku}** | {desc} | {picked}/{qty} [{status}]")
+        title = None
+        if isinstance(inv_map_sku, dict):
+            k = str(sku).strip()
+            title = inv_map_sku.get(k)
+            if title is None and k.isdigit():
+                try:
+                    title = inv_map_sku.get(str(int(k)))
+                except Exception:
+                    pass
+        title = title or desc or str(sku)
+
+        remaining = max(0, int(qty) - int(picked))
+        row1 = st.columns([6, 2, 2])
+        row1[0].markdown(f"**{title}**  \nSKU: `{sku}`")
+        row1[1].metric("Cant.", int(qty))
+        row1[2].metric("Hecho", int(picked))
+
+        if status != "DONE" and remaining > 0:
+            bcols = st.columns([1,1,6])
+            if bcols[0].button("⚠️ Incidencia", key=f"s2_inc_{sale_id}_{sku}"):
+                _s2_mark_incidence(mid, sale_id, str(sku))
+                st.rerun()
+            if bcols[1].button("📝 Sin EAN", key=f"s2_noean_{sale_id}_{sku}"):
+                _s2_force_done_no_ean(mid, sale_id, str(sku))
+                st.rerun()
+        st.divider()
 
     st.subheader("Escanea SKU/EAN del producto")
     # Limpieza segura del campo de producto (evita StreamlitAPIException)
@@ -3346,26 +3441,29 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             st.session_state["s2_clear_prod_scan"] = True
             st.rerun()
 
+
     done = _s2_is_sale_done(mid, sale_id)
+
+    st.subheader("Cerrar venta")
     if done:
-        if st.button("✅ Cerrar venta", use_container_width=True):
-            _s2_close_sale(mid, sale_id)
-            st.session_state["s2_sale_open"] = None
-            st.session_state["s2_clear_prod_scan"] = True
-            st.rerun()
-            st.session_state["s2_clear_label_scan"] = True
-            st.rerun()
-            st.success("Venta cerrada.")
-            st.rerun()
+        c1, c2 = st.columns([1,2])
+        with c1:
+            confirm_close = st.checkbox("Confirmo cierre", key=f"s2_confirm_close_{sale_id}")
+        with c2:
+            if st.button("✅ Cerrar venta y volver a escanear etiqueta", key=f"s2_close_{sale_id}", use_container_width=True, disabled=not confirm_close):
+                _s2_close_sale(mid, sale_id)
+                st.session_state["s2_sale_open"] = None
+                st.session_state["s2_clear_prod_scan"] = True
+                st.session_state["s2_clear_label_scan"] = True
+                st.rerun()
     else:
-        st.caption("Cierra la venta cuando todos los ítems estén completos.")
+        st.info("Para cerrar: completa todos los productos o márcalos como Incidencia / Sin EAN.")
 
 
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
-    st.title("Sorting · Administrador")
-    st.title("Sorting · Administrador")
+    st.title("Administrador")
 
 
 
@@ -3641,11 +3739,11 @@ def main():
         page = st.sidebar.radio("Menú", pages, index=0)
 
         if page.startswith("1"):
-            page_picking()
+            page_sorting_camarero(inv_map_sku, barcode_to_sku)
         elif page.startswith("2"):
-            page_import(inv_map_sku)
+            page_sorting_upload(inv_map_sku, barcode_to_sku)
         else:
-            page_admin()
+            page_sorting_admin(inv_map_sku, barcode_to_sku)
 
 
     # ==========
@@ -3653,9 +3751,9 @@ def main():
     # ==========
     elif mode == "SORTING":
         pages = [
-            "1) Cargar manifiesto y asignar mesas",
-            "2) Camarero",
-            "3) Admin",
+            "1) Camarero",
+            "2) Cargar manifiesto y asignar mesas",
+            "3) Administrador",
         ]
         page = st.sidebar.radio("Menú", pages, index=0)
 
