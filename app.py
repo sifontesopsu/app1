@@ -2893,42 +2893,65 @@ def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
 
 
 def _s2_get_stats(mid: int):
-    """Return useful reconciliation stats for current manifest."""
+    """
+    Return useful reconciliation stats for current manifest.
+    Schema-tolerant: avoids sqlite3.OperationalError if columns are missing.
+    """
     conn = get_conn()
     c = conn.cursor()
 
-    ventas = c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?", (mid,)).fetchone()[0]
-    items = c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?", (mid,)).fetchone()[0]
-    ventas_with_ship = c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!=''", (mid,)).fetchone()[0]
-    ventas_with_pack = c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!=''", (mid,)).fetchone()[0]
-    distinct_packs = c.execute("SELECT COUNT(DISTINCT pack_id) FROM s2_sales WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!=''", (mid,)).fetchone()[0]
+    def has_col(table: str, col: str) -> bool:
+        try:
+            cols = [r[1] for r in c.execute(f"PRAGMA table_info({table});").fetchall()]
+            return col in cols
+        except Exception:
+            return False
 
-    etiquetas = c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=?", (mid,)).fetchone()[0]
-    distinct_ship_labels = c.execute("SELECT COUNT(DISTINCT shipment_id) FROM s2_labels WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!=''", (mid,)).fetchone()[0]
-    labels_with_pack = c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!=''", (mid,)).fetchone()[0]
-    labels_with_sale = c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND sale_id IS NOT NULL AND sale_id!=''", (mid,)).fetchone()[0]
+    stats = {}
 
-    matched_by_pack = c.execute("""SELECT COUNT(*) FROM s2_sales s
-                                   JOIN s2_pack_ship ps
-                                     ON ps.manifest_id=s.manifest_id AND ps.pack_id=s.pack_id
-                                   WHERE s.manifest_id=? AND s.pack_id IS NOT NULL AND s.pack_id!=''""", (mid,)).fetchone()[0]
+    stats["sales_total"] = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?;", (mid,)).fetchone()[0] or 0)
+    stats["sales_pending"] = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status='PENDING';", (mid,)).fetchone()[0] or 0)
+    stats["sales_done"] = int(c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND status='DONE';", (mid,)).fetchone()[0] or 0)
 
-    # how many sales are still missing shipment_id
-    missing_ship = c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='')", (mid,)).fetchone()[0]
+    stats["items_total"] = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?;", (mid,)).fetchone()[0] or 0)
+    stats["items_pending"] = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='PENDING';", (mid,)).fetchone()[0] or 0)
+    stats["items_done"] = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='DONE';", (mid,)).fetchone()[0] or 0)
+    stats["items_incidence"] = int(c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=? AND status='INCIDENCE';", (mid,)).fetchone()[0] or 0)
 
-    return {
-        "ventas": ventas,
-        "items": items,
-        "ventas_with_ship": ventas_with_ship,
-        "ventas_with_pack": ventas_with_pack,
-        "distinct_packs": distinct_packs,
-        "etiquetas": etiquetas,
-        "distinct_ship_labels": distinct_ship_labels,
-        "labels_with_pack": labels_with_pack,
-        "labels_with_sale": labels_with_sale,
-        "matched_by_pack": matched_by_pack,
-        "missing_ship": missing_ship,
-    }
+    stats["labels_total"] = int(c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=?;", (mid,)).fetchone()[0] or 0)
+
+    # labels_with_pack: only if pack_id column exists
+    if has_col("s2_labels", "pack_id"):
+        stats["labels_with_pack"] = int(
+            c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!='';", (mid,)).fetchone()[0] or 0
+        )
+    else:
+        stats["labels_with_pack"] = 0
+
+    # shipment_id may exist in s2_labels
+    if has_col("s2_labels", "shipment_id"):
+        stats["labels_with_ship"] = int(
+            c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!='';", (mid,)).fetchone()[0] or 0
+        )
+        stats["labels_unique_ship"] = int(
+            c.execute("SELECT COUNT(DISTINCT shipment_id) FROM s2_labels WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!='';", (mid,)).fetchone()[0] or 0
+        )
+    else:
+        stats["labels_with_ship"] = 0
+        stats["labels_unique_ship"] = 0
+
+    # sales_with_ship: only if column exists
+    if has_col("s2_sales", "shipment_id"):
+        stats["sales_with_ship"] = int(
+            c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!='';", (mid,)).fetchone()[0] or 0
+        )
+        stats["sales_missing_ship"] = stats["sales_total"] - stats["sales_with_ship"]
+    else:
+        stats["sales_with_ship"] = 0
+        stats["sales_missing_ship"] = stats["sales_total"]
+
+    conn.close()
+    return stats
 
 def _s2_reset_all_sorting():
     """Hard reset of Sorting module only (keeps other modules intact)."""
