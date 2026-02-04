@@ -3364,15 +3364,30 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
-    st.title("Sorting · Administradoristrador")
+    st.title("Sorting · Administrador")
+    st.title("Sorting · Administrador")
+
+
+
+
+    mid = None
+    try:
+        mid = _s2_get_active_manifest_id()
+    except Exception:
+        mid = None
+    if not mid:
+        st.warning("No hay manifiesto activo. Primero carga Control + Etiquetas y crea corridas.")
+        return
+    conn = get_conn()
+    c = conn.cursor()
+
+    # archivo/control info
+    f = c.execute("SELECT control_name, labels_name, updated_at FROM s2_files WHERE manifest_id=?", (mid,)).fetchone()
+    stats = _s2_get_stats(mid)
 
 
 
     st.subheader("Trazabilidad")
-
-    conn = get_conn()
-    c = conn.cursor()
-
     # Ventas por mesa
     rows = c.execute(
         "SELECT mesa, COUNT(*) as ventas, "
@@ -3426,14 +3441,6 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
 
     conn.close()
 
-
-    mid = _s2_get_active_manifest_id()
-    conn = get_conn()
-    c = conn.cursor()
-
-    # archivo/control info
-    f = c.execute("SELECT control_name, labels_name, updated_at FROM s2_files WHERE manifest_id=?", (mid,)).fetchone()
-    stats = _s2_get_stats(mid)
 
     st.subheader("Estado del manifiesto activo")
     colA, colB, colC, colD = st.columns(4)
@@ -3491,8 +3498,6 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
                 del st.session_state[k]
         st.success("Sorting reiniciado completamente.")
         st.rerun()
-
-
 def get_next_run_for_mesa(mesa: int):
     conn = get_conn()
     c = conn.cursor()
