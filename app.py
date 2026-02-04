@@ -3739,11 +3739,11 @@ def main():
         page = st.sidebar.radio("Menú", pages, index=0)
 
         if page.startswith("1"):
-            page_picking(inv_map_sku, barcode_to_sku)
+            page_picking()
         elif page.startswith("2"):
             page_import(inv_map_sku)
         else:
-            page_admin(inv_map_sku, barcode_to_sku)
+            page_admin()
 
     elif mode == "SORTING":
         pages = [
