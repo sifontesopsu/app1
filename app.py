@@ -3154,10 +3154,32 @@ def _s2_apply_pick(mid:int, sale_id:str, sku:str, add_qty:int):
     conn.close()
     return True, None
 
+
+def _s2_mark_incidence(mid:int, sale_id:str, sku:str, note:str=""):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("UPDATE s2_items SET status='INCIDENCE' WHERE manifest_id=? AND sale_id=? AND sku=?;", (mid, sale_id, sku))
+    conn.commit()
+    conn.close()
+
+def _s2_force_done_no_ean(mid:int, sale_id:str, sku:str):
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("SELECT qty, picked FROM s2_items WHERE manifest_id=? AND sale_id=? AND sku=?;", (mid, sale_id, sku))
+    row=c.fetchone()
+    if not row:
+        conn.close()
+        return False
+    qty=int(row[0] or 0)
+    c.execute("UPDATE s2_items SET picked=?, status='DONE' WHERE manifest_id=? AND sale_id=? AND sku=?;", (qty, mid, sale_id, sku))
+    conn.commit()
+    conn.close()
+    return True
+
 def _s2_is_sale_done(mid:int, sale_id:str):
     conn=get_conn()
     c=conn.cursor()
-    c.execute("""SELECT COUNT(1) FROM s2_items WHERE manifest_id=? AND sale_id=? AND status!='DONE';""", (mid, sale_id))
+    c.execute("""SELECT COUNT(1) FROM s2_items WHERE manifest_id=? AND sale_id=? AND status NOT IN ('DONE','INCIDENCE');""", (mid, sale_id))
     rem=int(c.fetchone()[0] or 0)
     conn.close()
     return rem==0
@@ -3305,29 +3327,32 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         st.write(f"- **{sku}** | {desc} | {picked}/{qty} [{status}]")
 
     st.subheader("Escanea SKU/EAN del producto")
-    sku_scan = st.text_input("Producto", key="s2_prod_scan")
-    qty_add = st.number_input("Cantidad", min_value=1, max_value=999, value=1, key="s2_prod_qty")
-    if st.button("✅ Confirmar", use_container_width=True):
+    # Limpieza segura del campo de producto (evita StreamlitAPIException)
+    if st.session_state.get("s2_clear_prod_scan"):
+        st.session_state["s2_prod_scan_widget"] = ""
+        st.session_state["s2_clear_prod_scan"] = False
+
+    sku_scan = st.text_input("Producto", key="s2_prod_scan_widget")
+    
+    # ✅ No pedimos cantidad: cada escaneo suma 1. Si un ítem requiere más, se escanea varias veces.
+    sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
+    if sku_scan:
         raw = sku_scan.strip()
-        if not raw:
-            st.warning("Escanea un código primero.")
+        sku = barcode_to_sku.get(raw, raw) if isinstance(barcode_to_sku, dict) else raw
+        ok, msg = _s2_apply_pick(mid, sale_id, str(sku), 1)
+        if not ok:
+            st.error(msg)
         else:
-            # map barcode -> sku if needed
-            sku = barcode_to_sku.get(raw, raw) if isinstance(barcode_to_sku, dict) else raw
-            ok, msg = _s2_apply_pick(mid, sale_id, str(sku), int(qty_add))
-            if not ok:
-                st.error(msg)
-            else:
-                st.session_state["s2_prod_scan"] = ""
-                st.session_state["s2_prod_qty"] = 1
-                st.rerun()
+            st.session_state["s2_clear_prod_scan"] = True
+            st.rerun()
 
     done = _s2_is_sale_done(mid, sale_id)
     if done:
         if st.button("✅ Cerrar venta", use_container_width=True):
             _s2_close_sale(mid, sale_id)
             st.session_state["s2_sale_open"] = None
-            st.session_state["s2_prod_scan"] = ""
+            st.session_state["s2_clear_prod_scan"] = True
+            st.rerun()
             st.session_state["s2_clear_label_scan"] = True
             st.rerun()
             st.success("Venta cerrada.")
@@ -3339,7 +3364,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
-    st.title("Sorting · Admin")
+    st.title("Sorting · Administrador")
 
     mid = _s2_get_active_manifest_id()
     conn = get_conn()
