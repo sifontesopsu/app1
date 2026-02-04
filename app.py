@@ -3439,7 +3439,7 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     else:
         st.success("No hay ventas pendientes: todo está cerrado.")
 
-    conn.close()
+    # conn.close()  # moved to end (avoid closed cursor)
 
 
     st.subheader("Estado del manifiesto activo")
