@@ -3364,7 +3364,68 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
-    st.title("Sorting · Administrador")
+    st.title("Sorting · Administradoristrador")
+
+
+
+    st.subheader("Trazabilidad")
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    # Ventas por mesa
+    rows = c.execute(
+        "SELECT mesa, COUNT(*) as ventas, "
+        "SUM(CASE WHEN status='DONE' THEN 1 ELSE 0 END) as done "
+        "FROM s2_sales WHERE manifest_id=? GROUP BY mesa ORDER BY mesa;",
+        (mid,)
+    ).fetchall()
+
+    if rows:
+        mesa_data = []
+        for mesa, ventas, done in rows:
+            ventas = int(ventas or 0)
+            done = int(done or 0)
+            mesa_data.append({
+                "Mesa": int(mesa or 0),
+                "Ventas": ventas,
+                "Cerradas": done,
+                "%": 0 if ventas==0 else round(done*100/ventas, 1),
+            })
+        st.dataframe(mesa_data, use_container_width=True)
+    else:
+        st.info("No hay ventas asignadas a mesas todavía.")
+
+    # Ventas pendientes con progreso por ítems
+    pend = c.execute(
+        "SELECT sale_id, mesa, shipment_id, status FROM s2_sales "
+        "WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, sale_id LIMIT 100;",
+        (mid,)
+    ).fetchall()
+
+    if pend:
+        pend_data = []
+        for sale_id, mesa, shipment_id, status in pend:
+            it = c.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) "
+                "FROM s2_items WHERE manifest_id=? AND sale_id=?;",
+                (mid, sale_id)
+            ).fetchone()
+            total = int(it[0] or 0)
+            done = int(it[1] or 0)
+            pend_data.append({
+                "Venta": str(sale_id),
+                "Mesa": int(mesa or 0),
+                "Envío": str(shipment_id or ""),
+                "Estado": str(status),
+                "Items": f"{done}/{total}",
+            })
+        st.dataframe(pend_data, use_container_width=True)
+    else:
+        st.success("No hay ventas pendientes: todo está cerrado.")
+
+    conn.close()
+
 
     mid = _s2_get_active_manifest_id()
     conn = get_conn()
