@@ -2891,6 +2891,79 @@ def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
     conn.close()
     return len(shipment_ids)
 
+
+def _s2_get_stats(mid: int):
+    """Return useful reconciliation stats for current manifest."""
+    conn = get_conn()
+    c = conn.cursor()
+
+    ventas = c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=?", (mid,)).fetchone()[0]
+    items = c.execute("SELECT COUNT(*) FROM s2_items WHERE manifest_id=?", (mid,)).fetchone()[0]
+    ventas_with_ship = c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!=''", (mid,)).fetchone()[0]
+    ventas_with_pack = c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!=''", (mid,)).fetchone()[0]
+    distinct_packs = c.execute("SELECT COUNT(DISTINCT pack_id) FROM s2_sales WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!=''", (mid,)).fetchone()[0]
+
+    etiquetas = c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=?", (mid,)).fetchone()[0]
+    distinct_ship_labels = c.execute("SELECT COUNT(DISTINCT shipment_id) FROM s2_labels WHERE manifest_id=? AND shipment_id IS NOT NULL AND shipment_id!=''", (mid,)).fetchone()[0]
+    labels_with_pack = c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND pack_id IS NOT NULL AND pack_id!=''", (mid,)).fetchone()[0]
+    labels_with_sale = c.execute("SELECT COUNT(*) FROM s2_labels WHERE manifest_id=? AND sale_id IS NOT NULL AND sale_id!=''", (mid,)).fetchone()[0]
+
+    matched_by_pack = c.execute("""SELECT COUNT(*) FROM s2_sales s
+                                   JOIN s2_pack_ship ps
+                                     ON ps.manifest_id=s.manifest_id AND ps.pack_id=s.pack_id
+                                   WHERE s.manifest_id=? AND s.pack_id IS NOT NULL AND s.pack_id!=''""", (mid,)).fetchone()[0]
+
+    # how many sales are still missing shipment_id
+    missing_ship = c.execute("SELECT COUNT(*) FROM s2_sales WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='')", (mid,)).fetchone()[0]
+
+    return {
+        "ventas": ventas,
+        "items": items,
+        "ventas_with_ship": ventas_with_ship,
+        "ventas_with_pack": ventas_with_pack,
+        "distinct_packs": distinct_packs,
+        "etiquetas": etiquetas,
+        "distinct_ship_labels": distinct_ship_labels,
+        "labels_with_pack": labels_with_pack,
+        "labels_with_sale": labels_with_sale,
+        "matched_by_pack": matched_by_pack,
+        "missing_ship": missing_ship,
+    }
+
+def _s2_reset_all_sorting():
+    """Hard reset of Sorting module only (keeps other modules intact)."""
+    conn = get_conn()
+    c = conn.cursor()
+    # New (s2_*) tables
+    s2_tables = [
+        "s2_page_assign",
+        "s2_pack_ship",
+        "s2_labels",
+        "s2_items",
+        "s2_sales",
+        "s2_files",
+        "s2_manifests",
+    ]
+    for t in s2_tables:
+        c.execute(f"DELETE FROM {t};")
+
+    # Legacy sorting tables (kept for backward compat in older code paths)
+    legacy = [
+        "sorting_run_items",
+        "sorting_runs",
+        "sorting_labels",
+        "sorting_manifests",
+        "sorting_status",
+    ]
+    for t in legacy:
+        try:
+            c.execute(f"DELETE FROM {t};")
+        except Exception:
+            pass
+
+    conn.commit()
+
+
 def _s2_get_pages(mid:int):
     conn=get_conn()
     c=conn.cursor()
@@ -3031,13 +3104,34 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
         zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt","zpl"], key="s2_labels_txt")
 
     if pdf is not None:
-        n_sales = _s2_upsert_control(mid, getattr(pdf,"name","control.pdf"), pdf.getvalue())
+        n_sales = _s2_upsert_control(mid, getattr(pdf, "name", "control.pdf"), pdf.getvalue())
         st.success(f"Control cargado. Ventas detectadas: {n_sales}")
         _s2_auto_assign_pages(mid, num_mesas=10)
 
     if zpl is not None:
-        n_labels = _s2_upsert_labels(mid, getattr(zpl,"name","etiquetas.txt"), zpl.getvalue())
+        n_labels = _s2_upsert_labels(mid, getattr(zpl, "name", "etiquetas.txt"), zpl.getvalue())
         st.success(f"Etiquetas cargadas. IDs detectados: {n_labels}")
+
+    # Resumen (para evitar confusión: ventas y etiquetas NO siempre coinciden 1:1)
+    stats = _s2_get_stats(mid)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ventas (Control)", stats["ventas"])
+    c2.metric("Items (líneas)", stats["items"])
+    c3.metric("Etiquetas (total)", stats["etiquetas"])
+    c4.metric("Envíos únicos (labels)", stats["distinct_ship_labels"])
+
+    with st.expander("Ver detalle de conciliación", expanded=False):
+        st.write(
+            {
+                "Ventas con Pack ID": stats["ventas_with_pack"],
+                "Packs distintos (Control)": stats["distinct_packs"],
+                "Ventas con Envío (Control)": stats["ventas_with_ship"],
+                "Etiquetas con Pack ID": stats["labels_with_pack"],
+                "Etiquetas con Venta": stats["labels_with_sale"],
+                "Ventas matcheadas por Pack": stats["matched_by_pack"],
+                "Ventas sin Envío asignado": stats["missing_ship"],
+            }
+        )
 
     pages = _s2_get_pages(mid)
     if not pages:
@@ -3145,35 +3239,75 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     else:
         st.caption("Cierra la venta cuando todos los ítems estén completos.")
 
+
+
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
-    st.title("Sorting - Admin")
+    st.title("Sorting · Admin")
+
     mid = _s2_get_active_manifest_id()
-    st.session_state["sorting_manifest_id"] = mid
+    conn = get_conn()
+    c = conn.cursor()
 
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("SELECT COUNT(1) FROM s2_sales WHERE manifest_id=?;", (mid,))
-    sales=int(c.fetchone()[0] or 0)
-    c.execute("SELECT COUNT(1) FROM s2_sales WHERE manifest_id=? AND status='PENDING';", (mid,))
-    pending=int(c.fetchone()[0] or 0)
-    c.execute("SELECT COUNT(1) FROM s2_sales WHERE manifest_id=? AND status='DONE';", (mid,))
-    done=int(c.fetchone()[0] or 0)
-    c.execute("SELECT COUNT(1) FROM s2_labels WHERE manifest_id=?;", (mid,))
-    labels=int(c.fetchone()[0] or 0)
-    conn.close()
+    # archivo/control info
+    f = c.execute("SELECT control_name, labels_name, updated_at FROM s2_files WHERE manifest_id=?", (mid,)).fetchone()
+    stats = _s2_get_stats(mid)
 
-    st.write(f"Manifiesto activo: **{mid}**")
-    st.write(f"Ventas: **{sales}** | Pendientes: **{pending}** | Cerradas: **{done}** | Etiquetas: **{labels}**")
+    st.subheader("Estado del manifiesto activo")
+    colA, colB, colC, colD = st.columns(4)
+    colA.metric("Manifiesto ID", mid)
+    colB.metric("Ventas (Control)", stats["ventas"])
+    colC.metric("Items", stats["items"])
+    colD.metric("Etiquetas", stats["etiquetas"])
 
-    st.subheader("🗑️ Reiniciar corrida (BORRA TODO Sorting)")
-    if st.button("BORRAR TODO Sorting (confirmado)", type="primary", use_container_width=True):
-        _s2_reset_all()
-        # clear session
+    if f:
+        control_name, labels_name, updated_at = f
+        st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
+    else:
+        st.caption("Aún no se han cargado archivos para este manifiesto.")
+
+    with st.expander("Conciliación ventas ↔ etiquetas", expanded=False):
+        st.write(
+            {
+                "Envíos únicos (labels)": stats["distinct_ship_labels"],
+                "Ventas con Pack ID": stats["ventas_with_pack"],
+                "Packs distintos (Control)": stats["distinct_packs"],
+                "Etiquetas con Pack ID": stats["labels_with_pack"],
+                "Etiquetas con Venta": stats["labels_with_sale"],
+                "Ventas matcheadas por Pack": stats["matched_by_pack"],
+                "Ventas sin Envío asignado": stats["missing_ship"],
+            }
+        )
+
+        # Top 20 ventas sin envío para diagnóstico rápido
+        missing = c.execute(
+            "SELECT sale_id, page_no, pack_id FROM s2_sales WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') ORDER BY page_no, sale_id LIMIT 20",
+            (mid,),
+        ).fetchall()
+        if missing:
+            st.warning("Ejemplos de ventas sin envío asignado (primeras 20):")
+            st.table([{"venta": a, "pagina": b, "pack_id": cpid or ""} for (a, b, cpid) in missing])
+
+    st.divider()
+    st.subheader("Acciones")
+    st.caption("⚠️ Reiniciar borra SOLO el módulo Sorting (no afecta Picking/Full).")
+
+    if "s2_reset_armed" not in st.session_state:
+        st.session_state["s2_reset_armed"] = False
+
+    arm = st.checkbox("Quiero reiniciar Sorting (entiendo que se borra todo)", value=st.session_state["s2_reset_armed"])
+    st.session_state["s2_reset_armed"] = bool(arm)
+
+    confirm_txt = st.text_input("Escribe BORRAR para confirmar", value="", disabled=not arm)
+    do_reset = st.button("🗑️ Reiniciar Sorting (borrar todo)", type="primary", disabled=not (arm and confirm_txt.strip().upper() == "BORRAR"))
+
+    if do_reset:
+        _s2_reset_all_sorting()
+        # limpiar session del módulo
         for k in list(st.session_state.keys()):
-            if k.startswith("s2_") or k.startswith("sorting_"):
+            if k.startswith("s2_") or "sorting" in k:
                 del st.session_state[k]
-        st.success("Sorting reiniciado. Vuelve a cargar Control y etiquetas.")
+        st.success("Sorting reiniciado completamente.")
         st.rerun()
 
 
