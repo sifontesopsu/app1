@@ -3268,7 +3268,12 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
     if st.session_state["s2_sale_open"] is None:
         st.subheader("Escanea etiqueta (QR Flex o barra Colecta)")
-        scan = st.text_input("Etiqueta", key="s2_label_scan")
+        # Limpieza segura del campo de escaneo (evita StreamlitAPIException)
+        if st.session_state.get("s2_clear_label_scan"):
+            st.session_state["s2_label_scan_widget"] = ""
+            st.session_state["s2_clear_label_scan"] = False
+
+        scan = st.text_input("Etiqueta", key="s2_label_scan_widget")
         if scan:
             sid = _s2_extract_shipment_id(scan)
             if not sid:
@@ -3286,7 +3291,8 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                         st.error("No encontré esta etiqueta en corridas pendientes.")
                 else:
                     st.session_state["s2_sale_open"] = sale_id
-                    st.session_state["s2_label_scan"] = ""
+                    st.session_state["s2_clear_label_scan"] = True
+                    st.rerun()
                     st.rerun()
         return
 
@@ -3322,7 +3328,8 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             _s2_close_sale(mid, sale_id)
             st.session_state["s2_sale_open"] = None
             st.session_state["s2_prod_scan"] = ""
-            st.session_state["s2_label_scan"] = ""
+            st.session_state["s2_clear_label_scan"] = True
+            st.rerun()
             st.success("Venta cerrada.")
             st.rerun()
     else:
