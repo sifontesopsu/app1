@@ -3381,9 +3381,9 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     name = info.get("destinatario") or customer or "-"
     addr = info.get("direccion") or "-"
     comuna = info.get("comuna") or info.get("ciudad_destino") or "-"
-    st.write(f"**Destinatario:** {name}")
-    st.write(f"**Dirección:** {addr}")
-    st.write(f"**Comuna/Ciudad:** {comuna}")
+    
+    
+    
 
     items = _s2_sale_items(mid, sale_id)
 
@@ -3407,8 +3407,8 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
         remaining = max(0, int(qty) - int(picked))
         row1 = st.columns([6, 2, 2])
-        row1[0].markdown(f"**{title}**  \nSKU: `{sku}`")
-        row1[1].metric("Cant.", int(qty))
+        row1[0].markdown(f"### {title}  \nSKU: `{sku}`")
+        row1[1].markdown(f"## {int(qty)}")
         row1[2].metric("Hecho", int(picked))
 
         if status != "DONE" and remaining > 0:
