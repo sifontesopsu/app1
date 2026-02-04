@@ -3758,9 +3758,9 @@ def main():
         page = st.sidebar.radio("Menú", pages, index=0)
 
         if page.startswith("1"):
-            page_sorting_upload(inv_map_sku, barcode_to_sku)
-        elif page.startswith("2"):
             page_sorting_camarero(inv_map_sku, barcode_to_sku)
+        elif page.startswith("2"):
+            page_sorting_upload(inv_map_sku, barcode_to_sku)
         else:
             page_sorting_admin(inv_map_sku, barcode_to_sku)
 
