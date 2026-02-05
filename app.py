@@ -2625,22 +2625,49 @@ def _s2_get_label_raw(mid:int, shipment_id:str):
     return row[0] if row else ""
 
 def _s2_extract_shipment_id(scan_raw: str):
+    """Extrae shipment_id desde distintos tipos de escaneo (FLEX/COLECTA).
+
+    Soporta:
+    - QR FLEX en JSON (a veces viene como 'LA,{json}')
+    - Barcode COLECTA tipo '>:46393849062'
+    - Texto/ZPL con 'Envio: 4638268' + salto + '8794'
+    - Número limpio '46393849062'
+    """
     import re, json
+
     if not scan_raw:
         return None
+
     s = str(scan_raw).strip()
-    # JSON (Flex QR)
-    if s.startswith("{") and "id" in s:
+
+    # 1) QR FLEX (puede venir precedido por 'LA,')
+    if "{" in s and "}" in s and "id" in s:
         try:
-            obj = json.loads(s)
+            jtxt = s[s.find("{"): s.rfind("}") + 1]
+            obj = json.loads(jtxt)
             sid = obj.get("id")
-            if sid and re.fullmatch(r"\d{8,15}", str(sid)):
-                return str(sid)
+            if sid and re.fullmatch(r"\d{8,15}", str(sid).strip()):
+                return str(sid).strip()
         except Exception:
             pass
-    # any long digit group (Colecta barcode or text)
-    m = re.search(r"(\d{10,15})", s)
+
+    # 2) Barcode COLECTA: '>:46393849062'
+    m = re.search(r">:?\s*(\d{8,15})", s)
+    if m:
+        return m.group(1)
+
+    # 3) 'Envio: 4638268' + '8794' (partido)
+    if re.search(r"\bEnvio\b\s*:", s, flags=re.IGNORECASE):
+        digits = re.findall(r"\d+", s)
+        if digits:
+            joined = "".join(digits)
+            if re.fullmatch(r"\d{8,15}", joined):
+                return joined
+
+    # 4) Fallback: cualquier grupo de dígitos suficientemente largo
+    m = re.search(r"(\d{8,15})", s)
     return m.group(1) if m else None
+
 
 
 def _s2_parse_control_pdf(pdf_bytes: bytes):
@@ -2716,17 +2743,12 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                         if not cur.get("page_no"):
                             cur["page_no"] = pidx
 
-                # Pack ID (ojo: en Colecta a veces Pack+SKU viene ANTES de "Venta:",
-                # así que si aparece un Pack ID nuevo y ya tenemos una venta completa, hacemos flush aquí)
+                # Pack ID
                 pid = pack_from_line(ln)
                 if pid:
-                    if cur.get("sale_id") and cur.get("items"):
-                        if (cur.get("pack_id") and pid != cur.get("pack_id")) or (cur.get("pack_id") is None):
-                            flush()
                     cur["pack_id"] = pid
                     if not cur.get("page_no"):
                         cur["page_no"] = pidx
-
 
                 # Venta (si cambia, flush)
                 sid = sale_from_line(ln)
