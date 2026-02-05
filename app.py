@@ -2648,15 +2648,13 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
 
     Importante (Colecta): el Control a veces NO trae shipment_id al inicio de línea.
     Por eso este parser NO exige shipment_id para contar ventas; lo completa luego
-    usando Etiquetas (por Pack ID o, si no existe Pack ID, por Venta).
+    usando Etiquetas (por Pack ID o por shipment_id cuando venga en el Control).
 
     Returns: list of dicts:
       {page_no:int, shipment_id:str|None, sale_id:str, pack_id:str|None, customer:str|None,
        items:[{sku:str, qty:int}]}
     """
     import io, re, pdfplumber
-
-    UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
     def ship_from_line(s: str):
         # Flex suele venir como número al inicio (p.ej. 4636...)
@@ -2681,9 +2679,7 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
 
     def looks_like_name(s: str):
         s = (s or "").strip()
-        if not s or len(s) > 80:
-            return False
-        if UUID_RE.match(s):
+        if not s or len(s) > 70:
             return False
         if re.search(r"\b(color|acabado|modelo|di[aá]metro|voltaje|dise[nñ]o|tipo)\b\s*:", s, flags=re.I):
             return False
@@ -2695,10 +2691,8 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
 
     def flush():
         nonlocal cur, sku_queue
-        # fallback: si no hay Pack ID (algunos casos), usar Venta como llave para mapear con etiquetas
-        if cur.get("sale_id") and not cur.get("pack_id"):
-            cur["pack_id"] = cur.get("sale_id")
         if cur.get("sale_id") and cur.get("items"):
+            # sale_id + items es suficiente para contar venta
             sales.append(cur)
         cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None, "customer": None, "items": []}
         sku_queue = []
@@ -2711,11 +2705,6 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                 low = ln.lower()
                 if low.startswith("despacha ") or low.startswith("identifi"):
                     continue
-                if UUID_RE.match(ln):
-                    # Colecta: cada bloque suele iniciar con UUID → si ya hay una venta armada, cerrar
-                    if cur.get("sale_id") and cur.get("items"):
-                        flush()
-                    continue
 
                 # Flex shipment id en línea
                 ship = ship_from_line(ln)
@@ -2727,14 +2716,17 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                         if not cur.get("page_no"):
                             cur["page_no"] = pidx
 
-                # Pack ID (si cambia y ya hay venta armada, flush ANTES de sobre-escribir el pack)
+                # Pack ID (ojo: en Colecta a veces Pack+SKU viene ANTES de "Venta:",
+                # así que si aparece un Pack ID nuevo y ya tenemos una venta completa, hacemos flush aquí)
                 pid = pack_from_line(ln)
                 if pid:
-                    if cur.get("pack_id") and pid != cur.get("pack_id") and cur.get("sale_id") and cur.get("items"):
-                        flush()
+                    if cur.get("sale_id") and cur.get("items"):
+                        if (cur.get("pack_id") and pid != cur.get("pack_id")) or (cur.get("pack_id") is None):
+                            flush()
                     cur["pack_id"] = pid
                     if not cur.get("page_no"):
                         cur["page_no"] = pidx
+
 
                 # Venta (si cambia, flush)
                 sid = sale_from_line(ln)
@@ -2745,14 +2737,6 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                     if not cur.get("page_no"):
                         cur["page_no"] = pidx
 
-                    # customer puede venir en la misma línea que Venta (ej: "Venta: ... Rosa Mora SKU: ...")
-                    if not cur.get("customer"):
-                        rest = re.split(r"\bVenta\s*:\s*\d{10,20}\b", ln, flags=re.I)
-                        rest = rest[1] if len(rest) > 1 else ""
-                        rest = re.sub(r"\bSKU\s*:\s*[0-9A-Za-z_-]{6,20}\b", "", rest, flags=re.I).strip(" -:,")
-                        if rest and looks_like_name(rest):
-                            cur["customer"] = rest[:80]
-
                 # SKU en línea
                 skus = skus_from_line(ln)
                 if skus:
@@ -2761,13 +2745,13 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                 # Cantidad: asigna a primer SKU pendiente
                 q = qty_from_line(ln)
                 if q is not None:
-                    # cliente a veces viene junto a Cantidad (o en la línea previa)
+                    # cliente a veces viene junto a Cantidad
                     if cur.get("sale_id") and not cur.get("customer") and ("venta" not in low) and ("pack" not in low):
                         pre = re.split(r"Cantidad\s*:", ln, flags=re.IGNORECASE)[0].strip()
                         pre = re.sub(r"\bSKU\s*:\s*[0-9A-Za-z_-]{6,20}\b", "", pre, flags=re.IGNORECASE).strip()
                         pre = re.sub(r"^\d{8,15}\b", "", pre).strip()
-                        if pre and looks_like_name(pre):
-                            cur["customer"] = pre[:80]
+                        if pre and len(pre) <= 70 and looks_like_name(pre):
+                            cur["customer"] = pre
 
                     if sku_queue:
                         sku = sku_queue.pop(0)
@@ -2775,28 +2759,29 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                 else:
                     # nombre en línea sola después de Venta
                     if cur.get("sale_id") and not cur.get("customer") and looks_like_name(ln):
-                        cur["customer"] = ln[:80]
+                        cur["customer"] = ln[:70]
 
     flush()
     return sales
+
 def _s2_parse_labels_txt(raw_bytes: bytes):
     """Parsea etiquetas TXT/ZPL de Flex y Colecta.
 
     Devuelve:
       - pack_to_ship: dict {pack_id(str) -> shipment_id(str)}
-        Nota: si una etiqueta no trae Pack ID pero sí "Venta:", se guarda usando Venta como llave.
       - shipment_ids: sorted list de shipment_id detectados
 
-    Nota: En Colecta el Pack ID (o Venta) suele venir PARTIDO en dos ^FD:
-        ^FDPack ID: 20000^FS  y luego ^FD1136....^FS
+    Nota: En Colecta el Pack ID suele venir PARTIDO en dos ^FD:
+        ^FDPack ID: 20000^FS  y luego ^FD1128....^FS
     """
-    import re
+    import re, json
 
     try:
         txt = raw_bytes.decode("utf-8", errors="ignore")
     except Exception:
         txt = str(raw_bytes)
 
+    # separar etiquetas por bloque ^XA ... ^XZ
     blocks = re.split(r"\^XA", txt)
     pack_to_ship = {}
     shipment_ids = set()
@@ -2804,55 +2789,49 @@ def _s2_parse_labels_txt(raw_bytes: bytes):
     def clean_num(s):
         return re.sub(r"\D", "", s or "")
 
-    def extract_split_number(block: str, label: str):
-        # label in {"Pack ID", "Venta"}
-        full = None
-        m_full = re.search(label + r"\s*:\s*(\d{10,20})", block, flags=re.I)
-        if m_full:
-            return m_full.group(1)
-        # partido: "Label: 20000" + siguiente ^FD con resto
-        m_part = re.search(label + r"\s*:\s*(\d{4,10})\s*\^FS", block, flags=re.I)
-        if m_part:
-            head = clean_num(m_part.group(1))
-            tailm = re.search(r"\^FD\s*([0-9 ]{6,20})\s*\^FS", block[m_part.end():])
-            if tailm:
-                tail = clean_num(tailm.group(1))
-                cand = head + tail
-                if 10 <= len(cand) <= 20:
-                    return cand
-        return None
-
     for b in blocks:
         if not b.strip():
             continue
+        # reconstruir pack id (partido)
+        pack_full = None
 
-        pack_full = extract_split_number(b, r"Pack\s*ID")
-        venta_full = extract_split_number(b, r"Venta")
+        # caso completo en una sola línea
+        m_full = re.search(r"Pack\s*ID\s*:\s*(\d{10,20})", b, flags=re.I)
+        if m_full:
+            pack_full = m_full.group(1)
 
-        # shipment id: preferir JSON QR {"id":"4638..."}; si no, buscar el barcode/nums
+        # caso partido: "Pack ID: 20000" + siguiente ^FD con resto
+        if not pack_full:
+            m_part = re.search(r"Pack\s*ID\s*:\s*(\d{4,10})\s*\^FS", b, flags=re.I)
+            if m_part:
+                head = clean_num(m_part.group(1))
+                # buscar siguiente ^FD numérico cercano
+                tailm = re.search(r"\^FD\s*([0-9 ]{6,20})\s*\^FS", b[m_part.end():])
+                if tailm:
+                    tail = clean_num(tailm.group(1))
+                    cand = head + tail
+                    if 10 <= len(cand) <= 20:
+                        pack_full = cand
+
+        # shipment id: preferir números 10-15 dígitos (en Colecta/Flex suelen ser 4636...)
+        # En Flex también hay JSON con "id":"4638..."
         ship = None
         jm = re.search(r"\"id\"\s*:\s*\"(\d{8,15})\"", b)
         if jm:
             ship = jm.group(1)
 
         if not ship:
-            # a veces viene como ^FD>:4639....
-            bm = re.search(r"\^FD>:\s*(\d{8,15})\^FS", b)
-            if bm:
-                ship = bm.group(1)
-
-        if not ship:
+            # buscar números candidatos, priorizando 10-15 dígitos y que empiecen por 46
             nums = re.findall(r"\b\d{10,15}\b", b)
             if nums:
+                # prioriza 46.. luego el más largo
                 nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
                 ship = nums_sorted[0]
 
         if ship:
             shipment_ids.add(ship)
-
-        key = pack_full or venta_full
-        if key and ship:
-            pack_to_ship[str(key)] = str(ship)
+        if pack_full and ship:
+            pack_to_ship[str(pack_full)] = str(ship)
 
     return pack_to_ship, sorted(shipment_ids)
 def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
