@@ -2716,12 +2716,17 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                         if not cur.get("page_no"):
                             cur["page_no"] = pidx
 
-                # Pack ID
+                # Pack ID (ojo: en Colecta a veces Pack+SKU viene ANTES de "Venta:",
+                # así que si aparece un Pack ID nuevo y ya tenemos una venta completa, hacemos flush aquí)
                 pid = pack_from_line(ln)
                 if pid:
+                    if cur.get("sale_id") and cur.get("items"):
+                        if (cur.get("pack_id") and pid != cur.get("pack_id")) or (cur.get("pack_id") is None):
+                            flush()
                     cur["pack_id"] = pid
                     if not cur.get("page_no"):
                         cur["page_no"] = pidx
+
 
                 # Venta (si cambia, flush)
                 sid = sale_from_line(ln)
