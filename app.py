@@ -2589,6 +2589,43 @@ def _s2_get_active_manifest_id():
     return mid
 
 
+def _s2_manifest_files_state(mid: int) -> dict:
+    """Return whether the active manifest already has Control and/or Labels loaded."""
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT (control_pdf IS NOT NULL AND length(control_pdf)>0) AS has_control, "
+        "       (labels_txt  IS NOT NULL AND length(labels_txt)>0)  AS has_labels "
+        "FROM s2_files WHERE manifest_id=?;",
+        (mid,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"has_control": False, "has_labels": False}
+    return {"has_control": bool(row[0]), "has_labels": bool(row[1])}
+
+def _s2_close_manifest(mid: int):
+    """Marks current manifest as DONE (archived)."""
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE s2_manifests SET status='DONE' WHERE id=?;", (int(mid),))
+    conn.commit()
+    conn.close()
+
+def _s2_create_new_manifest() -> int:
+    """Creates a new ACTIVE manifest and returns its id."""
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO s2_manifests(status, created_at) VALUES('ACTIVE', ?);", (_s2_now_iso(),))
+    mid = int(c.lastrowid)
+    conn.commit()
+    conn.close()
+    return mid
+
+
 def _s2_parse_label_raw_info(raw: str):
     """Extrae info visible de una etiqueta (nombre, dirección, comuna, etc.) desde el texto raw."""
     import re
@@ -3307,9 +3344,14 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
 
     st.caption(f"Manifiesto activo: {mid}")
 
+    files_state = _s2_manifest_files_state(mid)
+    lock_control = bool(files_state.get("has_control"))
+    if lock_control:
+        st.warning("🔒 Ya hay un Control cargado en el manifiesto activo. Para cargar un manifiesto nuevo debes **Cerrar** o **Reiniciar** el Sorting desde Administrador.")
+
     col1, col2 = st.columns(2)
     with col1:
-        pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf")
+        pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf", disabled=lock_control)
     with col2:
         zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt","zpl"], key="s2_labels_txt")
 
@@ -3643,7 +3685,22 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
 
     st.divider()
     st.subheader("Acciones")
-    st.caption("⚠️ Reiniciar borra SOLO el módulo Sorting (no afecta Picking/Full).")
+    st.caption("🔒 Bloqueo duro: para cargar un nuevo manifiesto debes **Cerrar** o **Reiniciar** el manifiesto activo.")
+
+    close_ok = (int(stats.get("sales_total", 0) or 0) > 0 and int(stats.get("sales_pending", 0) or 0) == 0 and int(stats.get("items_pending", 0) or 0) == 0)
+    btn_close = st.button("✅ Cerrar manifiesto (habilitar nuevo)", disabled=not close_ok)
+    if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
+        st.info("Para cerrar el manifiesto: todas las **ventas** deben estar cerradas y no deben quedar **ítems pendientes**. Si necesitas cargar otro manifiesto sin terminar, usa **Reiniciar** (borra todo).")
+
+    if btn_close:
+        _s2_close_manifest(mid)
+        new_mid = _s2_create_new_manifest()
+        # limpiar session del módulo (incluye uploaders)
+        for k in list(st.session_state.keys()):
+            if k.startswith("s2_") or "sorting" in k:
+                del st.session_state[k]
+        st.success(f"Manifiesto {mid} cerrado. Nuevo manifiesto activo: {new_mid}")
+        st.rerun()
 
     if "s2_reset_armed" not in st.session_state:
         st.session_state["s2_reset_armed"] = False
