@@ -2625,48 +2625,43 @@ def _s2_get_label_raw(mid:int, shipment_id:str):
     return row[0] if row else ""
 
 def _s2_extract_shipment_id(scan_raw: str):
-    """Extrae shipment_id desde distintos tipos de escaneo (FLEX/COLECTA).
+    """Lee el identificador desde el escaneo de etiqueta.
 
-    Soporta:
-    - QR FLEX en JSON (a veces viene como 'LA,{json}')
-    - Barcode COLECTA tipo '>:46393849062'
-    - Texto/ZPL con 'Envio: 4638268' + salto + '8794'
-    - Número limpio '46393849062'
+    - Flex: a veces viene como JSON con {"id":"..."}
+    - Colecta: puede venir como shipment (10-15 dígitos, suele empezar por 46)
+      o como Pack ID (más largo, 10-20 dígitos)
+
+    Devuelve el mejor candidato numérico (string) o None.
     """
     import re, json
-
     if not scan_raw:
         return None
-
     s = str(scan_raw).strip()
 
-    # 1) QR FLEX (puede venir precedido por 'LA,')
-    if "{" in s and "}" in s and "id" in s:
+    # 1) JSON (Flex QR)
+    if s.startswith("{") and "id" in s:
         try:
-            jtxt = s[s.find("{"): s.rfind("}") + 1]
-            obj = json.loads(jtxt)
+            obj = json.loads(s)
             sid = obj.get("id")
-            if sid and re.fullmatch(r"\d{8,15}", str(sid).strip()):
-                return str(sid).strip()
+            if sid and re.fullmatch(r"\d{8,20}", str(sid)):
+                return str(sid)
         except Exception:
             pass
 
-    # 2) Barcode COLECTA: '>:46393849062'
-    m = re.search(r">:?\s*(\d{8,15})", s)
-    if m:
-        return m.group(1)
+    # 2) Números: extraer todos los grupos (incluye prefijos tipo >: )
+    nums = re.findall(r"(\d{6,20})", s)
+    if not nums:
+        return None
 
-    # 3) 'Envio: 4638268' + '8794' (partido)
-    if re.search(r"\bEnvio\b\s*:", s, flags=re.IGNORECASE):
-        digits = re.findall(r"\d+", s)
-        if digits:
-            joined = "".join(digits)
-            if re.fullmatch(r"\d{8,15}", joined):
-                return joined
+    # Preferir shipment_id típico (10-15, empieza por 46) si existe
+    ship_like = [n for n in nums if 10 <= len(n) <= 15]
+    if ship_like:
+        ship_like = sorted(ship_like, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
+        return ship_like[0]
 
-    # 4) Fallback: cualquier grupo de dígitos suficientemente largo
-    m = re.search(r"(\d{8,15})", s)
-    return m.group(1) if m else None
+    # Si no, devolver el más largo (útil si escanean Pack ID)
+    nums_sorted = sorted(nums, key=lambda x: -len(x))
+    return nums_sorted[0]
 
 
 
@@ -2743,12 +2738,17 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                         if not cur.get("page_no"):
                             cur["page_no"] = pidx
 
-                # Pack ID
+                # Pack ID (ojo: en Colecta a veces Pack+SKU viene ANTES de "Venta:",
+                # así que si aparece un Pack ID nuevo y ya tenemos una venta completa, hacemos flush aquí)
                 pid = pack_from_line(ln)
                 if pid:
+                    if cur.get("sale_id") and cur.get("items"):
+                        if (cur.get("pack_id") and pid != cur.get("pack_id")) or (cur.get("pack_id") is None):
+                            flush()
                     cur["pack_id"] = pid
                     if not cur.get("page_no"):
                         cur["page_no"] = pidx
+
 
                 # Venta (si cambia, flush)
                 sid = sale_from_line(ln)
@@ -3189,6 +3189,19 @@ def _s2_find_sale_for_scan(mid:int, mesa:int, shipment_id:str):
     conn.close()
     return row[0] if row else None
 
+def _s2_find_sale_for_pack_scan(mid:int, mesa:int, pack_id:str):
+    """Fallback: algunos escáneres/etiquetas devuelven Pack ID en vez de Shipment ID (Colecta)."""
+    conn=get_conn()
+    c=conn.cursor()
+    c.execute("""SELECT sale_id FROM s2_sales
+                 WHERE manifest_id=? AND mesa=? AND pack_id=? AND status='PENDING'
+                 ORDER BY page_no, sale_id
+                 LIMIT 1;""", (mid, int(mesa), str(pack_id)))
+    row=c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
 def _s2_sale_items(mid:int, sale_id:str):
     conn=get_conn()
     c=conn.cursor()
@@ -3366,6 +3379,9 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 st.error("No pude leer el ID de envío desde el escaneo.")
             else:
                 sale_id = _s2_find_sale_for_scan(mid, int(mesa), sid)
+                if (not sale_id) and sid:
+                    # fallback: si el escaneo corresponde a Pack ID (Colecta)
+                    sale_id = _s2_find_sale_for_pack_scan(mid, int(mesa), sid)
                 if not sale_id:
                     # debug: exists in other mesa?
                     conn=get_conn(); c=conn.cursor()
