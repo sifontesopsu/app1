@@ -2680,7 +2680,7 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
 
     def ship_from_line(s: str):
         # Flex suele venir como número al inicio (p.ej. 4636...)
-        m = re.match(r"^(\d{8,15})\b", s or "")
+        m = re.match(r"^(46\d{8,13})\b", (s or "").strip())  # evita capturar códigos no-shipment (ej: 30119784...)
         return m.group(1) if m else None
 
     def sale_from_line(s: str):
@@ -2791,12 +2791,14 @@ def _s2_parse_labels_txt(raw_bytes: bytes):
 
     Devuelve:
       - pack_to_ship: dict {pack_id(str) -> shipment_id(str)}
+      - sale_to_ship: dict {sale_id(str) -> shipment_id(str)}  (fallback cuando no hay Pack ID en Control)
       - shipment_ids: sorted list de shipment_id detectados
 
-    Nota: En Colecta el Pack ID suele venir PARTIDO en dos ^FD:
-        ^FDPack ID: 20000^FS  y luego ^FD1128....^FS
+    Nota: En Colecta el Pack ID / Venta suelen venir PARTIDOS en dos ^FD:
+        ^FDPack ID: 20000^FS  y luego ^FD1128....^FS  -> 200001128....
+        ^FDVenta: 20000^FS    y luego ^FD1498....^FS  -> 200001498....
     """
-    import re, json
+    import re
 
     try:
         txt = raw_bytes.decode("utf-8", errors="ignore")
@@ -2806,37 +2808,46 @@ def _s2_parse_labels_txt(raw_bytes: bytes):
     # separar etiquetas por bloque ^XA ... ^XZ
     blocks = re.split(r"\^XA", txt)
     pack_to_ship = {}
+    sale_to_ship = {}
     shipment_ids = set()
 
     def clean_num(s):
         return re.sub(r"\D", "", s or "")
 
-    for b in blocks:
-        if not b.strip():
-            continue
-        # reconstruir pack id (partido)
-        pack_full = None
+    def rebuild_split_id(kind: str, b: str):
+        """
+        kind: 'Pack' o 'Venta'
+        Busca:
+          - Completo:  kind ID: 2000011363....
+          - Partido:   kind ID: 20000  + siguiente ^FD 11363....
+        """
+        kind_re = kind
+        full = None
 
-        # caso completo en una sola línea
-        m_full = re.search(r"Pack\s*ID\s*:\s*(\d{10,20})", b, flags=re.I)
+        m_full = re.search(rf"{kind_re}\s*(?:ID)?\s*:\s*(\d{{10,20}})", b, flags=re.I)
         if m_full:
-            pack_full = m_full.group(1)
+            full = clean_num(m_full.group(1))
 
-        # caso partido: "Pack ID: 20000" + siguiente ^FD con resto
-        if not pack_full:
-            m_part = re.search(r"Pack\s*ID\s*:\s*(\d{4,10})\s*\^FS", b, flags=re.I)
+        if not full:
+            m_part = re.search(rf"{kind_re}\s*(?:ID)?\s*:\s*(\d{{4,10}})\s*\^FS", b, flags=re.I)
             if m_part:
                 head = clean_num(m_part.group(1))
-                # buscar siguiente ^FD numérico cercano
                 tailm = re.search(r"\^FD\s*([0-9 ]{6,20})\s*\^FS", b[m_part.end():])
                 if tailm:
                     tail = clean_num(tailm.group(1))
                     cand = head + tail
                     if 10 <= len(cand) <= 20:
-                        pack_full = cand
+                        full = cand
+        return full
 
-        # shipment id: preferir números 10-15 dígitos (en Colecta/Flex suelen ser 4636...)
-        # En Flex también hay JSON con "id":"4638..."
+    for b in blocks:
+        if not b.strip():
+            continue
+
+        pack_full = rebuild_split_id("Pack", b)
+        sale_full = rebuild_split_id("Venta", b)
+
+        # shipment id: preferir JSON con "id":"4638..."
         ship = None
         jm = re.search(r"\"id\"\s*:\s*\"(\d{8,15})\"", b)
         if jm:
@@ -2846,16 +2857,18 @@ def _s2_parse_labels_txt(raw_bytes: bytes):
             # buscar números candidatos, priorizando 10-15 dígitos y que empiecen por 46
             nums = re.findall(r"\b\d{10,15}\b", b)
             if nums:
-                # prioriza 46.. luego el más largo
                 nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
                 ship = nums_sorted[0]
 
         if ship:
             shipment_ids.add(ship)
-        if pack_full and ship:
-            pack_to_ship[str(pack_full)] = str(ship)
+            if pack_full:
+                pack_to_ship[str(pack_full)] = str(ship)
+            if sale_full:
+                sale_to_ship[str(sale_full)] = str(ship)
 
-    return pack_to_ship, sorted(shipment_ids)
+    return pack_to_ship, sale_to_ship, sorted(shipment_ids)
+
 def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
     pages_sales = _s2_parse_control_pdf(pdf_bytes)
     conn = get_conn()
@@ -2918,7 +2931,7 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
 
 
 def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
-    pack_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
+    pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
@@ -2946,14 +2959,24 @@ def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
                                SELECT ps.shipment_id FROM s2_pack_ship ps
                                WHERE ps.manifest_id=s2_sales.manifest_id AND ps.pack_id=s2_sales.pack_id
                            )
-                           WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') AND pack_id IS NOT NULL;""", (mid,))
+                           WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') AND pack_id IS NOT NULL AND pack_id!='';""", (mid,))
+        except Exception:
+            pass
+
+    # fallback: completar shipment_id por sale_id (cuando el Control no trae Pack ID)
+    if sale_to_ship:
+        try:
+            for sale_id, ship_id in sale_to_ship.items():
+                c.execute("""UPDATE s2_sales
+                             SET shipment_id=?
+                             WHERE manifest_id=? AND sale_id=? AND (shipment_id IS NULL OR shipment_id='');""",
+                          (str(ship_id), mid, str(sale_id)))
         except Exception:
             pass
 
     conn.commit()
     conn.close()
     return len(shipment_ids)
-
 
 def _s2_get_stats(mid: int):
     """
