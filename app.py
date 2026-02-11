@@ -698,83 +698,111 @@ def master_bootstrap(master_path: str):
 # =========================
 # PARSER PDF MANIFIESTO
 # =========================
+
 def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
+    """
+    Parser robusto para Manifiesto PDF (etiquetas).
+
+    Problema detectado: el parser anterior buscaba líneas que contuvieran "Cantidad" y luego intentaba
+    retroceder para encontrar "SKU" y "Venta". En manifiestos reales, varios SKU/Cantidad vienen
+    en bloques, y el extract_text puede separar "SKU:" y "Cantidad:" en líneas distintas, lo que
+    hacía que se perdieran ítems.
+
+    Estrategia nueva (máquina de estados):
+    - Detecta el "Venta:" actual.
+    - Toma el comprador como la primera línea "normal" posterior a Venta (antes del primer SKU).
+    - Cada vez que aparece un "SKU:", lo guarda como sku_current.
+    - Cada vez que aparece un "Cantidad:", crea un registro con (venta, buyer, sku_current, qty).
+    """
     if not HAS_PDF_LIB:
         raise RuntimeError("Falta pdfplumber. Agrega 'pdfplumber' a requirements.txt")
 
-    records = []
+    records: list[dict] = []
+
+    re_venta = re.compile(r"\bVenta\s*[:#]?\s*([0-9]+)\b", re.IGNORECASE)
+    re_sku = re.compile(r"\bSKU\s*[:#]?\s*([0-9A-Za-z.\-]+)\b", re.IGNORECASE)
+    re_qty = re.compile(r"\bCantidad\s*[:#]?\s*([0-9]+)\b", re.IGNORECASE)
+    re_pack = re.compile(r"\bPack\s*ID\b", re.IGNORECASE)
+
+    def _is_noise_line(s: str) -> bool:
+        low = s.strip().lower()
+        if not low:
+            return True
+        # líneas típicas que no son nombre de comprador
+        if "código carrier" in low or "firma carrier" in low or "fecha y hora" in low:
+            return True
+        if "despacha tus productos" in low:
+            return True
+        if low.startswith("identifi") or low.startswith("identificación"):
+            return True
+        if re_pack.search(s):
+            return True
+        if "venta" in low and re_venta.search(s):
+            return True
+        if "sku" in low and re_sku.search(s):
+            return True
+        if "cantidad" in low and re_qty.search(s):
+            return True
+        return False
+
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             text = text.replace("\r", "\n")
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            lines = [ln.strip() for ln in text.splitlines() if ln and str(ln).strip()]
 
-            for i, line in enumerate(lines):
-                if "Cantidad" not in line:
+            current_order = None
+            current_buyer = ""
+            buyer_locked = False
+            sku_current = None
+
+            for line in lines:
+                # Cambio de venta
+                mv = re_venta.search(line)
+                if mv:
+                    current_order = mv.group(1).strip()
+                    current_buyer = ""
+                    buyer_locked = False
+                    sku_current = None
                     continue
 
-                m_qty = re.search(r"Cantidad\s*[:#]?\s*([0-9]+)", line)
-                if not m_qty:
-                    continue
-                qty = int(m_qty.group(1))
-
-                sku = None
-                order = None
-                buyer = ""
-                start = max(0, i - 12)
-
-                m_sku_cur = re.search(r"SKU\s*[:#]?\s*([0-9A-Za-z.\-]+)", line)
-                if m_sku_cur:
-                    sku = normalize_sku(m_sku_cur.group(1))
-
-                m_ord_cur = re.search(r"Venta\s*[:#]?\s*([0-9]+)", line)
-                if m_ord_cur:
-                    order = m_ord_cur.group(1).strip()
-
-                if sku is None or order is None:
-                    for j in range(i - 1, start - 1, -1):
-                        l = lines[j]
-                        if sku is None and "SKU" in l:
-                            m_sku = re.search(r"SKU\s*[:#]?\s*([0-9A-Za-z.\-]+)", l)
-                            if m_sku:
-                                sku = normalize_sku(m_sku.group(1))
-                        if order is None and "Venta" in l:
-                            m_ord = re.search(r"Venta\s*[:#]?\s*([0-9]+)", l)
-                            if m_ord:
-                                order = m_ord.group(1).strip()
-
-                if not (order and sku):
+                # SKU
+                ms = re_sku.search(line)
+                if ms:
+                    sku_current = normalize_sku(ms.group(1))
+                    # cuando aparece el primer SKU del bloque, ya no seguimos capturando buyer
+                    buyer_locked = True
                     continue
 
-                venta_idx = None
-                for k in range(start, i):
-                    if "Venta" in lines[k]:
-                        venta_idx = k
-                        break
-                if venta_idx is not None:
-                    for k in range(venta_idx + 1, i):
-                        cand = lines[k].strip()
-                        low = cand.lower()
-                        if any(tok in low for tok in [
-                            "venta", "sku", "pack id", "cantidad",
-                            "código carrier", "firma carrier", "fecha y hora de retiro"
-                        ]):
-                            continue
-                        if re.fullmatch(r"[0-9 .:/-]+", cand):
-                            continue
-                        buyer = cand
-                        break
+                # Cantidad => crea registro si hay contexto
+                mq = re_qty.search(line)
+                if mq:
+                    try:
+                        qty = int(mq.group(1))
+                    except Exception:
+                        qty = 0
 
-                records.append({
-                    "ml_order_id": order,
-                    "buyer": buyer,
-                    "sku_ml": sku,
-                    "title_ml": "",
-                    "qty": qty
-                })
+                    if current_order and sku_current and qty > 0:
+                        records.append(
+                            {
+                                "ml_order_id": str(current_order).strip(),
+                                "buyer": str(current_buyer or "").strip(),
+                                "sku_ml": str(sku_current).strip(),
+                                "title_ml": "",
+                                "qty": qty,
+                            }
+                        )
+                    continue
+
+                # Buyer: primera línea no ruido después de Venta y antes del primer SKU
+                if current_order and not buyer_locked and not current_buyer:
+                    if not _is_noise_line(line):
+                        # Evitar capturar títulos de productos si el PDF los incluye antes del primer SKU
+                        # (en general el nombre de comprador es corto y sin dos puntos).
+                        if ":" not in line and len(line) <= 80:
+                            current_buyer = line.strip()
 
     return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
-
 
 # =========================
 # IMPORTAR VENTAS (FLEX)
