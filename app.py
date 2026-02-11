@@ -703,12 +703,14 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
     """
     Parser robusto para Manifiesto PDF (etiquetas).
 
-    Fix: algunos manifiestos traen SKU y Cantidad en la MISMA línea (o incluso varios pares en una línea).
-    El parser anterior hacía `continue` al ver SKU, por lo que se perdía la Cantidad del mismo renglón.
-    Esta versión tokeniza cada línea y procesa en orden de aparición:
-      - Si aparece Venta => setea venta actual y reinicia buyer/sku.
-      - Si aparece SKU => sku_current = ese SKU
-      - Si aparece Cantidad => si hay venta y sku_current, agrega registro.
+    Cubre casos reales de ML donde el PDF puede traer, en cualquier orden:
+      - "Venta: <id> SKU:<sku>" en el mismo renglón
+      - "Pack ID: ... SKU:<sku>" en un renglón y luego "Venta: <id> Cantidad: <n>" en el siguiente
+      - "SKU:<sku>" en un renglón y "Cantidad:<n>" en el siguiente
+      - Varias ocurrencias de SKU/Cantidad dentro de un mismo renglón
+
+    Regla: cada vez que se detecta una Cantidad, si existe un SKU "vigente" y una Venta vigente,
+    se crea un registro (línea) para esa venta+sku.
     """
     if not HAS_PDF_LIB:
         raise RuntimeError("Falta pdfplumber. Agrega 'pdfplumber' a requirements.txt")
@@ -719,7 +721,6 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
     re_sku = re.compile(r"\bSKU\s*[:#]?\s*([0-9A-Za-z.\-]+)\b", re.IGNORECASE)
     re_qty = re.compile(r"\bCantidad\s*[:#]?\s*([0-9]+)\b", re.IGNORECASE)
 
-    # Ruido / headers típicos
     def _is_noise_line(s: str) -> bool:
         low = (s or "").strip().lower()
         if not low:
@@ -727,42 +728,66 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
         bad = [
             "código carrier", "codigo carrier", "firma carrier",
             "fecha y hora", "despacha tus productos", "identifi",
-            "pack id"
         ]
         if any(b in low for b in bad):
             return True
-        # líneas que son solo números/fechas
         if re.fullmatch(r"[0-9 .:/\-]+", low):
             return True
         return False
+
+    def _maybe_buyer(line: str) -> str:
+        # Quitamos cosas típicas que se pegan al nombre (ej: "Diámetro de la cupla: ...")
+        # sin ser demasiado agresivos.
+        cut_tokens = ["diámetro", "diametro", "color:", "acabado:", "pack id", "sku", "cantidad", "venta:"]
+        low = line.lower()
+        for tok in cut_tokens:
+            idx = low.find(tok)
+            if idx > 0:
+                return line[:idx].strip()
+        return line.strip()
 
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
             text = (page.extract_text() or "").replace("\r", "\n")
             lines = [ln.strip() for ln in text.splitlines() if ln and str(ln).strip()]
 
-            current_order = None
-            current_buyer = ""
-            buyer_locked = False
-            sku_current = None
+            current_order: str | None = None
+            current_buyer: str = ""
+
+            # SKU "vigente" para el próximo "Cantidad"
+            sku_current: str | None = None
+
+            # SKU visto antes de que aparezca la Venta (caso: "Pack ID ... SKU:xxxx" y luego "Venta ... Cantidad ...")
+            pending_sku_before_order: str | None = None
 
             for line in lines:
-                # 1) Venta (puede venir junto a más texto)
+                if _is_noise_line(line):
+                    continue
+
+                # Capturar Venta (no reseteamos SKU aquí; hay PDFs donde el SKU viene en la línea anterior)
                 mv = re_venta.search(line)
                 if mv:
                     current_order = mv.group(1).strip()
                     current_buyer = ""
-                    buyer_locked = False
-                    sku_current = None
-                    # no continue: el mismo renglón puede traer SKU/Cantidad
+                    # Si hay un SKU pendiente (visto antes de la venta), lo activamos
+                    if pending_sku_before_order and not sku_current:
+                        sku_current = pending_sku_before_order
+                        pending_sku_before_order = None
 
-                # 2) Buyer: primera línea “normal” tras Venta y antes del primer SKU
-                if current_order and (not buyer_locked) and (not current_buyer):
-                    if (not _is_noise_line(line)) and (":" not in line) and (len(line) <= 90):
-                        # OJO: si el mismo renglón tiene Venta y luego el nombre, igual lo capturamos
-                        current_buyer = line.strip()
+                # Buyer: primera línea razonable después de "Venta:" que no sea metadata
+                if current_order and not current_buyer:
+                    low = line.lower()
+                    if (not _is_noise_line(line)
+                        and "venta" not in low
+                        and "sku" not in low
+                        and "cantidad" not in low
+                        and ":" not in line  # evita "Color:" etc
+                        and len(line) <= 120):
+                        cand = _maybe_buyer(line)
+                        if cand and len(cand) >= 3:
+                            current_buyer = cand
 
-                # 3) Tokenizar SKU y Cantidad en el renglón, en orden de aparición
+                # Tokenizar SKU y Cantidad en orden de aparición en el renglón
                 tokens = []
                 for ms in re_sku.finditer(line):
                     tokens.append((ms.start(), "SKU", normalize_sku(ms.group(1))))
@@ -776,8 +801,10 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
 
                 for _, kind, val in tokens:
                     if kind == "SKU":
-                        sku_current = val
-                        buyer_locked = True
+                        if current_order:
+                            sku_current = val
+                        else:
+                            pending_sku_before_order = val
                     elif kind == "QTY":
                         qty = int(val) if val is not None else 0
                         if current_order and sku_current and qty > 0:
@@ -790,8 +817,11 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
                                     "qty": qty,
                                 }
                             )
+                            # Importante: NO limpiamos sku_current aquí, porque puede venir otra Cantidad asociada
+                            # al mismo SKU en el mismo bloque (raro, pero seguro).
 
     return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
+
 
 # =========================
 # IMPORTAR VENTAS (FLEX)
