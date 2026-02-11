@@ -3577,25 +3577,90 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         st.divider()
 
     st.subheader("Escanea SKU/EAN del producto")
+    st.caption("Escanea **1 vez**. Luego verificas la cantidad solicitada (sin digitar).")
+
+    # Estado de confirmación por producto
+    if "s2_pending_sku" not in st.session_state:
+        st.session_state["s2_pending_sku"] = None
+        st.session_state["s2_pending_qty"] = 0
+        st.session_state["s2_pending_title"] = ""
+
+    pending_sku = st.session_state.get("s2_pending_sku")
+
     # Limpieza segura del campo de producto (evita StreamlitAPIException)
     if st.session_state.get("s2_clear_prod_scan"):
         st.session_state["s2_prod_scan_widget"] = ""
         st.session_state["s2_clear_prod_scan"] = False
 
-    sku_scan = st.text_input("Producto", key="s2_prod_scan_widget")
-    
-    # ✅ No pedimos cantidad: cada escaneo suma 1. Si un ítem requiere más, se escanea varias veces.
-    sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
-    if sku_scan:
-        raw = sku_scan.strip()
-        sku = barcode_to_sku.get(raw, raw) if isinstance(barcode_to_sku, dict) else raw
-        ok, msg = _s2_apply_pick(mid, sale_id, str(sku), 1)
-        if not ok:
-            st.error(msg)
-        else:
-            st.session_state["s2_clear_prod_scan"] = True
-            st.rerun()
+    sku_scan = st.text_input(
+        "Producto",
+        key="s2_prod_scan_widget",
+        disabled=bool(pending_sku)  # mientras confirmas, bloquea nuevo escaneo
+    )
 
+    # 1) Al escanear: identificamos el SKU y preparamos la verificación automática de cantidad pendiente
+    sku_scan = st.session_state.get("s2_prod_scan_widget", "").strip()
+    if sku_scan and not pending_sku:
+        sku = resolve_scan_to_sku(sku_scan, barcode_to_sku)
+
+        # Buscar qty/picked del ítem dentro de esta venta
+        connx = get_conn()
+        cx = connx.cursor()
+        cx.execute(
+            "SELECT qty, picked, description FROM s2_items WHERE manifest_id=? AND sale_id=? AND sku=?;",
+            (mid, sale_id, str(sku))
+        )
+        row = cx.fetchone()
+        connx.close()
+
+        if not row:
+            st.error("SKU/EAN no pertenece a esta venta.")
+        else:
+            qty_req, picked_now, desc_ml = int(row[0]), int(row[1]), row[2]
+            remaining = max(0, qty_req - picked_now)
+
+            # Resolver título visible (maestro > descripción > SKU)
+            title_show = ""
+            if isinstance(inv_map_sku, dict):
+                k = str(sku).strip()
+                title_show = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
+            title_show = title_show or (desc_ml or "") or str(sku)
+
+            if remaining <= 0:
+                st.info(f"✅ Ya está completo: {title_show}")
+                st.session_state["s2_clear_prod_scan"] = True
+                st.rerun()
+            else:
+                st.session_state["s2_pending_sku"] = str(sku)
+                st.session_state["s2_pending_qty"] = int(remaining)
+                st.session_state["s2_pending_title"] = str(title_show)
+                st.session_state["s2_clear_prod_scan"] = True
+                st.rerun()
+
+    # 2) Si hay un SKU pendiente: mostrar verificación de cantidad (sin digitar)
+    pending_sku = st.session_state.get("s2_pending_sku")
+    if pending_sku:
+        pending_qty = int(st.session_state.get("s2_pending_qty", 0) or 0)
+        pending_title = st.session_state.get("s2_pending_title", "") or pending_sku
+
+        st.warning(f"Verificar **{pending_qty}** unidad(es) para: **{pending_title}**")
+        cA, cB = st.columns([2, 1])
+        with cA:
+            if st.button(f"✅ Verificar {pending_qty} y cerrar producto", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
+                ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
+                if not ok:
+                    st.error(msg or "No se pudo aplicar.")
+                else:
+                    st.session_state["s2_pending_sku"] = None
+                    st.session_state["s2_pending_qty"] = 0
+                    st.session_state["s2_pending_title"] = ""
+                    st.rerun()
+        with cB:
+            if st.button("Cancelar", key=f"s2_verify_cancel_{sale_id}_{pending_sku}", use_container_width=True):
+                st.session_state["s2_pending_sku"] = None
+                st.session_state["s2_pending_qty"] = 0
+                st.session_state["s2_pending_title"] = ""
+                st.rerun()
 
     done = _s2_is_sale_done(mid, sale_id)
 
