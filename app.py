@@ -1436,6 +1436,7 @@ def page_cortes_pdf_batch():
     from io import BytesIO
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
+    import textwrap
 
     buffer = BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4)
@@ -1475,14 +1476,25 @@ def page_cortes_pdf_batch():
             pdf.setFont("Helvetica", 10)
 
         sku = str(r["SKU"])
-
-        title = str(r["Producto"])[:58]
+        title_full = str(r["Producto"])
         qty = str(int(r["Cantidad"]))
 
+        # Envolver título en 2 líneas máximo para que no se corte ni se mezcle con la cantidad
+        wrap_width = 62  # aprox. caracteres para la columna de Producto en A4
+        lines = textwrap.wrap(title_full, width=wrap_width)[:2]
+        if not lines:
+            lines = [""]
+
+        # Línea 1: SKU + Producto + Cantidad
         pdf.drawString(40, y, sku)
-        pdf.drawString(140, y, title)
+        pdf.drawString(140, y, lines[0])
         pdf.drawRightString(565, y, qty)
         y -= 12
+
+        # Línea 2 (si aplica): continuación del producto (sin tocar cantidad)
+        if len(lines) > 1:
+            pdf.drawString(140, y, lines[1])
+            y -= 12
 
     pdf.save()
     pdf_bytes = buffer.getvalue()
