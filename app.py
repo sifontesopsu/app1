@@ -1416,8 +1416,22 @@ def page_cortes_pdf_batch():
         st.info("No hay SKUs de corte en la tanda actual.")
         return
 
-    df = pd.DataFrame(rows, columns=["OT", "SKU", "Producto", "Cantidad"])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    df_raw = pd.DataFrame(rows, columns=["OT", "SKU", "Producto", "Cantidad"])
+
+    # Consolidar por SKU (mismo producto) sumando cantidades
+    df = (
+        df_raw.groupby(["SKU", "Producto"], as_index=False)
+        .agg(Cantidad=("Cantidad", "sum"), OTs=("OT", lambda s: sorted(set(map(str, s)))))
+    )
+    df["OTs"] = df["OTs"].apply(lambda xs: ", ".join(xs))
+    # Orden por SKU numérico si aplica
+    try:
+        df["_sku_num"] = pd.to_numeric(df["SKU"], errors="coerce")
+        df = df.sort_values(["_sku_num", "SKU"]).drop(columns=["_sku_num"])
+    except Exception:
+        df = df.sort_values(["SKU"])
+
+    st.dataframe(df[["SKU", "Producto", "Cantidad", "OTs"]], use_container_width=True, hide_index=True)
 
     from io import BytesIO
     from reportlab.lib.pagesizes import A4
@@ -1435,43 +1449,41 @@ def page_cortes_pdf_batch():
     pdf.drawString(40, y, f"Generado: {to_chile_display(now_iso())}")
     y -= 22
 
-    current_ot = None
-    for _, r in df.iterrows():
-        ot = str(r["OT"])
-        if ot != current_ot:
-            current_ot = ot
-            y -= 6
-            if y < 80:
-                pdf.showPage()
-                y = h - 40
-            pdf.setFont("Helvetica-Bold", 12)
-            pdf.drawString(40, y, ot)
-            y -= 16
-            pdf.setFont("Helvetica-Bold", 10)
-            pdf.drawString(40, y, "SKU")
-            pdf.drawString(140, y, "Producto")
-            pdf.drawString(520, y, "Cant.")
-            y -= 14
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.drawString(40, y, "SKU")
+    pdf.drawString(140, y, "Producto")
+    pdf.drawString(460, y, "OTs")
+    pdf.drawString(540, y, "Cant.")
+    y -= 14
 
+    pdf.setFont("Helvetica", 10)
+    for _, r in df.iterrows():
         if y < 60:
             pdf.showPage()
             y = h - 40
-            pdf.setFont("Helvetica-Bold", 12)
-            pdf.drawString(40, y, f"{current_ot} (cont.)")
-            y -= 16
+            pdf.setFont("Helvetica-Bold", 14)
+            pdf.drawString(40, y, "Ferretería Aurora - Cortes")
+            y -= 18
+            pdf.setFont("Helvetica", 10)
+            pdf.drawString(40, y, f"Generado: {to_chile_display(now_iso())}")
+            y -= 22
             pdf.setFont("Helvetica-Bold", 10)
             pdf.drawString(40, y, "SKU")
             pdf.drawString(140, y, "Producto")
-            pdf.drawString(520, y, "Cant.")
+            pdf.drawString(460, y, "OTs")
+            pdf.drawString(540, y, "Cant.")
             y -= 14
+            pdf.setFont("Helvetica", 10)
 
-        pdf.setFont("Helvetica", 10)
         sku = str(r["SKU"])
-        title = str(r["Producto"])[:78]
+
+        title = str(r["Producto"])[:58]
+        ots = str(r["OTs"])[:20]
         qty = str(int(r["Cantidad"]))
 
         pdf.drawString(40, y, sku)
         pdf.drawString(140, y, title)
+        pdf.drawString(460, y, ots)
         pdf.drawRightString(565, y, qty)
         y -= 12
 
