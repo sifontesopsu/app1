@@ -1504,6 +1504,19 @@ def page_picking():
     with col1:
         scan_label = "Escaneo"
         scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
+
+        # Autofocus en PDA: después de elegir desde la lista, dejar listo el campo de escaneo
+        if st.session_state.get("focus_scan", False):
+            components.html(
+                "<script>"
+                "setTimeout(function(){"
+                "const el=document.querySelector('input[type=\"text\"]');"
+                "if(el){el.focus(); if(el.select){el.select();}}"
+                "}, 50);"
+                "</script>",
+                height=0,
+            )
+            st.session_state["focus_scan"] = False
         force_tel_keyboard(scan_label)
         autofocus_input(scan_label)
 
@@ -1693,6 +1706,7 @@ def page_picking():
                     st.session_state.pick_state.pop(str(_tid), None)
 
                 st.session_state[force_close_key] = True
+                st.session_state['focus_scan'] = True
                 st.rerun()
 
     conn.close()
