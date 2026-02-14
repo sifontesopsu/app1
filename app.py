@@ -95,28 +95,15 @@ def split_title_ubc(title: str):
     return t, ubc
 
 def to_chile_display(iso_str: str) -> str:
-    """Convierte un ISO guardado (UTC) a hora Chile para mostrar.
-
-    Soporta:
-      - ISO naive (sin zona): se asume UTC.
-      - ISO aware (con +00:00 u otra zona): se respeta la zona y se convierte.
-    """
+    """Convierte ISO guardado (asumido UTC server) a hora Chile para mostrar."""
     if not iso_str:
         return ""
     try:
         dt = datetime.fromisoformat(str(iso_str))
-
-        # Si no hay TZ en el string, asumimos UTC (compatibilidad con históricos)
-        if dt.tzinfo is None:
-            if UTC_TZ is not None:
-                dt = dt.replace(tzinfo=UTC_TZ)
-
-        # Si no tenemos zoneinfo disponible, devolvemos “tal cual”
-        if CL_TZ is None:
-            return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S") if hasattr(dt, "strftime") else str(iso_str)
-
-        # Convertir a Chile
-        dt_cl = dt.astimezone(CL_TZ) if dt.tzinfo is not None else dt
+        if CL_TZ is None or UTC_TZ is None:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        dt_utc = dt.replace(tzinfo=UTC_TZ)
+        dt_cl = dt_utc.astimezone(CL_TZ)
         return dt_cl.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(iso_str)
@@ -1825,11 +1812,24 @@ def page_picking():
                 s["needs_decision"] = False
 
             elif q == int(qty_total):
-                c.execute("""
-                    UPDATE picking_tasks
-                    SET qty_picked=?, status='DONE', decided_at=?, confirm_mode=?
-                    WHERE id=?
-                """, (q, now_iso(), s["confirm_mode"], task_id))
+                # Si fue confirmado como "Sin EAN", lo tratamos como incidencia (para poder auditar qué SKU fue).
+                if s.get("confirm_mode") == "MANUAL_NO_EAN":
+                    c.execute("""
+                        INSERT INTO picking_incidences (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, created_at)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, (ot_id, sku_expected, int(qty_total), q, 0, "SIN_EAN", now_iso()))
+                    c.execute("""
+                        UPDATE picking_tasks
+                        SET qty_picked=?, status='INCIDENCE', decided_at=?, confirm_mode=?
+                        WHERE id=?
+                    """, (q, now_iso(), s["confirm_mode"], task_id))
+                else:
+                    c.execute("""
+                        UPDATE picking_tasks
+                        SET qty_picked=?, status='DONE', decided_at=?, confirm_mode=?
+                        WHERE id=?
+                    """, (q, now_iso(), s["confirm_mode"], task_id))
+
                 conn.commit()
                 state.pop(str(task_id), None)
                 st.success("OK. Siguiente…")
@@ -2202,7 +2202,7 @@ def page_full_upload(inv_map_sku: dict):
         return
 
     # Nombre de lote automático (no se muestra)
-    batch_name = f"FULL_{to_chile_display(now_iso()).replace(' ', '_').replace(':', '')}"
+    batch_name = f"FULL_{datetime.now().strftime('%Y-%m-%d_%H%M')}"
 
     file = st.file_uploader("Excel de preparación Full (xlsx)", type=["xlsx"], key="full_excel")
     if not file:
@@ -2703,6 +2703,30 @@ def page_admin():
     df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    
+
+    # Detalle de productos confirmados como "Sin EAN" (auditables)
+    st.subheader("Detalle Sin EAN (auditoría)")
+    c.execute("""
+        SELECT po.ot_code, pk.name,
+               pt.sku_ml,
+               COALESCE(NULLIF(pt.title_tec,''), pt.title_ml) AS producto,
+               pt.qty_total,
+               pt.decided_at
+        FROM picking_tasks pt
+        JOIN picking_ots po ON po.id = pt.ot_id
+        JOIN pickers pk ON pk.id = po.picker_id
+        WHERE pt.confirm_mode='MANUAL_NO_EAN'
+        ORDER BY po.ot_code, CAST(pt.sku_ml AS INTEGER), pt.sku_ml
+    """)
+    rows_noean = c.fetchall()
+    if not rows_noean:
+        st.info("No hay productos marcados como Sin EAN en la tanda.")
+    else:
+        df_noean = pd.DataFrame(rows_noean, columns=["OT", "Picker", "SKU", "Producto", "Cantidad", "Marcado"])
+        df_noean["Marcado"] = df_noean["Marcado"].apply(to_chile_display)
+        st.dataframe(df_noean, use_container_width=True, hide_index=True)
+
     st.subheader("Incidencias")
     c.execute("""
         SELECT po.ot_code, pk.name, pi.sku_ml, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.created_at
@@ -2760,7 +2784,8 @@ def page_admin():
 # SORTING (CAMARERO)
 # =========================
 
-# Nota: usamos el now_iso() global (UTC) para guardar y luego mostramos en hora Chile con to_chile_display().
+def now_iso():
+    return datetime.now(CL_TZ).isoformat() if CL_TZ else datetime.now().isoformat()
 
 def get_active_sorting_manifest():
     conn = get_conn()
