@@ -1730,7 +1730,13 @@ def page_picking():
             )
             st.session_state["focus_scan"] = False
         force_tel_keyboard(scan_label)
-        autofocus_input(scan_label)
+        # Autofocus inteligente:
+        # - Si ya validó el producto (confirmed), llevar el foco a "Cantidad"
+        # - Si no, mantener foco en "Escaneo"
+        if s.get("confirmed", False):
+            autofocus_input("Cantidad")
+        else:
+            autofocus_input(scan_label)
 
     with col2:
         if st.button("Validar"):
@@ -2636,7 +2642,6 @@ def page_full_admin():
 # =========================
 def page_admin():
     st.header("Administrador")
-    st.caption("Acceso abierto. Las acciones críticas (respaldo/restauración) siguen pidiendo contraseña.")
 
 
     # =========================
