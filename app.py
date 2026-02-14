@@ -35,6 +35,33 @@ SORTING_TABLES = [
 
 # Maestro SKU/EAN en la misma carpeta que app.py
 MASTER_FILE = "maestro_sku_ean.xlsx"
+
+
+# -------------------------
+# Maestro de SKUs de CORTES
+# -------------------------
+CORTES_FILE = "CORTES.xlsx"
+
+@st.cache_data(show_spinner=False)
+def load_cortes_set(path: str = CORTES_FILE) -> set:
+    """Carga listado de SKUs que requieren corte manual desde Excel."""
+    try:
+        df = pd.read_excel(path)
+    except Exception:
+        return set()
+
+    cols = {str(c).strip().upper(): c for c in df.columns}
+    col_sku = cols.get("SKU") or cols.get("SKUS") or cols.get("CODIGO") or cols.get("CÓDIGO")
+    if not col_sku:
+        col_sku = df.columns[0]
+
+    skus = set()
+    for v in df[col_sku].astype(str).fillna(""):
+        s = str(v).strip()
+        if s and s.lower() != "nan":
+            skus.add(s)
+    return skus
+
 CORTES_FILE = "CORTES.xlsx"
 
 
@@ -1179,6 +1206,7 @@ def import_sales_excel(file) -> pd.DataFrame:
     out = pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
     return out
 def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pickers: int):
+    cortes_set = load_cortes_set()
     conn = get_conn()
     c = conn.cursor()
 
