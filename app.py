@@ -2794,7 +2794,7 @@ def page_admin():
             if st.button("✅ Sí, borrar todo y reiniciar"):
                 c.execute("DELETE FROM picking_tasks;")
     c.execute("DELETE FROM cortes_tasks;")
-                c.execute("DELETE FROM picking_incidences;")
+        c.execute("DELETE FROM picking_incidences;")
                 c.execute("DELETE FROM sorting_status;")
                 c.execute("DELETE FROM ot_orders;")
                 c.execute("DELETE FROM picking_ots;")
