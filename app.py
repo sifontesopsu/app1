@@ -2144,6 +2144,57 @@ def page_admin():
         st.info("Ingresa contraseña para administrar.")
         return
 
+
+    # =========================
+    # PERSISTENCIA (Streamlit Community Cloud)
+    # =========================
+    st.subheader("Persistencia / Respaldo (recomendado en Streamlit Cloud)")
+    st.caption(
+        "En Streamlit Community Cloud, el servidor puede 'dormir' y reiniciar. "
+        "Todo lo que esté en memoria se pierde, y el archivo de base de datos local puede reiniciarse. "
+        "Para no perder el control, usa respaldo/restauración aquí (o migra a Postgres)."
+    )
+
+    # Backup (descargar)
+    try:
+        if os.path.exists(DB_NAME):
+            with open(DB_NAME, "rb") as f:
+                db_bytes = f.read()
+            st.download_button(
+                "⬇️ Descargar respaldo (aurora_ml.db)",
+                data=db_bytes,
+                file_name=DB_NAME,
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
+        else:
+            st.warning(f"No se encontró {DB_NAME} en disco (aún no se ha creado la BD).")
+    except Exception as e:
+        st.warning(f"No se pudo preparar el respaldo: {e}")
+
+    # Restore (subir)
+    up = st.file_uploader("⬆️ Restaurar desde respaldo (.db)", type=["db"], key="restore_db_file")
+    colR1, colR2 = st.columns([2, 1])
+    with colR1:
+        confirm_restore = st.text_input("Escribe RESTAURAR para confirmar", value="", key="restore_db_confirm")
+    with colR2:
+        do_restore = st.button("♻️ Restaurar BD", type="primary", disabled=not (up and confirm_restore.strip().upper() == "RESTAURAR"))
+
+    if do_restore and up is not None:
+        try:
+            # Cerrar cualquier conexión abierta antes de reemplazar (seguridad extra)
+            # (en este punto aún no abrimos get_conn() en page_admin)
+            tmp_path = DB_NAME + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(up.getvalue())
+            os.replace(tmp_path, DB_NAME)
+            st.success("✅ BD restaurada. Recargando…")
+            st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo restaurar la BD: {e}")
+
+    st.divider()
+
     conn = get_conn()
     c = conn.cursor()
 
