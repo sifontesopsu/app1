@@ -21,6 +21,7 @@ NUM_MESAS = 4
 # =========================
 PICKING_TABLES = [
     "orders","order_items","pickers","picking_ots","picking_tasks","picking_incidences","ot_orders","sorting_status"
+,"cortes_tasks"
 ]
 FULL_TABLES = [
     "full_batches","full_batch_items","full_incidences"
@@ -34,6 +35,7 @@ SORTING_TABLES = [
 
 # Maestro SKU/EAN en la misma carpeta que app.py
 MASTER_FILE = "maestro_sku_ean.xlsx"
+CORTES_FILE = "CORTES.xlsx"
 
 
 # =========================
@@ -47,6 +49,17 @@ except Exception:
     CL_TZ = None
     UTC_TZ = None
 
+
+
+# PDF (cortes)
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    HAS_REPORTLAB = True
+except Exception:
+    HAS_REPORTLAB = False
 
 # PDF manifiestos
 try:
@@ -450,6 +463,20 @@ def init_db():
         confirm_mode TEXT,
         defer_rank INTEGER DEFAULT 0,
         defer_at TEXT
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS cortes_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ot_id INTEGER,
+        sku_ml TEXT,
+        title_ml TEXT,
+        title_tec TEXT,
+        qty_total INTEGER,
+        status TEXT DEFAULT 'PENDING',
+        created_at TEXT,
+        done_at TEXT
     );
     """)
 
@@ -892,6 +919,35 @@ def master_bootstrap(master_path: str):
     return inv_map_sku, barcode_to_sku, conflicts
 
 
+@st.cache_data(show_spinner=False)
+def load_cortes_set(cortes_path: str) -> set[str]:
+    """Carga lista de SKUs que requieren corte manual desde Excel (columna SKU o CORTES)."""
+    s = set()
+    if not cortes_path or not os.path.exists(cortes_path):
+        return s
+    try:
+        df = pd.read_excel(cortes_path, dtype=str)
+        if df.empty:
+            return s
+        cols = [str(c).strip().lower() for c in df.columns.tolist()]
+        col = None
+        if "sku" in cols:
+            col = df.columns[cols.index("sku")]
+        elif "cortes" in cols:
+            col = df.columns[cols.index("cortes")]
+        else:
+            col = df.columns[0]
+        for v in df[col].dropna().astype(str).tolist():
+            vv = str(v).strip()
+            if vv.endswith(".0"):
+                vv = vv[:-2]
+            vv = vv.strip()
+            if vv:
+                s.add(vv)
+    except Exception:
+        return set()
+    return s
+
 # =========================
 # PARSER PDF MANIFIESTO
 # =========================
@@ -1210,10 +1266,19 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
         """, (ot_id,))
         rows = c.fetchall()
         for sku, title, title_tec_any, total in rows:
-            c.execute("""
-                INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode)
-                VALUES (?,?,?,?,?,?,?,?,?)
-            """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None, None))
+            sku_str = str(sku).strip()
+            if sku_str.endswith(".0"):
+                sku_str = sku_str[:-2]
+            if sku_str in cortes_set:
+                c.execute("""
+                    INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, status, created_at, done_at)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (ot_id, sku_str, title, title_tec_any, int(total), "PENDING", now_iso(), None))
+            else:
+                c.execute("""
+                    INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                """, (ot_id, sku_str, title, title_tec_any, int(total), 0, "PENDING", None, None))
 
     conn.commit()
     conn.close()
@@ -1347,6 +1412,112 @@ def picking_lobby():
     return "selected_picker" in st.session_state
 
 
+
+def chile_date_to_utc_range(d):
+    """Retorna (utc_start_iso, utc_end_iso) para un día Chile dado."""
+    if CL_TZ is None or UTC_TZ is None:
+        # fallback: asume server UTC y usa día UTC
+        start = datetime(d.year, d.month, d.day, 0, 0, 0)
+        end = start + pd.Timedelta(days=1)
+        return start.isoformat(timespec="seconds"), end.to_pydatetime().isoformat(timespec="seconds")
+    start_cl = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=CL_TZ)
+    end_cl = start_cl + pd.Timedelta(days=1)
+    start_utc = start_cl.astimezone(UTC_TZ).replace(tzinfo=None)
+    end_utc = end_cl.astimezone(UTC_TZ).replace(tzinfo=None)
+    return start_utc.isoformat(timespec="seconds"), end_utc.isoformat(timespec="seconds")
+
+
+def build_cortes_pdf(day_str: str, rows: list[tuple]) -> bytes:
+    """rows: list of (ot_code, sku, title, qty_total)"""
+    if not HAS_REPORTLAB:
+        return b""
+    from io import BytesIO
+    buff = BytesIO()
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(buff, pagesize=A4, leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
+    story = []
+    story.append(Paragraph(f"<b>Ferretería Aurora – Cortes</b>", styles["Title"]))
+    story.append(Paragraph(f"Día: <b>{day_str}</b>", styles["Normal"]))
+    story.append(Spacer(1, 8))
+
+    data = [["OT", "SKU", "Producto", "Cant."]]
+    for ot_code, sku, title, qty in rows:
+        data.append([ot_code, str(sku), str(title), str(qty)])
+
+    tbl = Table(data, colWidths=[70, 80, 300, 50])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("FONTSIZE", (0,0), (-1,0), 9),
+        ("FONTSIZE", (0,1), (-1,-1), 8),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.white]),
+    ]))
+    story.append(tbl)
+    doc.build(story)
+    return buff.getvalue()
+
+
+def page_cortes_pdf():
+    st.header("Cortes (PDF por día)")
+    st.caption("Aquí se listan los SKUs que requieren corte manual. Se genera un PDF con TODAS las OTs del día seleccionado.")
+
+    if not HAS_REPORTLAB:
+        st.error("No está disponible la librería de PDF (reportlab) en este entorno.")
+        return
+
+    # Fecha Chile
+    try:
+        today_cl = datetime.now(CL_TZ).date() if CL_TZ else datetime.utcnow().date()
+    except Exception:
+        today_cl = datetime.utcnow().date()
+
+    d = st.date_input("Día", value=today_cl)
+
+    utc_start, utc_end = chile_date_to_utc_range(d)
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT po.ot_code, ct.sku_ml, COALESCE(NULLIF(ct.title_tec,''), ct.title_ml) AS title_eff, ct.qty_total
+        FROM cortes_tasks ct
+        JOIN picking_ots po ON po.id = ct.ot_id
+        WHERE po.created_at >= ? AND po.created_at < ?
+        ORDER BY po.ot_code, CAST(ct.sku_ml AS INTEGER), ct.sku_ml
+        """,
+        (utc_start, utc_end)
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    # Reemplazar título por el del maestro si existe (consistente)
+    final_rows = []
+    for ot_code, sku, title_eff, qty_total in rows:
+        sku_norm = str(sku).strip()
+        if sku_norm.endswith(".0"):
+            sku_norm = sku_norm[:-2]
+        raw_master = master_raw_title_lookup(MASTER_FILE, sku_norm)
+        title_show = raw_master if raw_master else str(title_eff or "")
+        final_rows.append((ot_code, sku_norm, title_show, int(qty_total)))
+
+    if not final_rows:
+        st.info("No hay productos de cortes para ese día.")
+        return
+
+    st.markdown("### Resumen")
+    st.write(f"Total líneas de corte: **{len(final_rows)}**")
+
+    # Vista rápida en pantalla
+    st.dataframe(pd.DataFrame(final_rows, columns=["OT","SKU","Producto","Cantidad"]), use_container_width=True, hide_index=True)
+
+    pdf_bytes = build_cortes_pdf(d.strftime("%Y-%m-%d"), final_rows)
+    st.download_button(
+        "⬇️ Descargar PDF Cortes (día completo)",
+        data=pdf_bytes,
+        file_name=f"cortes_{d.strftime('%Y-%m-%d')}.pdf",
+        mime="application/pdf"
+    )
 def page_picking():
     if "selected_picker" not in st.session_state:
         ok = picking_lobby()
@@ -4267,14 +4438,17 @@ def main():
     if mode == "FLEX_PICK":
         pages = [
             "1) Picking",
-            "2) Importar ventas",
-            "3) Administrador",
+            "2) Cortes (PDF)",
+            "3) Importar ventas",
+            "4) Administrador",
         ]
         page = st.sidebar.radio("Menú", pages, index=0)
 
         if page.startswith("1"):
             page_picking()
         elif page.startswith("2"):
+            page_cortes_pdf()
+        elif page.startswith("3"):
             page_import(inv_map_sku)
         else:
             page_admin()
