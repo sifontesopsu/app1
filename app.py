@@ -4064,7 +4064,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
     st.markdown("### Productos de la venta")
     total_items = len(items)
-    done_items = sum(1 for _sku,_d,_q,_p,stx in items if stx in ("DONE","INCIDENCE"))
+    done_items = sum(1 for _sku,_d,_q,_p,stx,_note in items if stx in ("DONE","INCIDENCE"))
     st.progress(0 if total_items==0 else done_items/total_items)
     st.caption(f"{done_items}/{total_items} ítems finalizados (DONE o INCIDENCE)")
 
