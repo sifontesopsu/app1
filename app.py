@@ -1632,67 +1632,55 @@ def page_picking():
             if st.button("Reintentar"):
                 s["needs_decision"] = False
                 st.info("Ajusta cantidad y confirma nuevamente.")
-
-
     # =========================
-    # MOSTRAR LISTA (SALTO DE SKU)
+    # LISTA DE SKUS DE ESTA OT
     # =========================
     st.markdown("---")
-    list_flag_key = f"pick_show_list_{ot_id}"
-    if list_flag_key not in st.session_state:
-        st.session_state[list_flag_key] = False
+    with st.expander("📋 Lista de SKUs de esta OT", expanded=True):
+        st.caption("Toca un SKU pendiente para ponerlo como el próximo a escanear. Luego sigues normal.")
 
-    # Botón al fondo (centrado)
-    _c1, _c2, _c3 = st.columns([1, 2, 1])
-    with _c2:
-        if st.button("Mostrar lista" if not st.session_state[list_flag_key] else "Ocultar lista", use_container_width=True):
-            st.session_state[list_flag_key] = not st.session_state[list_flag_key]
-            st.rerun()
+        # Pendientes primero
+        ordered = sorted(
+            tasks,
+            key=lambda t: (0 if t[6] == "PENDING" else 1, str(t[1]))
+        )
 
-    if st.session_state[list_flag_key]:
-        with st.expander("📋 Lista de SKUs de esta OT", expanded=True):
-            st.caption("Toca un SKU pendiente para ponerlo como el próximo a escanear. Luego sigues normal.")
-            # Pendientes primero
-            ordered = sorted(
-                tasks,
-                key=lambda t: (0 if t[6] == "PENDING" else 1, str(t[1]))
+        for t in ordered:
+            _tid, _sku, _title_ml, _title_tec, _qty_total, _qty_picked, _status = t
+            raw_master_t = master_raw_title_lookup(MASTER_FILE, _sku)
+            _title_show = raw_master_t if raw_master_t else (
+                _title_tec if _title_tec not in (None, "") else (_title_ml or "")
             )
 
-            for t in ordered:
-                _tid, _sku, _title_ml, _title_tec, _qty_total, _qty_picked, _status = t
-                raw_master_t = master_raw_title_lookup(MASTER_FILE, _sku)
-                _title_show = raw_master_t if raw_master_t else (_title_tec if _title_tec not in (None, "") else (_title_ml or ""))
+            disabled = (_status != "PENDING") or (_tid == task_id)
+            label = f"{_title_show} [{_sku}]"
 
-                disabled = (_status != "PENDING") or (_tid == task_id)
-                label = f"{_title_show} [{_sku}]"
+            if st.button(label, disabled=disabled, key=f"jump_{ot_id}_{_tid}"):
+                try:
+                    # Poner este task como el siguiente: defer_rank más bajo
+                    c.execute(
+                        "SELECT COALESCE(MIN(defer_rank), 0) FROM picking_tasks WHERE ot_id=? AND status='PENDING'",
+                        (ot_id,)
+                    )
+                    min_rank = c.fetchone()[0] or 0
+                    new_rank = int(min_rank) - 1
+                    c.execute(
+                        "UPDATE picking_tasks SET defer_rank=?, defer_at=? WHERE id=?",
+                        (new_rank, now_iso(), _tid)
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
 
-                if st.button(label, disabled=disabled, key=f"jump_{ot_id}_{_tid}"):
-                    try:
-                        # Poner este task como el siguiente: defer_rank más bajo
-                        c.execute(
-                            "SELECT COALESCE(MIN(defer_rank), 0) FROM picking_tasks WHERE ot_id=? AND status='PENDING'",
-                            (ot_id,)
-                        )
-                        min_rank = c.fetchone()[0] or 0
-                        new_rank = int(min_rank) - 1
-                        c.execute(
-                            "UPDATE picking_tasks SET defer_rank=?, defer_at=? WHERE id=?",
-                            (new_rank, now_iso(), _tid)
-                        )
-                        conn.commit()
-                    except Exception:
-                        pass
+                # Limpiar estados UI del actual y del seleccionado
+                if "pick_state" in st.session_state:
+                    st.session_state.pick_state.pop(str(task_id), None)
+                    st.session_state.pick_state.pop(str(_tid), None)
 
-                    # Limpiar estados UI del actual y del seleccionado
-                    if "pick_state" in st.session_state:
-                        st.session_state.pick_state.pop(str(task_id), None)
-                        st.session_state.pick_state.pop(str(_tid), None)
-
-                    # Cerrar lista
-                    st.session_state[list_flag_key] = False
-                    st.rerun()
+                st.rerun()
 
     conn.close()
+
 
 
 # =========================
