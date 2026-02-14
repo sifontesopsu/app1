@@ -95,15 +95,28 @@ def split_title_ubc(title: str):
     return t, ubc
 
 def to_chile_display(iso_str: str) -> str:
-    """Convierte ISO guardado (asumido UTC server) a hora Chile para mostrar."""
+    """Convierte un ISO guardado (UTC) a hora Chile para mostrar.
+
+    Soporta:
+      - ISO naive (sin zona): se asume UTC.
+      - ISO aware (con +00:00 u otra zona): se respeta la zona y se convierte.
+    """
     if not iso_str:
         return ""
     try:
         dt = datetime.fromisoformat(str(iso_str))
-        if CL_TZ is None or UTC_TZ is None:
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        dt_utc = dt.replace(tzinfo=UTC_TZ)
-        dt_cl = dt_utc.astimezone(CL_TZ)
+
+        # Si no hay TZ en el string, asumimos UTC (compatibilidad con históricos)
+        if dt.tzinfo is None:
+            if UTC_TZ is not None:
+                dt = dt.replace(tzinfo=UTC_TZ)
+
+        # Si no tenemos zoneinfo disponible, devolvemos “tal cual”
+        if CL_TZ is None:
+            return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S") if hasattr(dt, "strftime") else str(iso_str)
+
+        # Convertir a Chile
+        dt_cl = dt.astimezone(CL_TZ) if dt.tzinfo is not None else dt
         return dt_cl.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(iso_str)
@@ -2189,7 +2202,7 @@ def page_full_upload(inv_map_sku: dict):
         return
 
     # Nombre de lote automático (no se muestra)
-    batch_name = f"FULL_{datetime.now().strftime('%Y-%m-%d_%H%M')}"
+    batch_name = f"FULL_{to_chile_display(now_iso()).replace(' ', '_').replace(':', '')}"
 
     file = st.file_uploader("Excel de preparación Full (xlsx)", type=["xlsx"], key="full_excel")
     if not file:
@@ -2747,8 +2760,7 @@ def page_admin():
 # SORTING (CAMARERO)
 # =========================
 
-def now_iso():
-    return datetime.now(CL_TZ).isoformat() if CL_TZ else datetime.now().isoformat()
+# Nota: usamos el now_iso() global (UTC) para guardar y luego mostramos en hora Chile con to_chile_display().
 
 def get_active_sorting_manifest():
     conn = get_conn()
