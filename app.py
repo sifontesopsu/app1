@@ -2340,10 +2340,7 @@ def page_full_admin():
 # =========================
 def page_admin():
     st.header("Administrador")
-    pwd = st.text_input("Contraseña", type="password")
-    if pwd != ADMIN_PASSWORD:
-        st.info("Ingresa contraseña para administrar.")
-        return
+    st.caption("Acceso abierto. Las acciones críticas (respaldo/restauración) siguen pidiendo contraseña.")
 
 
     # =========================
