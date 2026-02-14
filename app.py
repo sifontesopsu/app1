@@ -73,8 +73,20 @@ def load_cortes_set(path: str = CORTES_FILE) -> set:
             col_sku = df.columns[0]
 
         skus = set()
-        for v in df[col_sku].astype(str).fillna(""):
+        def _norm(v):
             s = str(v).strip()
+            if s.endswith(".0"):
+                s = s[:-2]
+            # Si existe normalize_sku en el código, úsalo para asegurar misma forma
+            try:
+                s2 = normalize_sku(s)
+                s = s2 if s2 else s
+            except Exception:
+                pass
+            return s
+
+        for v in df[col_sku].fillna("").tolist():
+            s = _norm(v)
             if s and s.lower() != "nan":
                 skus.add(s)
 
@@ -1239,6 +1251,7 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
 
     # Reset corrida (no borra histórico; eso lo hace admin reset total)
     c.execute("DELETE FROM picking_tasks;")
+    c.execute("DELETE FROM cortes_tasks;")
     c.execute("DELETE FROM picking_incidences;")
     c.execute("DELETE FROM ot_orders;")
     c.execute("DELETE FROM sorting_status;")
@@ -1513,66 +1526,109 @@ def build_cortes_pdf(day_str: str, rows: list[tuple]) -> bytes:
     return buff.getvalue()
 
 
-def page_cortes_pdf():
-    st.header("Cortes (PDF por día)")
-    st.caption("Aquí se listan los SKUs que requieren corte manual. Se genera un PDF con TODAS las OTs del día seleccionado.")
 
-    if not HAS_REPORTLAB:
-        st.error("No está disponible la librería de PDF (reportlab) en este entorno.")
-        return
-
-    # Fecha Chile
-    try:
-        today_cl = datetime.now(CL_TZ).date() if CL_TZ else datetime.utcnow().date()
-    except Exception:
-        today_cl = datetime.utcnow().date()
-
-    d = st.date_input("Día", value=today_cl)
-
-    utc_start, utc_end = chile_date_to_utc_range(d)
+def page_cortes_pdf_batch():
+    st.header("Cortes de la tanda (PDF)")
+    st.caption("Genera un PDF con todos los productos que requieren corte manual en la tanda actual.")
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        """
-        SELECT po.ot_code, ct.sku_ml, COALESCE(NULLIF(ct.title_tec,''), ct.title_ml) AS title_eff, ct.qty_total
+
+    c.execute("""
+        SELECT ct.ot_id,
+               po.ot_code,
+               ct.sku_ml,
+               COALESCE(NULLIF(ct.title_tec,''), ct.title_ml) AS title,
+               ct.qty_total,
+               ct.status
         FROM cortes_tasks ct
         JOIN picking_ots po ON po.id = ct.ot_id
-        WHERE po.created_at >= ? AND po.created_at < ?
-        ORDER BY po.ot_code, CAST(ct.sku_ml AS INTEGER), ct.sku_ml
-        """,
-        (utc_start, utc_end)
-    )
+        ORDER BY po.ot_code, ct.sku_ml
+    """)
     rows = c.fetchall()
     conn.close()
 
-    # Reemplazar título por el del maestro si existe (consistente)
-    final_rows = []
-    for ot_code, sku, title_eff, qty_total in rows:
-        sku_norm = str(sku).strip()
-        if sku_norm.endswith(".0"):
-            sku_norm = sku_norm[:-2]
-        raw_master = master_raw_title_lookup(MASTER_FILE, sku_norm)
-        title_show = raw_master if raw_master else str(title_eff or "")
-        final_rows.append((ot_code, sku_norm, title_show, int(qty_total)))
-
-    if not final_rows:
-        st.info("No hay productos de cortes para ese día.")
+    if not rows:
+        st.info("No hay SKUs de corte en la tanda actual.")
         return
 
-    st.markdown("### Resumen")
-    st.write(f"Total líneas de corte: **{len(final_rows)}**")
+    # Tabla en pantalla
+    import pandas as pd
+    df = pd.DataFrame(rows, columns=["ot_id", "ot_code", "sku", "title", "qty", "status"])
+    st.dataframe(df[["ot_code", "sku", "title", "qty", "status"]], use_container_width=True, hide_index=True)
 
-    # Vista rápida en pantalla
-    st.dataframe(pd.DataFrame(final_rows, columns=["OT","SKU","Producto","Cantidad"]), use_container_width=True, hide_index=True)
+    # PDF (ReportLab)
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
 
-    pdf_bytes = build_cortes_pdf(d.strftime("%Y-%m-%d"), final_rows)
+    buffer = BytesIO()
+    cpdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    y = height - 40
+    cpdf.setFont("Helvetica-Bold", 14)
+    cpdf.drawString(40, y, "Ferretería Aurora - Cortes (tanda actual)")
+    y -= 18
+    cpdf.setFont("Helvetica", 10)
+    cpdf.drawString(40, y, f"Generado: {now_iso()}")
+    y -= 22
+
+    current_ot = None
+    cpdf.setFont("Helvetica", 10)
+
+    for _, r in df.iterrows():
+        if current_ot != r["ot_code"]:
+            current_ot = r["ot_code"]
+            y -= 6
+            if y < 80:
+                cpdf.showPage()
+                y = height - 40
+            cpdf.setFont("Helvetica-Bold", 12)
+            cpdf.drawString(40, y, f"{current_ot}")
+            y -= 16
+            cpdf.setFont("Helvetica-Bold", 10)
+            cpdf.drawString(40, y, "SKU")
+            cpdf.drawString(140, y, "Producto")
+            cpdf.drawString(500, y, "Cant.")
+            y -= 14
+            cpdf.setFont("Helvetica", 10)
+
+        if y < 60:
+            cpdf.showPage()
+            y = height - 40
+            cpdf.setFont("Helvetica-Bold", 12)
+            cpdf.drawString(40, y, f"{current_ot} (cont.)")
+            y -= 16
+            cpdf.setFont("Helvetica-Bold", 10)
+            cpdf.drawString(40, y, "SKU")
+            cpdf.drawString(140, y, "Producto")
+            cpdf.drawString(500, y, "Cant.")
+            y -= 14
+            cpdf.setFont("Helvetica", 10)
+
+        sku = str(r["sku"])
+        title = str(r["title"])[:70]
+        qty = str(int(r["qty"]))
+
+        cpdf.drawString(40, y, sku)
+        cpdf.drawString(140, y, title)
+        cpdf.drawRightString(560, y, qty)
+        y -= 12
+
+    cpdf.showPage()
+    cpdf.save()
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
     st.download_button(
-        "⬇️ Descargar PDF Cortes (día completo)",
+        "⬇️ Descargar PDF de Cortes (tanda)",
         data=pdf_bytes,
-        file_name=f"cortes_{d.strftime('%Y-%m-%d')}.pdf",
-        mime="application/pdf"
+        file_name=f"cortes_tanda_{now_iso().replace(':','-')}.pdf",
+        mime="application/pdf",
+        use_container_width=True
     )
+
 def page_picking():
     if "selected_picker" not in st.session_state:
         ok = picking_lobby()
@@ -2737,6 +2793,7 @@ def page_admin():
         with colA:
             if st.button("✅ Sí, borrar todo y reiniciar"):
                 c.execute("DELETE FROM picking_tasks;")
+    c.execute("DELETE FROM cortes_tasks;")
                 c.execute("DELETE FROM picking_incidences;")
                 c.execute("DELETE FROM sorting_status;")
                 c.execute("DELETE FROM ot_orders;")
