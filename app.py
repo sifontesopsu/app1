@@ -1431,7 +1431,7 @@ def page_cortes_pdf_batch():
     except Exception:
         df = df.sort_values(["SKU"])
 
-    st.dataframe(df[["SKU", "Producto", "Cantidad", "OTs"]], use_container_width=True, hide_index=True)
+    st.dataframe(df[["SKU", "Producto", "Cantidad"]], use_container_width=True, hide_index=True)
 
     from io import BytesIO
     from reportlab.lib.pagesizes import A4
@@ -1452,8 +1452,7 @@ def page_cortes_pdf_batch():
     pdf.setFont("Helvetica-Bold", 10)
     pdf.drawString(40, y, "SKU")
     pdf.drawString(140, y, "Producto")
-    pdf.drawString(460, y, "OTs")
-    pdf.drawString(540, y, "Cant.")
+    pdf.drawString(520, y, "Cant.")
     y -= 14
 
     pdf.setFont("Helvetica", 10)
@@ -1478,12 +1477,10 @@ def page_cortes_pdf_batch():
         sku = str(r["SKU"])
 
         title = str(r["Producto"])[:58]
-        ots = str(r["OTs"])[:20]
         qty = str(int(r["Cantidad"]))
 
         pdf.drawString(40, y, sku)
         pdf.drawString(140, y, title)
-        pdf.drawString(460, y, ots)
         pdf.drawRightString(565, y, qty)
         y -= 12
 
