@@ -43,30 +43,50 @@ MASTER_FILE = "maestro_sku_ean.xlsx"
 CORTES_FILE = "CORTES.xlsx"
 
 def load_cortes_set(path: str = CORTES_FILE) -> set:
-    """Carga listado de SKUs que requieren corte manual desde Excel."""
-    # Cache simple por sesión (evita issues de cache_data en Cloud)
-    if st.session_state.get('_cortes_cache_path') == path and 'cortes_set' in st.session_state:
-        return set(st.session_state['cortes_set'])
+    """Carga listado de SKUs que requieren corte manual desde Excel (ultra defensivo)."""
+    # session cache (no depende de st.cache_data)
+    try:
+        ss = st.session_state
+    except Exception:
+        ss = {}
+
+    try:
+        if ss.get("_cortes_cache_path") == path and ss.get("_cortes_cache_skus") is not None:
+            return set(ss.get("_cortes_cache_skus") or [])
+    except Exception:
+        pass
+
     try:
         df = pd.read_excel(path)
     except Exception:
+        # Si no existe o falla lectura, no bloquear la app
+        try:
+            st.warning(f"No se pudo leer {path}. Cortes deshabilitado hasta corregir archivo.")
+        except Exception:
+            pass
         return set()
 
-    cols = {str(c).strip().upper(): c for c in df.columns}
-    col_sku = cols.get("SKU") or cols.get("SKUS") or cols.get("CODIGO") or cols.get("CÓDIGO")
-    if not col_sku:
-        col_sku = df.columns[0]
+    try:
+        cols = {str(c).strip().upper(): c for c in df.columns}
+        col_sku = cols.get("SKU") or cols.get("SKUS") or cols.get("CORTES") or cols.get("CODIGO") or cols.get("CÓDIGO")
+        if not col_sku:
+            col_sku = df.columns[0]
 
-    skus = set()
-    for v in df[col_sku].astype(str).fillna(""):
-        s = str(v).strip()
-        if s and s.lower() != "nan":
-            skus.add(s)
-    st.session_state['_cortes_cache_path'] = path
+        skus = set()
+        for v in df[col_sku].astype(str).fillna(""):
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                skus.add(s)
 
-    st.session_state['cortes_set'] = list(skus)
+        try:
+            ss["_cortes_cache_path"] = path
+            ss["_cortes_cache_skus"] = list(skus)
+        except Exception:
+            pass
 
-    return skus
+        return skus
+    except Exception:
+        return set()
 
 CORTES_FILE = "CORTES.xlsx"
 
@@ -1210,7 +1230,10 @@ def import_sales_excel(file) -> pd.DataFrame:
     out = pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
     return out
 def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pickers: int):
-    cortes_set = load_cortes_set()
+    try:
+        cortes_set = load_cortes_set()
+    except Exception:
+        cortes_set = set()
     conn = get_conn()
     c = conn.cursor()
 
