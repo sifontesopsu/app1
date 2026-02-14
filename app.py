@@ -1351,6 +1351,22 @@ def page_app_lobby():
     st.markdown("</div>", unsafe_allow_html=True)
 def page_import(inv_map_sku: dict):
     st.header("Importar ventas")
+    # Bloqueo duro: no permitir cargar otra tanda si hay una en curso
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COUNT(1) FROM picking_ots WHERE status='OPEN'")
+        open_ots = int(c.fetchone()[0] or 0)
+        c.execute("SELECT COUNT(1) FROM picking_tasks WHERE status='PENDING'")
+        pending_tasks = int(c.fetchone()[0] or 0)
+    except Exception:
+        open_ots, pending_tasks = 0, 0
+    conn.close()
+
+    if open_ots > 0 or pending_tasks > 0:
+        st.warning("⚠️ Ya hay una tanda de Picking en curso. Para cargar otra, ve a **Administrador** y reinicia/borra la tanda actual.")
+        return
+
     origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
     num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
 
@@ -1413,7 +1429,7 @@ def page_cortes_pdf_batch():
     y = h - 40
 
     pdf.setFont("Helvetica-Bold", 14)
-    pdf.drawString(40, y, "Ferretería Aurora - Cortes (tanda actual)")
+    pdf.drawString(40, y, "Ferretería Aurora - Cortes")
     y -= 18
     pdf.setFont("Helvetica", 10)
     pdf.drawString(40, y, f"Generado: {to_chile_display(now_iso())}")
@@ -4444,9 +4460,7 @@ def main():
             "1) Picking",
             "2) Importar ventas",
             "3) Cortes de la tanda (PDF)",
-            "4) Administrador",            "1) Picking",
-            "2) Importar ventas",
-            "3) Administrador",
+            "4) Administrador",
         ]
         page = st.sidebar.radio("Menú", pages, index=0)
 
