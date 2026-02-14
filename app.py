@@ -469,6 +469,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ot_id INTEGER,
         sku_ml TEXT,
+        product TEXT,
         qty_total INTEGER,
         qty_picked INTEGER,
         qty_missing INTEGER,
@@ -637,6 +638,9 @@ def init_db():
         # picking_tasks (nuevas columnas para reordenar por "Surtido en venta")
     _ensure_col("picking_tasks", "defer_rank", "INTEGER DEFAULT 0")
     _ensure_col("picking_tasks", "defer_at", "TEXT")
+
+    # picking_incidences
+    _ensure_col("picking_incidences", "product", "TEXT")
 
 # sorting_manifests
     _ensure_col("sorting_manifests", "name", "TEXT")
@@ -1815,9 +1819,9 @@ def page_picking():
                 # Si fue confirmado como "Sin EAN", lo tratamos como incidencia (para poder auditar qué SKU fue).
                 if s.get("confirm_mode") == "MANUAL_NO_EAN":
                     c.execute("""
-                        INSERT INTO picking_incidences (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, created_at)
-                        VALUES (?,?,?,?,?,?,?)
-                    """, (ot_id, sku_expected, int(qty_total), q, 0, "SIN_EAN", now_iso()))
+                        INSERT INTO picking_incidences (ot_id, sku_ml, product, qty_total, qty_picked, qty_missing, reason, created_at)
+                        VALUES (?,?,?,?,?,?,?,?)
+                    """, (ot_id, sku_expected, str(producto_show), int(qty_total), q, 0, "SIN_EAN", now_iso()))
                     c.execute("""
                         UPDATE picking_tasks
                         SET qty_picked=?, status='INCIDENCE', decided_at=?, confirm_mode=?
@@ -1851,9 +1855,9 @@ def page_picking():
                 missing = int(qty_total) - q
 
                 c.execute("""
-                    INSERT INTO picking_incidences (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, created_at)
-                    VALUES (?,?,?,?,?,?,?)
-                """, (ot_id, sku_expected, int(qty_total), q, missing, "FALTANTE", now_iso()))
+                    INSERT INTO picking_incidences (ot_id, sku_ml, product, qty_total, qty_picked, qty_missing, reason, created_at)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (ot_id, sku_expected, str(producto_show), int(qty_total), q, missing, "FALTANTE", now_iso()))
 
                 c.execute("""
                     UPDATE picking_tasks
@@ -2729,7 +2733,7 @@ def page_admin():
 
     st.subheader("Incidencias")
     c.execute("""
-        SELECT po.ot_code, pk.name, pi.sku_ml, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.created_at
+        SELECT po.ot_code, pk.name, pi.sku_ml, pi.product, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.created_at
         FROM picking_incidences pi
         JOIN picking_ots po ON po.id = pi.ot_id
         JOIN pickers pk ON pk.id = po.picker_id
@@ -2737,7 +2741,7 @@ def page_admin():
     """)
     inc_rows = c.fetchall()
     if inc_rows:
-        df_inc = pd.DataFrame(inc_rows, columns=["OT", "Picker", "SKU", "Solicitado", "Pickeado", "Faltante", "Motivo", "Hora"])
+        df_inc = pd.DataFrame(inc_rows, columns=["OT", "Picker", "SKU", "Producto", "Solicitado", "Pickeado", "Faltante", "Motivo", "Hora"])
         df_inc["Hora"] = df_inc["Hora"].apply(to_chile_display)
         st.dataframe(df_inc)
     else:
