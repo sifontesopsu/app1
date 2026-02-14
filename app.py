@@ -20,8 +20,15 @@ NUM_MESAS = 4
 # TABLAS POR MÓDULO (para respaldo parcial)
 # =========================
 PICKING_TABLES = [
-    "orders","order_items","pickers","picking_ots","picking_tasks","picking_incidences","ot_orders","sorting_status"
-,"cortes_tasks"
+    "orders",
+    "order_items",
+    "pickers",
+    "picking_ots",
+    "picking_tasks",
+    "picking_incidences",
+    "cortes_tasks",
+    "ot_orders",
+    "sorting_status",
 ]
 FULL_TABLES = [
     "full_batches","full_batch_items","full_incidences"
@@ -37,72 +44,9 @@ SORTING_TABLES = [
 MASTER_FILE = "maestro_sku_ean.xlsx"
 
 
-# -------------------------
-# Maestro de SKUs de CORTES
-# -------------------------
+
+# Maestro de SKUs para CORTES (rollos / corte manual)
 CORTES_FILE = "CORTES.xlsx"
-
-def load_cortes_set(path: str = CORTES_FILE) -> set:
-    """Carga listado de SKUs que requieren corte manual desde Excel (ultra defensivo)."""
-    # session cache (no depende de st.cache_data)
-    try:
-        ss = st.session_state
-    except Exception:
-        ss = {}
-
-    try:
-        if ss.get("_cortes_cache_path") == path and ss.get("_cortes_cache_skus") is not None:
-            return set(ss.get("_cortes_cache_skus") or [])
-    except Exception:
-        pass
-
-    try:
-        df = pd.read_excel(path)
-    except Exception:
-        # Si no existe o falla lectura, no bloquear la app
-        try:
-            st.warning(f"No se pudo leer {path}. Cortes deshabilitado hasta corregir archivo.")
-        except Exception:
-            pass
-        return set()
-
-    try:
-        cols = {str(c).strip().upper(): c for c in df.columns}
-        col_sku = cols.get("SKU") or cols.get("SKUS") or cols.get("CORTES") or cols.get("CODIGO") or cols.get("CÓDIGO")
-        if not col_sku:
-            col_sku = df.columns[0]
-
-        skus = set()
-        def _norm(v):
-            s = str(v).strip()
-            if s.endswith(".0"):
-                s = s[:-2]
-            # Si existe normalize_sku en el código, úsalo para asegurar misma forma
-            try:
-                s2 = normalize_sku(s)
-                s = s2 if s2 else s
-            except Exception:
-                pass
-            return s
-
-        for v in df[col_sku].fillna("").tolist():
-            s = _norm(v)
-            if s and s.lower() != "nan":
-                skus.add(s)
-
-        try:
-            ss["_cortes_cache_path"] = path
-            ss["_cortes_cache_skus"] = list(skus)
-        except Exception:
-            pass
-
-        return skus
-    except Exception:
-        return set()
-
-CORTES_FILE = "CORTES.xlsx"
-
-
 # =========================
 # TIMEZONE CHILE
 # =========================
@@ -114,17 +58,6 @@ except Exception:
     CL_TZ = None
     UTC_TZ = None
 
-
-
-# PDF (cortes)
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib import colors
-    HAS_REPORTLAB = True
-except Exception:
-    HAS_REPORTLAB = False
 
 # PDF manifiestos
 try:
@@ -532,20 +465,6 @@ def init_db():
     """)
 
     c.execute("""
-    CREATE TABLE IF NOT EXISTS cortes_tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ot_id INTEGER,
-        sku_ml TEXT,
-        title_ml TEXT,
-        title_tec TEXT,
-        qty_total INTEGER,
-        status TEXT DEFAULT 'PENDING',
-        created_at TEXT,
-        done_at TEXT
-    );
-    """)
-
-    c.execute("""
     CREATE TABLE IF NOT EXISTS picking_incidences (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ot_id INTEGER,
@@ -557,6 +476,20 @@ def init_db():
         created_at TEXT
     );
     """)
+
+    # --- CORTES (rollos / corte manual) ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS cortes_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ot_id INTEGER,
+        sku_ml TEXT,
+        title_ml TEXT,
+        title_tec TEXT,
+        qty_total INTEGER,
+        created_at TEXT
+    );
+    """)
+
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS ot_orders (
@@ -973,6 +906,7 @@ def with_location(title_display: str, title_tec: str) -> str:
     return base
 
 
+@st.cache_data(show_spinner=False)
 def get_master_cached(master_path: str) -> tuple[dict, dict, list]:
     return load_master_from_path(master_path)
 
@@ -983,34 +917,49 @@ def master_bootstrap(master_path: str):
     return inv_map_sku, barcode_to_sku, conflicts
 
 
-def load_cortes_set(cortes_path: str) -> set[str]:
-    """Carga lista de SKUs que requieren corte manual desde Excel (columna SKU o CORTES)."""
-    s = set()
-    if not cortes_path or not os.path.exists(cortes_path):
-        return s
+
+
+# =========================
+# CORTES (lista de SKUs)
+# =========================
+def load_cortes_set(path: str = CORTES_FILE) -> set:
+    """Carga listado de SKUs que requieren corte manual desde Excel (defensivo)."""
+    # Cache en session_state para evitar leer el Excel en cada rerun
     try:
-        df = pd.read_excel(cortes_path, dtype=str)
-        if df.empty:
-            return s
-        cols = [str(c).strip().lower() for c in df.columns.tolist()]
-        col = None
-        if "sku" in cols:
-            col = df.columns[cols.index("sku")]
-        elif "cortes" in cols:
-            col = df.columns[cols.index("cortes")]
-        else:
-            col = df.columns[0]
-        for v in df[col].dropna().astype(str).tolist():
-            vv = str(v).strip()
-            if vv.endswith(".0"):
-                vv = vv[:-2]
-            vv = vv.strip()
-            if vv:
-                s.add(vv)
+        ss = st.session_state
+        if ss.get("_cortes_cache_path") == path and ss.get("_cortes_cache_skus") is not None:
+            return set(ss.get("_cortes_cache_skus") or [])
+    except Exception:
+        pass
+
+    try:
+        if not path or not os.path.exists(path):
+            return set()
+        df = pd.read_excel(path, dtype=str)
     except Exception:
         return set()
-    return s
 
+    try:
+        cols = {str(c).strip().upper(): c for c in df.columns}
+        col_sku = cols.get("SKU") or cols.get("SKUS") or cols.get("CODIGO") or cols.get("CÓDIGO")
+        if not col_sku:
+            col_sku = df.columns[0]
+
+        skus = set()
+        for v in df[col_sku].fillna("").tolist():
+            s = normalize_sku(v)
+            if s:
+                skus.add(s)
+
+        try:
+            st.session_state["_cortes_cache_path"] = path
+            st.session_state["_cortes_cache_skus"] = list(skus)
+        except Exception:
+            pass
+
+        return skus
+    except Exception:
+        return set()
 # =========================
 # PARSER PDF MANIFIESTO
 # =========================
@@ -1242,17 +1191,17 @@ def import_sales_excel(file) -> pd.DataFrame:
     out = pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
     return out
 def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pickers: int):
-    try:
-        cortes_set = load_cortes_set()
-    except Exception:
-        cortes_set = set()
     conn = get_conn()
     c = conn.cursor()
 
+
+    # SKUs que se van a CORTES (no aparecen en picking)
+    cortes_set = load_cortes_set()
+
     # Reset corrida (no borra histórico; eso lo hace admin reset total)
     c.execute("DELETE FROM picking_tasks;")
-    c.execute("DELETE FROM cortes_tasks;")
     c.execute("DELETE FROM picking_incidences;")
+    c.execute("DELETE FROM cortes_tasks;")
     c.execute("DELETE FROM ot_orders;")
     c.execute("DELETE FROM sorting_status;")
     c.execute("DELETE FROM picking_ots;")
@@ -1334,20 +1283,16 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
         """, (ot_id,))
         rows = c.fetchall()
         for sku, title, title_tec_any, total in rows:
-            sku_str = str(sku).strip()
-            if sku_str.endswith(".0"):
-                sku_str = sku_str[:-2]
-            if sku_str in cortes_set:
-                c.execute("""
-                    INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, status, created_at, done_at)
-                    VALUES (?,?,?,?,?,?,?,?)
-                """, (ot_id, sku_str, title, title_tec_any, int(total), "PENDING", now_iso(), None))
+            if sku in cortes_set:
+                c.execute(
+                    "INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, created_at) VALUES (?,?,?,?,?,?)",
+                    (ot_id, sku, title, title_tec_any, int(total), now_iso())
+                )
             else:
                 c.execute("""
-                    INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode)
-                    VALUES (?,?,?,?,?,?,?,?,?)
-                """, (ot_id, sku_str, title, title_tec_any, int(total), 0, "PENDING", None, None))
-
+                INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None, None))
     conn.commit()
     conn.close()
 
@@ -1431,6 +1376,103 @@ def page_import(inv_map_sku: dict):
 
 
 # =========================
+# UI: CORTES (PDF de la tanda)
+# =========================
+def page_cortes_pdf_batch():
+    st.header("Cortes de la tanda (PDF)")
+    st.caption("Lista de productos que requieren corte manual (rollos). No aparecen en el picking PDA.")
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT po.ot_code,
+               ct.sku_ml,
+               COALESCE(NULLIF(ct.title_tec,''), ct.title_ml) AS title,
+               ct.qty_total
+        FROM cortes_tasks ct
+        JOIN picking_ots po ON po.id = ct.ot_id
+        ORDER BY po.ot_code, CAST(ct.sku_ml AS INTEGER), ct.sku_ml
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        st.info("No hay SKUs de corte en la tanda actual.")
+        return
+
+    df = pd.DataFrame(rows, columns=["OT", "SKU", "Producto", "Cantidad"])
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    w, h = A4
+    y = h - 40
+
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(40, y, "Ferretería Aurora - Cortes (tanda actual)")
+    y -= 18
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(40, y, f"Generado: {to_chile_display(now_iso())}")
+    y -= 22
+
+    current_ot = None
+    for _, r in df.iterrows():
+        ot = str(r["OT"])
+        if ot != current_ot:
+            current_ot = ot
+            y -= 6
+            if y < 80:
+                pdf.showPage()
+                y = h - 40
+            pdf.setFont("Helvetica-Bold", 12)
+            pdf.drawString(40, y, ot)
+            y -= 16
+            pdf.setFont("Helvetica-Bold", 10)
+            pdf.drawString(40, y, "SKU")
+            pdf.drawString(140, y, "Producto")
+            pdf.drawString(520, y, "Cant.")
+            y -= 14
+
+        if y < 60:
+            pdf.showPage()
+            y = h - 40
+            pdf.setFont("Helvetica-Bold", 12)
+            pdf.drawString(40, y, f"{current_ot} (cont.)")
+            y -= 16
+            pdf.setFont("Helvetica-Bold", 10)
+            pdf.drawString(40, y, "SKU")
+            pdf.drawString(140, y, "Producto")
+            pdf.drawString(520, y, "Cant.")
+            y -= 14
+
+        pdf.setFont("Helvetica", 10)
+        sku = str(r["SKU"])
+        title = str(r["Producto"])[:78]
+        qty = str(int(r["Cantidad"]))
+
+        pdf.drawString(40, y, sku)
+        pdf.drawString(140, y, title)
+        pdf.drawRightString(565, y, qty)
+        y -= 12
+
+    pdf.save()
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
+    st.download_button(
+        "⬇️ Descargar PDF de Cortes (tanda)",
+        data=pdf_bytes,
+        file_name=f"cortes_tanda_{now_iso().replace(':','-')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+
+# =========================
 # UI: PICKING (FLEX)
 # =========================
 def picking_lobby():
@@ -1479,155 +1521,6 @@ def picking_lobby():
 
     return "selected_picker" in st.session_state
 
-
-
-def chile_date_to_utc_range(d):
-    """Retorna (utc_start_iso, utc_end_iso) para un día Chile dado."""
-    if CL_TZ is None or UTC_TZ is None:
-        # fallback: asume server UTC y usa día UTC
-        start = datetime(d.year, d.month, d.day, 0, 0, 0)
-        end = start + pd.Timedelta(days=1)
-        return start.isoformat(timespec="seconds"), end.to_pydatetime().isoformat(timespec="seconds")
-    start_cl = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=CL_TZ)
-    end_cl = start_cl + pd.Timedelta(days=1)
-    start_utc = start_cl.astimezone(UTC_TZ).replace(tzinfo=None)
-    end_utc = end_cl.astimezone(UTC_TZ).replace(tzinfo=None)
-    return start_utc.isoformat(timespec="seconds"), end_utc.isoformat(timespec="seconds")
-
-
-def build_cortes_pdf(day_str: str, rows: list[tuple]) -> bytes:
-    """rows: list of (ot_code, sku, title, qty_total)"""
-    if not HAS_REPORTLAB:
-        return b""
-    from io import BytesIO
-    buff = BytesIO()
-    styles = getSampleStyleSheet()
-    doc = SimpleDocTemplate(buff, pagesize=A4, leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
-    story = []
-    story.append(Paragraph(f"<b>Ferretería Aurora – Cortes</b>", styles["Title"]))
-    story.append(Paragraph(f"Día: <b>{day_str}</b>", styles["Normal"]))
-    story.append(Spacer(1, 8))
-
-    data = [["OT", "SKU", "Producto", "Cant."]]
-    for ot_code, sku, title, qty in rows:
-        data.append([ot_code, str(sku), str(title), str(qty)])
-
-    tbl = Table(data, colWidths=[70, 80, 300, 50])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
-        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("FONTSIZE", (0,0), (-1,0), 9),
-        ("FONTSIZE", (0,1), (-1,-1), 8),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.white]),
-    ]))
-    story.append(tbl)
-    doc.build(story)
-    return buff.getvalue()
-
-
-
-def page_cortes_pdf_batch():
-    st.header("Cortes de la tanda (PDF)")
-    st.caption("Genera un PDF con todos los productos que requieren corte manual en la tanda actual.")
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    c.execute("""
-        SELECT ct.ot_id,
-               po.ot_code,
-               ct.sku_ml,
-               COALESCE(NULLIF(ct.title_tec,''), ct.title_ml) AS title,
-               ct.qty_total,
-               ct.status
-        FROM cortes_tasks ct
-        JOIN picking_ots po ON po.id = ct.ot_id
-        ORDER BY po.ot_code, ct.sku_ml
-    """)
-    rows = c.fetchall()
-    conn.close()
-
-    if not rows:
-        st.info("No hay SKUs de corte en la tanda actual.")
-        return
-
-    # Tabla en pantalla
-    import pandas as pd
-    df = pd.DataFrame(rows, columns=["ot_id", "ot_code", "sku", "title", "qty", "status"])
-    st.dataframe(df[["ot_code", "sku", "title", "qty", "status"]], use_container_width=True, hide_index=True)
-
-    # PDF (ReportLab)
-    from io import BytesIO
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-
-    buffer = BytesIO()
-    cpdf = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-
-    y = height - 40
-    cpdf.setFont("Helvetica-Bold", 14)
-    cpdf.drawString(40, y, "Ferretería Aurora - Cortes (tanda actual)")
-    y -= 18
-    cpdf.setFont("Helvetica", 10)
-    cpdf.drawString(40, y, f"Generado: {now_iso()}")
-    y -= 22
-
-    current_ot = None
-    cpdf.setFont("Helvetica", 10)
-
-    for _, r in df.iterrows():
-        if current_ot != r["ot_code"]:
-            current_ot = r["ot_code"]
-            y -= 6
-            if y < 80:
-                cpdf.showPage()
-                y = height - 40
-            cpdf.setFont("Helvetica-Bold", 12)
-            cpdf.drawString(40, y, f"{current_ot}")
-            y -= 16
-            cpdf.setFont("Helvetica-Bold", 10)
-            cpdf.drawString(40, y, "SKU")
-            cpdf.drawString(140, y, "Producto")
-            cpdf.drawString(500, y, "Cant.")
-            y -= 14
-            cpdf.setFont("Helvetica", 10)
-
-        if y < 60:
-            cpdf.showPage()
-            y = height - 40
-            cpdf.setFont("Helvetica-Bold", 12)
-            cpdf.drawString(40, y, f"{current_ot} (cont.)")
-            y -= 16
-            cpdf.setFont("Helvetica-Bold", 10)
-            cpdf.drawString(40, y, "SKU")
-            cpdf.drawString(140, y, "Producto")
-            cpdf.drawString(500, y, "Cant.")
-            y -= 14
-            cpdf.setFont("Helvetica", 10)
-
-        sku = str(r["sku"])
-        title = str(r["title"])[:70]
-        qty = str(int(r["qty"]))
-
-        cpdf.drawString(40, y, sku)
-        cpdf.drawString(140, y, title)
-        cpdf.drawRightString(560, y, qty)
-        y -= 12
-
-    cpdf.showPage()
-    cpdf.save()
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
-
-    st.download_button(
-        "⬇️ Descargar PDF de Cortes (tanda)",
-        data=pdf_bytes,
-        file_name=f"cortes_tanda_{now_iso().replace(':','-')}.pdf",
-        mime="application/pdf",
-        use_container_width=True
-    )
 
 def page_picking():
     if "selected_picker" not in st.session_state:
@@ -2793,8 +2686,7 @@ def page_admin():
         with colA:
             if st.button("✅ Sí, borrar todo y reiniciar"):
                 c.execute("DELETE FROM picking_tasks;")
-    c.execute("DELETE FROM cortes_tasks;")
-        c.execute("DELETE FROM picking_incidences;")
+                c.execute("DELETE FROM picking_incidences;")
                 c.execute("DELETE FROM sorting_status;")
                 c.execute("DELETE FROM ot_orders;")
                 c.execute("DELETE FROM picking_ots;")
@@ -4550,18 +4442,20 @@ def main():
     if mode == "FLEX_PICK":
         pages = [
             "1) Picking",
-            "2) Cortes (PDF)",
-            "3) Importar ventas",
-            "4) Administrador",
+            "2) Importar ventas",
+            "3) Cortes de la tanda (PDF)",
+            "4) Administrador",            "1) Picking",
+            "2) Importar ventas",
+            "3) Administrador",
         ]
         page = st.sidebar.radio("Menú", pages, index=0)
 
         if page.startswith("1"):
             page_picking()
         elif page.startswith("2"):
-            page_cortes_pdf()
-        elif page.startswith("3"):
             page_import(inv_map_sku)
+        elif page.startswith("3"):
+            page_cortes_pdf_batch()
         else:
             page_admin()
 
