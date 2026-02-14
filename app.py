@@ -1400,7 +1400,57 @@ def page_picking():
     ots = c.fetchall()
     if not ots:
         st.error(f"No existe OT para {picker_name}. Importa ventas y genera OTs.")
-        conn.close()
+    # --- Lista rápida de SKUs (salto manual dentro de la OT) ---
+    list_flag_key = f"pick_show_list_{ot_id}"
+    if list_flag_key not in st.session_state:
+        st.session_state[list_flag_key] = False
+
+    # Botón al final para abrir/cerrar lista
+    colL, colR = st.columns([1, 1])
+    with colL:
+        if st.button("Mostrar lista" if not st.session_state[list_flag_key] else "Ocultar lista"):
+            st.session_state[list_flag_key] = not st.session_state[list_flag_key]
+            st.rerun()
+
+    if st.session_state[list_flag_key]:
+        with st.expander("Lista de SKUs de esta OT", expanded=True):
+            st.caption("Toca un SKU para llevarlo al siguiente escaneo. Al confirmar cantidad, seguirá con el siguiente pendiente.")
+            # Mostrar pendientes primero
+            ordered = sorted(
+                tasks,
+                key=lambda t: (0 if t[6] == "PENDING" else 1, str(t[1]))
+            )
+
+            for t in ordered:
+                _tid, _sku, _title_ml, _title_tec, _qty_total, _qty_picked, _status = t
+                label = f"[{_status}] {_sku} — {_title_ml or _title_tec or ''}".strip()
+
+                if st.button(label, key=f"jump_{ot_id}_{_tid}", disabled=(_status != "PENDING")):
+                    # Traer este SKU al inicio (defer_rank mínimo - 1)
+                    try:
+                        c.execute(
+                            "SELECT COALESCE(MIN(defer_rank), 0) FROM picking_tasks WHERE ot_id=? AND status='PENDING'",
+                            (ot_id,)
+                        )
+                        min_rank = c.fetchone()[0] or 0
+                        new_rank = int(min_rank) - 1
+                        c.execute(
+                            "UPDATE picking_tasks SET defer_rank=?, defer_at=? WHERE id=?",
+                            (new_rank, now_iso(), _tid)
+                        )
+                        conn.commit()
+                    except Exception:
+                        pass
+
+                    # Limpiar estados UI del actual y del seleccionado
+                    state.pop(str(task_id), None)
+                    state.pop(str(_tid), None)
+
+                    # Cerrar lista
+                    st.session_state[list_flag_key] = False
+                    st.rerun()
+
+    conn.close()
         return
 
     ot_row = None
