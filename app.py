@@ -1639,6 +1639,11 @@ def page_picking():
     # =========================
     st.markdown("---")
 
+
+    force_close_key = f"pick_force_close_list_{ot_id}"
+    if force_close_key not in st.session_state:
+        st.session_state[force_close_key] = False
+
     with st.expander("📋 Lista de SKUs de esta OT", expanded=False):
 
         st.caption("Toca un SKU pendiente para ponerlo como el próximo a escanear. Luego sigues normal.")
@@ -1683,7 +1688,7 @@ def page_picking():
                     st.session_state.pick_state.pop(str(task_id), None)
                     st.session_state.pick_state.pop(str(_tid), None)
 
-                st.session_state["scroll_to_scan"] = True
+                st.session_state[force_close_key] = True
                 st.rerun()
 
     conn.close()
