@@ -1633,52 +1633,57 @@ def page_picking():
                 s["needs_decision"] = False
                 st.info("Ajusta cantidad y confirma nuevamente.")
     # =========================
+    
+    # =========================
     # LISTA DE SKUS DE ESTA OT
     # =========================
     st.markdown("---")
-    st.markdown("### 📋 Lista de SKUs de esta OT")
+
+    with st.expander("📋 Lista de SKUs de esta OT", expanded=False):
+
         st.caption("Toca un SKU pendiente para ponerlo como el próximo a escanear. Luego sigues normal.")
 
         # Pendientes primero
         ordered = sorted(
-        tasks,
-        key=lambda t: (0 if t[6] == "PENDING" else 1, str(t[1]))
+            tasks,
+            key=lambda t: (0 if t[6] == "PENDING" else 1, str(t[1]))
         )
 
         for t in ordered:
-        _tid, _sku, _title_ml, _title_tec, _qty_total, _qty_picked, _status = t
-        raw_master_t = master_raw_title_lookup(MASTER_FILE, _sku)
-        _title_show = raw_master_t if raw_master_t else (
-            _title_tec if _title_tec not in (None, "") else (_title_ml or "")
-        )
+            _tid, _sku, _title_ml, _title_tec, _qty_total, _qty_picked, _status = t
 
-        disabled = (_status != "PENDING") or (_tid == task_id)
-        label = f"{_title_show} [{_sku}]"
+            raw_master_t = master_raw_title_lookup(MASTER_FILE, _sku)
+            _title_show = raw_master_t if raw_master_t else (
+                _title_tec if _title_tec not in (None, "") else (_title_ml or "")
+            )
 
-        if st.button(label, disabled=disabled, key=f"jump_{ot_id}_{_tid}"):
-            try:
-                # Poner este task como el siguiente: defer_rank más bajo
-                c.execute(
-                    "SELECT COALESCE(MIN(defer_rank), 0) FROM picking_tasks WHERE ot_id=? AND status='PENDING'",
-                    (ot_id,)
-                )
-                min_rank = c.fetchone()[0] or 0
-                new_rank = int(min_rank) - 1
-                c.execute(
-                    "UPDATE picking_tasks SET defer_rank=?, defer_at=? WHERE id=?",
-                    (new_rank, now_iso(), _tid)
-                )
-                conn.commit()
-            except Exception:
-                pass
+            disabled = (_status != "PENDING") or (_tid == task_id)
+            label = f"{_title_show} [{_sku}]"
 
-            # Limpiar estados UI del actual y del seleccionado
-            if "pick_state" in st.session_state:
-                st.session_state.pick_state.pop(str(task_id), None)
-                st.session_state.pick_state.pop(str(_tid), None)
+            if st.button(label, disabled=disabled, key=f"jump_{ot_id}_{_tid}"):
 
-            st.session_state["scroll_to_scan"] = True
+                try:
+                    c.execute(
+                        "SELECT COALESCE(MIN(defer_rank), 0) FROM picking_tasks WHERE ot_id=? AND status='PENDING'",
+                        (ot_id,)
+                    )
+                    min_rank = c.fetchone()[0] or 0
+                    new_rank = int(min_rank) - 1
 
+                    c.execute(
+                        "UPDATE picking_tasks SET defer_rank=?, defer_at=? WHERE id=?",
+                        (new_rank, now_iso(), _tid)
+                    )
+                    conn.commit()
+
+                except Exception:
+                    pass
+
+                if "pick_state" in st.session_state:
+                    st.session_state.pick_state.pop(str(task_id), None)
+                    st.session_state.pick_state.pop(str(_tid), None)
+
+                st.session_state["scroll_to_scan"] = True
                 st.rerun()
 
     conn.close()
