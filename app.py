@@ -42,9 +42,11 @@ MASTER_FILE = "maestro_sku_ean.xlsx"
 # -------------------------
 CORTES_FILE = "CORTES.xlsx"
 
-@st.cache_data(show_spinner=False)
 def load_cortes_set(path: str = CORTES_FILE) -> set:
     """Carga listado de SKUs que requieren corte manual desde Excel."""
+    # Cache simple por sesión (evita issues de cache_data en Cloud)
+    if st.session_state.get('_cortes_cache_path') == path and 'cortes_set' in st.session_state:
+        return set(st.session_state['cortes_set'])
     try:
         df = pd.read_excel(path)
     except Exception:
@@ -60,6 +62,10 @@ def load_cortes_set(path: str = CORTES_FILE) -> set:
         s = str(v).strip()
         if s and s.lower() != "nan":
             skus.add(s)
+    st.session_state['_cortes_cache_path'] = path
+
+    st.session_state['cortes_set'] = list(skus)
+
     return skus
 
 CORTES_FILE = "CORTES.xlsx"
@@ -935,7 +941,6 @@ def with_location(title_display: str, title_tec: str) -> str:
     return base
 
 
-@st.cache_data(show_spinner=False)
 def get_master_cached(master_path: str) -> tuple[dict, dict, list]:
     return load_master_from_path(master_path)
 
@@ -946,7 +951,6 @@ def master_bootstrap(master_path: str):
     return inv_map_sku, barcode_to_sku, conflicts
 
 
-@st.cache_data(show_spinner=False)
 def load_cortes_set(cortes_path: str) -> set[str]:
     """Carga lista de SKUs que requieren corte manual desde Excel (columna SKU o CORTES)."""
     s = set()
