@@ -4319,7 +4319,23 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         (mid,)
     ).fetchall()
     if inc_rows:
-        df_inc = pd.DataFrame(inc_rows, columns=["Venta","Mesa","Envío","SKU","Producto","Solicitado","Hecho","Nota"])
+        df_inc = pd.DataFrame(inc_rows, columns=["Venta","Mesa","Envío","SKU","Descripción","Solicitado","Hecho","Nota"])
+        # Producto (nombre técnico): usar maestro si existe, si no la descripción del control
+        if isinstance(inv_map_sku, dict) and not df_inc.empty:
+            def _name_from_master(sku, desc):
+                k = str(sku).strip()
+                t = inv_map_sku.get(k)
+                if t is None and k.isdigit():
+                    try:
+                        t = inv_map_sku.get(str(int(k)))
+                    except Exception:
+                        t = None
+                return t or (desc or str(sku))
+            df_inc["Producto"] = df_inc.apply(lambda r: _name_from_master(r["SKU"], r["Descripción"]), axis=1)
+        else:
+            df_inc["Producto"] = df_inc["Descripción"].fillna(df_inc["SKU"].astype(str))
+        # Reorden columnas
+        df_inc = df_inc[["Venta","Mesa","Envío","SKU","Producto","Solicitado","Hecho","Nota"]]
         st.dataframe(df_inc, use_container_width=True, hide_index=True)
     else:
         st.info("No hay incidencias registradas en este manifiesto.")
