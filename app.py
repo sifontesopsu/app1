@@ -2707,30 +2707,6 @@ def page_admin():
     df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    
-
-    # Detalle de productos confirmados como "Sin EAN" (auditables)
-    st.subheader("Detalle Sin EAN (auditoría)")
-    c.execute("""
-        SELECT po.ot_code, pk.name,
-               pt.sku_ml,
-               COALESCE(NULLIF(pt.title_tec,''), pt.title_ml) AS producto,
-               pt.qty_total,
-               pt.decided_at
-        FROM picking_tasks pt
-        JOIN picking_ots po ON po.id = pt.ot_id
-        JOIN pickers pk ON pk.id = po.picker_id
-        WHERE pt.confirm_mode='MANUAL_NO_EAN'
-        ORDER BY po.ot_code, CAST(pt.sku_ml AS INTEGER), pt.sku_ml
-    """)
-    rows_noean = c.fetchall()
-    if not rows_noean:
-        st.info("No hay productos marcados como Sin EAN en la tanda.")
-    else:
-        df_noean = pd.DataFrame(rows_noean, columns=["OT", "Picker", "SKU", "Producto", "Cantidad", "Marcado"])
-        df_noean["Marcado"] = df_noean["Marcado"].apply(to_chile_display)
-        st.dataframe(df_noean, use_container_width=True, hide_index=True)
-
     st.subheader("Incidencias")
     c.execute("""
         SELECT po.ot_code, pk.name, pi.sku_ml, pi.product, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.created_at
