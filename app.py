@@ -1644,7 +1644,11 @@ def page_picking():
     if force_close_key not in st.session_state:
         st.session_state[force_close_key] = False
 
-    with st.expander("📋 Lista de SKUs de esta OT", expanded=False):
+    label_list = "📋 Lista de SKUs de esta OT" + ("\u200b" if st.session_state.get(force_close_key, False) else "")
+    with st.expander(label_list, expanded=False):
+
+        # Forzar cierre en la próxima recarga (especial PDA)
+        st.session_state[force_close_key] = False
 
         st.caption("Toca un SKU pendiente para ponerlo como el próximo a escanear. Luego sigues normal.")
 
