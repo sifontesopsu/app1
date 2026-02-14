@@ -15,6 +15,23 @@ DB_NAME = "aurora_ml.db"
 ADMIN_PASSWORD = "aurora123"  # cambia si quieres
 NUM_MESAS = 4
 
+
+# =========================
+# TABLAS POR MÓDULO (para respaldo parcial)
+# =========================
+PICKING_TABLES = [
+    "orders","order_items","pickers","picking_ots","picking_tasks","picking_incidences","ot_orders","sorting_status"
+]
+FULL_TABLES = [
+    "full_batches","full_batch_items","full_incidences"
+]
+SORTING_TABLES = [
+    # Sorting v1
+    "sorting_manifests","sorting_runs","sorting_run_items","sorting_labels",
+    # Sorting v2 (control + etiquetas + corridas)
+    "s2_manifests","s2_files","s2_page_assign","s2_sales","s2_items","s2_labels","s2_pack_ship"
+]
+
 # Maestro SKU/EAN en la misma carpeta que app.py
 MASTER_FILE = "maestro_sku_ean.xlsx"
 
@@ -125,6 +142,186 @@ def split_barcodes(cell_value) -> list[str]:
 
 def get_conn():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
+
+
+# =========================
+# BACKUP/RESTORE POR MÓDULO (SQLite parcial)
+# =========================
+def _db_table_exists(conn, table: str) -> bool:
+    try:
+        row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", (table,)).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+def _export_tables_to_db_bytes(tables: list[str]) -> bytes:
+    """Exporta SOLO las tablas indicadas a un .db (bytes). No toca el DB actual."""
+    import tempfile
+    conn_src = get_conn()
+    csrc = conn_src.cursor()
+    # Crear DB temporal
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    conn_out = sqlite3.connect(tmp_path, check_same_thread=False)
+    cout = conn_out.cursor()
+    try:
+        for tname in tables:
+            if not _db_table_exists(conn_src, tname):
+                continue
+            row = csrc.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?;", (tname,)).fetchone()
+            create_sql = row[0] if row and row[0] else None
+            if not create_sql:
+                continue
+            cout.execute(create_sql)
+            rows = csrc.execute(f"SELECT * FROM {tname};").fetchall()
+            if rows:
+                ncols = len(rows[0])
+                ph = ",".join(["?"] * ncols)
+                cout.executemany(f"INSERT INTO {tname} VALUES ({ph});", rows)
+        conn_out.commit()
+        conn_out.close()
+        conn_src.close()
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        return data
+    finally:
+        try:
+            conn_out.close()
+        except Exception:
+            pass
+        try:
+            conn_src.close()
+        except Exception:
+            pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+def _restore_tables_from_db_bytes(db_bytes: bytes, tables: list[str]) -> tuple[bool, str|None]:
+    """Restaura SOLO las tablas indicadas desde un .db (bytes). Mantiene el resto intacto."""
+    import tempfile
+    # Guardar uploaded db a temp
+    fd, up_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    with open(up_path, "wb") as f:
+        f.write(db_bytes)
+
+    conn_src = sqlite3.connect(up_path, check_same_thread=False)
+    csrc = conn_src.cursor()
+    conn_dst = get_conn()
+    cdst = conn_dst.cursor()
+
+    try:
+        # Validación mínima: que exista al menos 1 de las tablas esperadas
+        any_ok = False
+        for tname in tables:
+            if _db_table_exists(conn_src, tname):
+                any_ok = True
+                break
+        if not any_ok:
+            return False, "El respaldo no contiene las tablas esperadas para este módulo."
+
+        # Transacción de reemplazo parcial
+        cdst.execute("BEGIN;")
+        for tname in tables:
+            if not _db_table_exists(conn_src, tname):
+                continue
+
+            # Leer schema desde respaldo
+            row = csrc.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?;", (tname,)).fetchone()
+            create_sql = row[0] if row and row[0] else None
+            if not create_sql:
+                continue
+
+            # Reemplazar tabla
+            cdst.execute(f"DROP TABLE IF EXISTS {tname};")
+            cdst.execute(create_sql)
+
+            # Copiar filas
+            rows = csrc.execute(f"SELECT * FROM {tname};").fetchall()
+            if rows:
+                ncols = len(rows[0])
+                ph = ",".join(["?"] * ncols)
+                cdst.executemany(f"INSERT INTO {tname} VALUES ({ph});", rows)
+
+        conn_dst.commit()
+        return True, None
+    except Exception as e:
+        try:
+            conn_dst.rollback()
+        except Exception:
+            pass
+        return False, str(e)
+    finally:
+        try:
+            conn_src.close()
+        except Exception:
+            pass
+        try:
+            conn_dst.close()
+        except Exception:
+            pass
+        try:
+            os.remove(up_path)
+        except Exception:
+            pass
+
+def _render_module_backup_ui(scope_key: str, scope_label: str, tables: list[str]):
+    """UI para respaldar/restaurar SOLO un módulo (tablas específicas)."""
+    with st.expander(f"💾 Respaldo / Restauración — {scope_label}", expanded=False):
+        st.caption(
+            "Este respaldo es SOLO de este módulo (tablas específicas). "
+            "No toca datos de otros módulos. "
+            "Nota: el mapa común de códigos (sku_barcodes) no se incluye aquí."
+        )
+        # Password gate sólo para acciones críticas
+        pwd2 = st.text_input("Contraseña admin", type="password", key=f"pwd_{scope_key}")
+        if pwd2 != ADMIN_PASSWORD:
+            st.info("Ingresa la contraseña para habilitar respaldo/restauración.")
+            return
+
+        # Backup
+        try:
+            data = _export_tables_to_db_bytes(tables)
+            st.download_button(
+                f"⬇️ Descargar respaldo ({scope_key}.db)",
+                data=data,
+                file_name=f"aurora_{scope_key}.db",
+                mime="application/octet-stream",
+                use_container_width=True,
+                key=f"dl_{scope_key}",
+            )
+        except Exception as e:
+            st.warning(f"No se pudo preparar el respaldo: {e}")
+
+        st.divider()
+
+        up = st.file_uploader(
+            f"⬆️ Restaurar respaldo de {scope_label} (.db)",
+            type=["db"],
+            key=f"up_{scope_key}",
+        )
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            confirm = st.text_input("Escribe RESTAURAR para confirmar", value="", key=f"cf_{scope_key}")
+        with col2:
+            do = st.button(
+                "♻️ Restaurar",
+                type="primary",
+                disabled=not (up and confirm.strip().upper() == "RESTAURAR"),
+                key=f"do_{scope_key}",
+            )
+        if do and up is not None:
+            ok, err = _restore_tables_from_db_bytes(up.getvalue(), tables)
+            if ok:
+                st.success("✅ Restaurado. Recargando…")
+                st.rerun()
+            else:
+                st.error(f"No se pudo restaurar: {err}")
+
+
+
 
 
 def force_tel_keyboard(label: str):
@@ -2017,6 +2214,10 @@ def page_full_supervisor(inv_map_sku: dict):
 def page_full_admin():
     st.header("Full – Administrador (progreso)")
 
+    # Respaldo/Restauración SOLO FULL (no afecta otros módulos)
+    _render_module_backup_ui("full", "Full", FULL_TABLES)
+
+
     batches = get_open_full_batches()
     if not batches:
         st.info("No hay lotes Full cargados aún.")
@@ -2148,50 +2349,12 @@ def page_admin():
     # =========================
     # PERSISTENCIA (Streamlit Community Cloud)
     # =========================
-    st.subheader("Persistencia / Respaldo (recomendado en Streamlit Cloud)")
+    st.subheader("Persistencia / Respaldo — PICKING")
     st.caption(
         "En Streamlit Community Cloud, el servidor puede 'dormir' y reiniciar. "
-        "Todo lo que esté en memoria se pierde, y el archivo de base de datos local puede reiniciarse. "
-        "Para no perder el control, usa respaldo/restauración aquí (o migra a Postgres)."
+        "Esto guarda y restaura SOLO Picking (sin tocar Sorting/Full)."
     )
-
-    # Backup (descargar)
-    try:
-        if os.path.exists(DB_NAME):
-            with open(DB_NAME, "rb") as f:
-                db_bytes = f.read()
-            st.download_button(
-                "⬇️ Descargar respaldo (aurora_ml.db)",
-                data=db_bytes,
-                file_name=DB_NAME,
-                mime="application/octet-stream",
-                use_container_width=True,
-            )
-        else:
-            st.warning(f"No se encontró {DB_NAME} en disco (aún no se ha creado la BD).")
-    except Exception as e:
-        st.warning(f"No se pudo preparar el respaldo: {e}")
-
-    # Restore (subir)
-    up = st.file_uploader("⬆️ Restaurar desde respaldo (.db)", type=["db"], key="restore_db_file")
-    colR1, colR2 = st.columns([2, 1])
-    with colR1:
-        confirm_restore = st.text_input("Escribe RESTAURAR para confirmar", value="", key="restore_db_confirm")
-    with colR2:
-        do_restore = st.button("♻️ Restaurar BD", type="primary", disabled=not (up and confirm_restore.strip().upper() == "RESTAURAR"))
-
-    if do_restore and up is not None:
-        try:
-            # Cerrar cualquier conexión abierta antes de reemplazar (seguridad extra)
-            # (en este punto aún no abrimos get_conn() en page_admin)
-            tmp_path = DB_NAME + ".tmp"
-            with open(tmp_path, "wb") as f:
-                f.write(up.getvalue())
-            os.replace(tmp_path, DB_NAME)
-            st.success("✅ BD restaurada. Recargando…")
-            st.rerun()
-        except Exception as e:
-            st.error(f"No se pudo restaurar la BD: {e}")
+    _render_module_backup_ui("picking", "Picking", PICKING_TABLES)
 
     st.divider()
 
@@ -3735,6 +3898,10 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 def page_sorting_admin(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
     st.title("Administrador")
+
+    # Respaldo/Restauración SOLO SORTING (no afecta otros módulos)
+    _render_module_backup_ui("sorting", "Sorting", SORTING_TABLES)
+
 
 
 
