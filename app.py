@@ -4265,18 +4265,16 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     # Respaldo/Restauración SOLO SORTING (no afecta otros módulos)
     _render_module_backup_ui("sorting", "Sorting", SORTING_TABLES)
 
-
-
-
-
-    mid = None
+    # Manifiesto activo
     try:
         mid = _s2_get_active_manifest_id()
     except Exception:
         mid = None
+
     if not mid:
         st.warning("No hay manifiesto activo. Primero carga Control + Etiquetas y crea corridas.")
         return
+
     conn = get_conn()
     c = conn.cursor()
 
@@ -4284,10 +4282,24 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     f = c.execute("SELECT control_name, labels_name, updated_at FROM s2_files WHERE manifest_id=?", (mid,)).fetchone()
     stats = _s2_get_stats(mid)
 
+    # ---- Estado del manifiesto (como en Admin Picking: métricas arriba) ----
+    st.subheader("Estado del manifiesto activo")
+    colA, colB, colC, colD = st.columns(4)
+    colA.metric("Manifiesto ID", mid)
+    colB.metric("Ventas (Control)", stats.get("ventas", 0))
+    colC.metric("Items", stats.get("items", 0))
+    colD.metric("Etiquetas", stats.get("etiquetas", 0))
 
+    if f:
+        control_name, labels_name, updated_at = f
+        st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
+    else:
+        st.caption("Aún no se han cargado archivos para este manifiesto.")
 
+    # ---- Trazabilidad ----
+    st.divider()
     st.subheader("Trazabilidad")
-    # Ventas por mesa
+
     rows = c.execute(
         "SELECT mesa, COUNT(*) as ventas, "
         "SUM(CASE WHEN status='DONE' THEN 1 ELSE 0 END) as done "
@@ -4304,12 +4316,13 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
                 "Mesa": int(mesa or 0),
                 "Ventas": ventas,
                 "Cerradas": done,
-                "%": 0 if ventas==0 else round(done*100/ventas, 1),
+                "%": 0 if ventas == 0 else round(done * 100 / ventas, 1),
             })
-        st.dataframe(mesa_data, use_container_width=True)
+        st.dataframe(mesa_data, use_container_width=True, hide_index=True)
     else:
         st.info("No hay ventas asignadas a mesas todavía.")
 
+    # ---- Incidencias (bajo trazabilidad) ----
     st.divider()
     st.subheader("Incidencias")
 
@@ -4331,16 +4344,8 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         df_inc = pd.DataFrame(
             inc_rows,
             columns=[
-                "Venta",
-                "Mesa",
-                "Envío",
-                "SKU",
-                "Descripción Control",
-                "Solicitado",
-                "Verificado",
-                "Estado",
-                "Modo",
-                "Hora",
+                "Venta", "Mesa", "Envío", "SKU", "Descripción Control",
+                "Solicitado", "Verificado", "Estado", "Modo", "Hora"
             ],
         )
 
@@ -4363,22 +4368,12 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         except Exception:
             df_inc["Producto (técnico)"] = df_inc["SKU"].astype(str)
 
-        # Orden de columnas más útil
+        # Orden similar a Admin Picking
         try:
-            df_inc = df_inc[
-                [
-                    "Mesa",
-                    "Venta",
-                    "Envío",
-                    "SKU",
-                    "Producto (técnico)",
-                    "Solicitado",
-                    "Verificado",
-                    "Estado",
-                    "Modo",
-                    "Hora",
-                ]
-            ]
+            df_inc = df_inc[[
+                "Mesa", "Venta", "Envío", "SKU", "Producto (técnico)",
+                "Solicitado", "Verificado", "Estado", "Modo", "Hora"
+            ]]
         except Exception:
             pass
 
@@ -4386,29 +4381,14 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     else:
         st.info("Sin incidencias ni productos marcados como Sin EAN en este manifiesto.")
 
-    if "s2_reset_armed" not in st.session_state:
-        st.session_state["s2_reset_armed"] = False
+    # ---- Ventas pendientes ----
+    st.divider()
+    st.subheader("Ventas pendientes")
 
-    arm = st.checkbox("Quiero reiniciar Sorting (entiendo que se borra todo)", value=st.session_state["s2_reset_armed"])
-    st.session_state["s2_reset_armed"] = bool(arm)
-
-    confirm_txt = st.text_input("Escribe BORRAR para confirmar", value="", disabled=not arm)
-    do_reset = st.button("🗑️ Reiniciar Sorting (borrar todo)", type="primary", disabled=not (arm and confirm_txt.strip().upper() == "BORRAR"))
-
-    if do_reset:
-        _s2_reset_all_sorting()
-        # limpiar session del módulo
-        for k in list(st.session_state.keys()):
-            if k.startswith("s2_") or "sorting" in k:
-                del st.session_state[k]
-        st.success("Sorting reiniciado completamente.")
-        st.rerun()
-
-    # Ventas pendientes con progreso por ítems
     pend = c.execute(
         "SELECT sale_id, mesa, shipment_id, status FROM s2_sales "
-        "WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, sale_id LIMIT 100;",
-        (mid,)
+        "WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, sale_id LIMIT 200;",
+        (mid,),
     ).fetchall()
 
     if pend:
@@ -4417,7 +4397,7 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
             it = c.execute(
                 "SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) "
                 "FROM s2_items WHERE manifest_id=? AND sale_id=?;",
-                (mid, sale_id)
+                (mid, sale_id),
             ).fetchone()
             total = int(it[0] or 0)
             done = int(it[1] or 0)
@@ -4428,69 +4408,81 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
                 "Estado": str(status),
                 "Items": f"{done}/{total}",
             })
-        st.dataframe(pend_data, use_container_width=True)
+        st.dataframe(pend_data, use_container_width=True, hide_index=True)
     else:
         st.success("No hay ventas pendientes: todo está cerrado.")
 
-    # conn.close()  # moved to end (avoid closed cursor)
-
-
-    st.subheader("Estado del manifiesto activo")
-    colA, colB, colC, colD = st.columns(4)
-    colA.metric("Manifiesto ID", mid)
-    colB.metric("Ventas (Control)", stats["ventas"])
-    colC.metric("Items", stats["items"])
-    colD.metric("Etiquetas", stats["etiquetas"])
-
-    if f:
-        control_name, labels_name, updated_at = f
-        st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
-    else:
-        st.caption("Aún no se han cargado archivos para este manifiesto.")
-
+    # ---- Conciliación ----
     with st.expander("Conciliación ventas ↔ etiquetas", expanded=False):
-        st.write(
-            {
-                "Envíos únicos (labels)": stats["distinct_ship_labels"],
-                "Ventas con Pack ID": stats["ventas_with_pack"],
-                "Packs distintos (Control)": stats["distinct_packs"],
-                "Etiquetas con Pack ID": stats["labels_with_pack"],
-                "Etiquetas con Venta": stats["labels_with_sale"],
-                "Ventas matcheadas por Pack": stats["matched_by_pack"],
-                "Ventas sin Envío asignado": stats["missing_ship"],
-            }
-        )
+        st.write({
+            "Envíos únicos (labels)": stats.get("distinct_ship_labels"),
+            "Ventas con Pack ID": stats.get("ventas_with_pack"),
+            "Packs distintos (Control)": stats.get("distinct_packs"),
+            "Etiquetas con Pack ID": stats.get("labels_with_pack"),
+            "Etiquetas con Venta": stats.get("labels_with_sale"),
+            "Ventas matcheadas por Pack": stats.get("matched_by_pack"),
+            "Ventas sin Envío asignado": stats.get("missing_ship"),
+        })
 
-        # Top 20 ventas sin envío para diagnóstico rápido
         missing = c.execute(
-            "SELECT sale_id, page_no, pack_id FROM s2_sales WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') ORDER BY page_no, sale_id LIMIT 20",
+            "SELECT sale_id, page_no, pack_id FROM s2_sales "
+            "WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') "
+            "ORDER BY page_no, sale_id LIMIT 20",
             (mid,),
         ).fetchall()
         if missing:
             st.warning("Ejemplos de ventas sin envío asignado (primeras 20):")
             st.table([{"venta": a, "pagina": b, "pack_id": cpid or ""} for (a, b, cpid) in missing])
 
+    # ---- Acciones (bloqueo duro + cierre + reinicio) ----
     st.divider()
     st.subheader("Acciones")
     st.caption("🔒 Bloqueo duro: para cargar un nuevo manifiesto debes **Cerrar** o **Reiniciar** el manifiesto activo.")
 
-    close_ok = (int(stats.get("sales_total", 0) or 0) > 0 and int(stats.get("sales_pending", 0) or 0) == 0 and int(stats.get("items_pending", 0) or 0) == 0)
+    close_ok = (
+        int(stats.get("sales_total", 0) or 0) > 0
+        and int(stats.get("sales_pending", 0) or 0) == 0
+        and int(stats.get("items_pending", 0) or 0) == 0
+    )
     btn_close = st.button("✅ Cerrar manifiesto (habilitar nuevo)", disabled=not close_ok)
     if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
-        st.info("Para cerrar el manifiesto: todas las **ventas** deben estar cerradas y no deben quedar **ítems pendientes**. Si necesitas cargar otro manifiesto sin terminar, usa **Reiniciar** (borra todo).")
+        st.info(
+            "Para cerrar el manifiesto: todas las **ventas** deben estar cerradas y no deben quedar **ítems pendientes**. "
+            "Si necesitas cargar otro manifiesto sin terminar, usa **Reiniciar** (borra todo)."
+        )
 
     if btn_close:
         _s2_close_manifest(mid)
         new_mid = _s2_create_new_manifest()
-        # limpiar session del módulo (incluye uploaders)
         for k in list(st.session_state.keys()):
             if k.startswith("s2_") or "sorting" in k:
                 del st.session_state[k]
         st.success(f"Manifiesto {mid} cerrado. Nuevo manifiesto activo: {new_mid}")
         st.rerun()
 
+    # Reinicio al final (como en Admin Picking)
+    if "s2_reset_armed" not in st.session_state:
+        st.session_state["s2_reset_armed"] = False
 
+    arm = st.checkbox("Quiero reiniciar Sorting (entiendo que se borra todo)", value=st.session_state["s2_reset_armed"])
+    st.session_state["s2_reset_armed"] = bool(arm)
 
+    confirm_txt = st.text_input("Escribe BORRAR para confirmar", value="", disabled=not arm)
+    do_reset = st.button(
+        "🗑️ Reiniciar Sorting (borrar todo)",
+        type="primary",
+        disabled=not (arm and confirm_txt.strip().upper() == "BORRAR"),
+    )
+
+    if do_reset:
+        _s2_reset_all_sorting()
+        for k in list(st.session_state.keys()):
+            if k.startswith("s2_") or "sorting" in k:
+                del st.session_state[k]
+        st.success("Sorting reiniciado completamente.")
+        st.rerun()
+
+    conn.close()
 
 def get_next_run_for_mesa(mesa: int):
     conn = get_conn()
