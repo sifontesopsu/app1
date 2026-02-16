@@ -1323,13 +1323,6 @@ def page_app_lobby():
             border-radius: 18px !important;
         }
         .lobbywrap { max-width: 1100px; margin: 0 auto; }
-        /* PDA: forzar columnas (botones) en fila en pantallas angostas */
-        @media (max-width: 700px) {
-          div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
-          div[data-testid="stHorizontalBlock"] > div[data-testid="column"] { flex: 1 1 0 !important; min-width: 0 !important; }
-          div[data-testid="stHorizontalBlock"] button { width: 100% !important; padding: 0.45rem 0.35rem !important; font-size: 0.95rem !important; white-space: nowrap !important; }
-        }
-
         </style>
         """,
         unsafe_allow_html=True
@@ -1565,7 +1558,8 @@ def picking_lobby():
             st.markdown('<div class="bigbtn">', unsafe_allow_html=True)
             if st.button(p, key=f"pick_{p}"):
                 chosen = p
-            
+            st.markdown('</div>', unsafe_allow_html=True)
+
     if chosen:
         st.session_state.selected_picker = chosen
         st.rerun()
@@ -1604,7 +1598,8 @@ def page_picking():
         .smallcap { font-size: 12px; opacity: 0.75; margin: 0 0 4px 0; }
         .scanok { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
         .ok { background: rgba(0, 200, 0, 0.15); }
-        .bad { background: rgba(255, 0, 0, 0.12); }        </style>
+        .bad { background: rgba(255, 0, 0, 0.12); }
+        </style>
         """,
         unsafe_allow_html=True
     )
@@ -1723,36 +1718,36 @@ def page_picking():
             unsafe_allow_html=True,
         )
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
-    # Escaneo (ancho completo)
-    scan_label = "Escaneo"
-    scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
 
-    # Autofocus en PDA: después de elegir desde la lista, dejar listo el campo de escaneo
-    if st.session_state.get("focus_scan", False):
-        components.html(
-            "<script>"
-            "setTimeout(function(){"
-            "const el=document.querySelector('input[type=\"text\"]');"
-            "if(el){el.focus(); if(el.select){el.select();}}"
-            "}, 50);"
-            "</script>",
-            height=0,
-        )
-        st.session_state["focus_scan"] = False
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
-    force_tel_keyboard(scan_label)
+    with col1:
+        scan_label = "Escaneo"
+        scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
 
-    # Autofocus inteligente:
-    if s.get("confirmed", False):
-        autofocus_input("Cantidad")
-    else:
-        autofocus_input(scan_label)
-
-    # Botones en una sola fila (PDA)
-        col2, col3, col4 = st.columns(3, gap="small")
+        # Autofocus en PDA: después de elegir desde la lista, dejar listo el campo de escaneo
+        if st.session_state.get("focus_scan", False):
+            components.html(
+                "<script>"
+                "setTimeout(function(){"
+                "const el=document.querySelector('input[type=\"text\"]');"
+                "if(el){el.focus(); if(el.select){el.select();}}"
+                "}, 50);"
+                "</script>",
+                height=0,
+            )
+            st.session_state["focus_scan"] = False
+        force_tel_keyboard(scan_label)
+        # Autofocus inteligente:
+        # - Si ya validó el producto (confirmed), llevar el foco a "Cantidad"
+        # - Si no, mantener foco en "Escaneo"
+        if s.get("confirmed", False):
+            autofocus_input("Cantidad")
+        else:
+            autofocus_input(scan_label)
 
     with col2:
-        if st.button("Validar", use_container_width=True):
+        if st.button("Validar"):
             sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
             if not sku_detected:
                 s["scan_status"] = "bad"
@@ -1773,12 +1768,14 @@ def page_picking():
             st.rerun()
 
     with col3:
-        if st.button("Sin EAN", use_container_width=True):
+        if st.button("Sin EAN"):
             s["show_manual_confirm"] = True
             st.rerun()
 
     with col4:
-        if st.button("Siguiente", use_container_width=True):
+        if st.button("Siguiente"):
+            # Siempre manda este SKU al final de la fila (rotación circular).
+            # Implementación: defer_rank = (máximo defer_rank en esta OT) + 1
             try:
                 c.execute("SELECT COALESCE(MAX(defer_rank), 0) FROM picking_tasks WHERE ot_id=?", (ot_id,))
                 max_rank = c.fetchone()[0] or 0
@@ -1790,10 +1787,10 @@ def page_picking():
                 conn.commit()
             except Exception:
                 pass
+            # Limpiar estado UI de este task y seguir con el siguiente
             state.pop(str(task_id), None)
             st.rerun()
 
-    
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
         st.info("Confirmación manual")
         st.write(f"✅ {producto_show}")
