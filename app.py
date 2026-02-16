@@ -1890,16 +1890,6 @@ def page_picking():
                     st.session_state["pick_inc_pending"] = None
                     st.rerun()
 
-                c.execute("""
-                    UPDATE picking_tasks
-                    SET qty_picked=?, status='INCIDENCE', decided_at=?, confirm_mode=?
-                    WHERE id=?
-                """, (q, now_iso(), s["confirm_mode"], task_id))
-
-                conn.commit()
-                state.pop(str(task_id), None)
-                st.success("Enviado a incidencias. Siguiente…")
-                st.rerun()
 
         with colB:
             if st.button("Reintentar"):
@@ -2770,53 +2760,6 @@ def page_admin():
         st.info("Sin incidencias en la corrida actual.")
 
     st.divider()
-
-    # Sorting: manifiesto activo para reportes
-    mid = _s2_get_active_manifest_id()
-
-    st.subheader("Incidencias y Sin EAN")
-    inc_rows = c.execute(
-        """SELECT s.mesa, s.sale_id, s.shipment_id, i.sku, i.description, i.qty, i.picked,
-                  i.status, COALESCE(i.confirm_mode,'') as confirm_mode, i.updated_at
-             FROM s2_items i
-             JOIN s2_sales s
-               ON s.manifest_id=i.manifest_id AND s.sale_id=i.sale_id
-            WHERE i.manifest_id=?
-              AND (i.status='INCIDENCE' OR COALESCE(i.confirm_mode,'')='MANUAL_NO_EAN')
-            ORDER BY s.mesa, s.sale_id, CAST(i.sku AS INTEGER), i.sku;""",
-        (mid,)
-    ).fetchall()
-
-    if inc_rows:
-        df_inc = pd.DataFrame(
-            inc_rows,
-            columns=["Mesa","Venta","Envío","SKU","Descripción","Solicitado","Verificado","Estado","Confirmación","Actualizado"]
-        )
-        # Tipo amigable
-        df_inc["Tipo"] = df_inc["Confirmación"].apply(lambda x: "SIN_EAN" if str(x)=="MANUAL_NO_EAN" else "INCIDENCIA")
-
-        # Producto (título técnico): maestro > descripción > SKU
-        def _s2_prod_name(sku, desc):
-            k = str(sku).strip()
-            if isinstance(inv_map_sku, dict):
-                return (inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or (desc or "") or k)
-            return (master_raw_title_lookup(MASTER_FILE, k) or (desc or "") or k)
-
-        df_inc["Producto"] = [
-            _s2_prod_name(sku, desc) for sku, desc in zip(df_inc["SKU"].tolist(), df_inc["Descripción"].tolist())
-        ]
-
-        # Hora Chile
-        try:
-            df_inc["Actualizado"] = df_inc["Actualizado"].apply(to_chile_display)
-        except Exception:
-            pass
-
-        df_inc = df_inc[["Mesa","Venta","Envío","SKU","Producto","Solicitado","Verificado","Tipo","Estado","Actualizado"]]
-        st.dataframe(df_inc, use_container_width=True, hide_index=True)
-    else:
-        st.info("Sin incidencias ni productos marcados como Sin EAN en este manifiesto.")
-
     st.subheader("Acciones")
 
     if "confirm_reset" not in st.session_state:
