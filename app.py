@@ -411,19 +411,6 @@ def autofocus_input(label: str):
 # DB INIT
 # =========================
 def init_db():
-
-    st.markdown(
-        """
-        <style>
-        /* --- PDA: mantener 3 botones en una sola fila --- */
-        div.pda-btn-row div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
-        div.pda-btn-row div[data-testid="column"] { flex: 1 1 0 !important; min-width: 0 !important; }
-        div.pda-btn-row button { width: 100% !important; white-space: nowrap !important; padding: 0.6rem 0.4rem !important; }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
     conn = get_conn()
     c = conn.cursor()
 
@@ -1612,6 +1599,11 @@ def page_picking():
         .scanok { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
         .ok { background: rgba(0, 200, 0, 0.15); }
         .bad { background: rgba(255, 0, 0, 0.12); }
+
+        /* PDA: mantener 3 botones en una sola fila */
+        .pda-btn-row div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
+        .pda-btn-row div[data-testid="column"] { flex: 1 1 0 !important; min-width: 0 !important; }
+        .pda-btn-row button { width: 100% !important; white-space: nowrap !important; }
         </style>
         """,
         unsafe_allow_html=True
@@ -1731,9 +1723,7 @@ def page_picking():
             unsafe_allow_html=True,
         )
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
-
-    
-    # --- Layout PDA: escaneo arriba + 3 botones en una fila ---
+    # Escaneo (ancho completo)
     scan_label = "Escaneo"
     scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
 
@@ -1753,17 +1743,16 @@ def page_picking():
     force_tel_keyboard(scan_label)
 
     # Autofocus inteligente:
-    # - Si ya validó el producto (confirmed), llevar el foco a "Cantidad"
-    # - Si no, mantener foco en "Escaneo"
     if s.get("confirmed", False):
         autofocus_input("Cantidad")
     else:
         autofocus_input(scan_label)
 
+    # Botones en una sola fila (PDA)
     st.markdown('<div class="pda-btn-row">', unsafe_allow_html=True)
-    b1, b2, b3 = st.columns(3, gap="small")
+    col2, col3, col4 = st.columns(3, gap="small")
 
-    with b1:
+    with col2:
         if st.button("Validar", use_container_width=True):
             sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
             if not sku_detected:
@@ -1784,15 +1773,13 @@ def page_picking():
                 s["scan_value"] = scan
             st.rerun()
 
-    with b2:
+    with col3:
         if st.button("Sin EAN", use_container_width=True):
             s["show_manual_confirm"] = True
             st.rerun()
 
-    with b3:
+    with col4:
         if st.button("Siguiente", use_container_width=True):
-            # Siempre manda este SKU al final de la fila (rotación circular).
-            # Implementación: defer_rank = (máximo defer_rank en esta OT) + 1
             try:
                 c.execute("SELECT COALESCE(MAX(defer_rank), 0) FROM picking_tasks WHERE ot_id=?", (ot_id,))
                 max_rank = c.fetchone()[0] or 0
@@ -1804,12 +1791,12 @@ def page_picking():
                 conn.commit()
             except Exception:
                 pass
-            # Limpiar estado UI de este task y seguir con el siguiente
             state.pop(str(task_id), None)
             st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
-if s.get("show_manual_confirm", False) and not s["confirmed"]:
+
+    if s.get("show_manual_confirm", False) and not s["confirmed"]:
         st.info("Confirmación manual")
         st.write(f"✅ {producto_show}")
         if st.button("Confirmar", key=f"confirm_manual_{task_id}"):
