@@ -1820,6 +1820,16 @@ def page_picking():
                 s["needs_decision"] = False
 
             elif q == int(qty_total):
+                # Si el picker usó "Sin EAN", lo registramos en incidencias para trazabilidad
+                if str(s.get("confirm_mode") or "") == "MANUAL_NO_EAN":
+                    try:
+                        c.execute("""INSERT INTO picking_incidences
+                                     (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, note, created_at)
+                                     VALUES (?,?,?,?,?,?,?,?)""",
+                                  (ot_id, sku_expected, int(qty_total), int(q), 0, "SIN_EAN", "", now_iso()))
+                    except Exception:
+                        pass
+
                 c.execute("""
                     UPDATE picking_tasks
                     SET qty_picked=?, status='DONE', decided_at=?, confirm_mode=?
@@ -1829,7 +1839,6 @@ def page_picking():
                 state.pop(str(task_id), None)
                 st.success("OK. Siguiente…")
                 st.rerun()
-
             else:
                 missing = int(qty_total) - q
                 s["needs_decision"] = True
@@ -2744,12 +2753,67 @@ def page_admin():
     inc_rows = c.fetchall()
     if inc_rows:
         df_inc = pd.DataFrame(inc_rows, columns=["OT","Picker","SKU","Solicitado","Pickeado","Faltante","Motivo","Nota","Hora"])
+        # Producto (título técnico): maestro si existe; si no, SKU
+        try:
+            df_inc["Producto"] = df_inc["SKU"].apply(lambda x: (master_raw_title_lookup(MASTER_FILE, str(x).strip()) or str(x).strip()))
+        except Exception:
+            df_inc["Producto"] = df_inc["SKU"].astype(str)
+
         df_inc["Hora"] = df_inc["Hora"].apply(to_chile_display)
-        st.dataframe(df_inc)
+        # Orden de columnas más útil
+        try:
+            df_inc = df_inc[["OT","Picker","SKU","Producto","Solicitado","Pickeado","Faltante","Motivo","Nota","Hora"]]
+        except Exception:
+            pass
+        st.dataframe(df_inc, use_container_width=True, hide_index=True)
     else:
         st.info("Sin incidencias en la corrida actual.")
 
     st.divider()
+
+    st.subheader("Incidencias y Sin EAN")
+    inc_rows = c.execute(
+        """SELECT s.mesa, s.sale_id, s.shipment_id, i.sku, i.description, i.qty, i.picked,
+                  i.status, COALESCE(i.confirm_mode,'') as confirm_mode, i.updated_at
+             FROM s2_items i
+             JOIN s2_sales s
+               ON s.manifest_id=i.manifest_id AND s.sale_id=i.sale_id
+            WHERE i.manifest_id=?
+              AND (i.status='INCIDENCE' OR COALESCE(i.confirm_mode,'')='MANUAL_NO_EAN')
+            ORDER BY s.mesa, s.sale_id, CAST(i.sku AS INTEGER), i.sku;""",
+        (mid,)
+    ).fetchall()
+
+    if inc_rows:
+        df_inc = pd.DataFrame(
+            inc_rows,
+            columns=["Mesa","Venta","Envío","SKU","Descripción","Solicitado","Verificado","Estado","Confirmación","Actualizado"]
+        )
+        # Tipo amigable
+        df_inc["Tipo"] = df_inc["Confirmación"].apply(lambda x: "SIN_EAN" if str(x)=="MANUAL_NO_EAN" else "INCIDENCIA")
+
+        # Producto (título técnico): maestro > descripción > SKU
+        def _s2_prod_name(sku, desc):
+            k = str(sku).strip()
+            if isinstance(inv_map_sku, dict):
+                return (inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or (desc or "") or k)
+            return (master_raw_title_lookup(MASTER_FILE, k) or (desc or "") or k)
+
+        df_inc["Producto"] = [
+            _s2_prod_name(sku, desc) for sku, desc in zip(df_inc["SKU"].tolist(), df_inc["Descripción"].tolist())
+        ]
+
+        # Hora Chile
+        try:
+            df_inc["Actualizado"] = df_inc["Actualizado"].apply(to_chile_display)
+        except Exception:
+            pass
+
+        df_inc = df_inc[["Mesa","Venta","Envío","SKU","Producto","Solicitado","Verificado","Tipo","Estado","Actualizado"]]
+        st.dataframe(df_inc, use_container_width=True, hide_index=True)
+    else:
+        st.info("Sin incidencias ni productos marcados como Sin EAN en este manifiesto.")
+
     st.subheader("Acciones")
 
     if "confirm_reset" not in st.session_state:
@@ -3157,6 +3221,17 @@ def _s2_create_tables():
             c.execute("ALTER TABLE s2_sales ADD COLUMN customer TEXT;")
     except Exception:
         pass
+
+    # s2_items: guardar confirm_mode para trazabilidad (ej: MANUAL_NO_EAN)
+    try:
+        cols_i = [r[1] for r in c.execute("PRAGMA table_info(s2_items);").fetchall()]
+        if "confirm_mode" not in cols_i:
+            c.execute("ALTER TABLE s2_items ADD COLUMN confirm_mode TEXT;")
+        if "updated_at" not in cols_i:
+            c.execute("ALTER TABLE s2_items ADD COLUMN updated_at TEXT;")
+    except Exception:
+        pass
+
 
     # Mapa Pack ID -> Shipment ID (necesario para Colecta)
     c.execute("""CREATE TABLE IF NOT EXISTS s2_pack_ship (
@@ -3891,7 +3966,7 @@ def _s2_apply_pick(mid:int, sale_id:str, sku:str, add_qty:int):
 def _s2_mark_incidence(mid:int, sale_id:str, sku:str, note:str=""):
     conn=get_conn()
     c=conn.cursor()
-    c.execute("UPDATE s2_items SET status='INCIDENCE' WHERE manifest_id=? AND sale_id=? AND sku=?;", (mid, sale_id, sku))
+    c.execute("UPDATE s2_items SET status='INCIDENCE', confirm_mode='INCIDENCE', updated_at=? WHERE manifest_id=? AND sale_id=? AND sku=?;", (_s2_now_iso(), mid, sale_id, sku))
     conn.commit()
     conn.close()
 
@@ -3904,7 +3979,7 @@ def _s2_force_done_no_ean(mid:int, sale_id:str, sku:str):
         conn.close()
         return False
     qty=int(row[0] or 0)
-    c.execute("UPDATE s2_items SET picked=?, status='DONE' WHERE manifest_id=? AND sale_id=? AND sku=?;", (qty, mid, sale_id, sku))
+    c.execute("UPDATE s2_items SET picked=?, status='DONE', confirm_mode='MANUAL_NO_EAN', updated_at=? WHERE manifest_id=? AND sale_id=? AND sku=?;", (qty, _s2_now_iso(), mid, sale_id, sku))
     conn.commit()
     conn.close()
     return True
