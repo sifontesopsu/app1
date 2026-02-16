@@ -4389,6 +4389,83 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         st.success(f"Manifiesto {mid} cerrado. Nuevo manifiesto activo: {new_mid}")
         st.rerun()
 
+
+    st.divider()
+    st.subheader("Incidencias y Sin EAN")
+
+    inc_rows = c.execute(
+        """SELECT s.sale_id, s.mesa, s.shipment_id,
+                  i.sku, i.description, i.qty, i.picked, i.status,
+                  COALESCE(i.confirm_mode,'') as confirm_mode,
+                  COALESCE(i.updated_at,'') as updated_at
+             FROM s2_items i
+             JOIN s2_sales s
+               ON s.manifest_id=i.manifest_id AND s.sale_id=i.sale_id
+            WHERE i.manifest_id=?
+              AND (i.status='INCIDENCE' OR i.confirm_mode='MANUAL_NO_EAN')
+            ORDER BY s.mesa, s.sale_id, i.sku;""",
+        (mid,),
+    ).fetchall()
+
+    if inc_rows:
+        df_inc = pd.DataFrame(
+            inc_rows,
+            columns=[
+                "Venta",
+                "Mesa",
+                "Envío",
+                "SKU",
+                "Descripción Control",
+                "Solicitado",
+                "Verificado",
+                "Estado",
+                "Modo",
+                "Hora",
+            ],
+        )
+
+        def _title_tec_for_sku(sku_val, fallback_desc=""):
+            try:
+                if isinstance(inv_map_sku, dict):
+                    k = str(sku_val).strip()
+                    t = inv_map_sku.get(k) or inv_map_sku.get(normalize_sku(k)) or ""
+                    if t:
+                        return t
+            except Exception:
+                pass
+            return str(fallback_desc or sku_val or "")
+
+        try:
+            df_inc["Producto (técnico)"] = df_inc.apply(
+                lambda r: _title_tec_for_sku(r["SKU"], r["Descripción Control"]),
+                axis=1,
+            )
+        except Exception:
+            df_inc["Producto (técnico)"] = df_inc["SKU"].astype(str)
+
+        # Orden de columnas más útil
+        try:
+            df_inc = df_inc[
+                [
+                    "Mesa",
+                    "Venta",
+                    "Envío",
+                    "SKU",
+                    "Producto (técnico)",
+                    "Solicitado",
+                    "Verificado",
+                    "Estado",
+                    "Modo",
+                    "Hora",
+                ]
+            ]
+        except Exception:
+            pass
+
+        st.dataframe(df_inc, use_container_width=True, hide_index=True)
+    else:
+        st.info("Sin incidencias ni productos marcados como Sin EAN en este manifiesto.")
+
     if "s2_reset_armed" not in st.session_state:
         st.session_state["s2_reset_armed"] = False
 
