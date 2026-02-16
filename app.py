@@ -1773,7 +1773,7 @@ def page_picking():
             st.rerun()
 
     with col4:
-        if st.button("Siguiente producto"):
+        if st.button("Siguiente"):
             # Siempre manda este SKU al final de la fila (rotación circular).
             # Implementación: defer_rank = (máximo defer_rank en esta OT) + 1
             try:
