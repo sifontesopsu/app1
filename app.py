@@ -2771,6 +2771,9 @@ def page_admin():
 
     st.divider()
 
+    # Sorting: manifiesto activo para reportes
+    mid = _s2_get_active_manifest_id()
+
     st.subheader("Incidencias y Sin EAN")
     inc_rows = c.execute(
         """SELECT s.mesa, s.sale_id, s.shipment_id, i.sku, i.description, i.qty, i.picked,
