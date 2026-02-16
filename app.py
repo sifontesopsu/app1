@@ -1323,6 +1323,13 @@ def page_app_lobby():
             border-radius: 18px !important;
         }
         .lobbywrap { max-width: 1100px; margin: 0 auto; }
+        /* PDA: forzar columnas (botones) en fila en pantallas angostas */
+        @media (max-width: 700px) {
+          div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
+          div[data-testid="stHorizontalBlock"] > div[data-testid="column"] { flex: 1 1 0 !important; min-width: 0 !important; }
+          div[data-testid="stHorizontalBlock"] button { width: 100% !important; padding: 0.45rem 0.35rem !important; font-size: 0.95rem !important; white-space: nowrap !important; }
+        }
+
         </style>
         """,
         unsafe_allow_html=True
@@ -1558,8 +1565,7 @@ def picking_lobby():
             st.markdown('<div class="bigbtn">', unsafe_allow_html=True)
             if st.button(p, key=f"pick_{p}"):
                 chosen = p
-            st.markdown('</div>', unsafe_allow_html=True)
-
+            
     if chosen:
         st.session_state.selected_picker = chosen
         st.rerun()
@@ -1598,13 +1604,7 @@ def page_picking():
         .smallcap { font-size: 12px; opacity: 0.75; margin: 0 0 4px 0; }
         .scanok { display:inline-block; padding: 6px 10px; border-radius: 10px; font-weight: 900; }
         .ok { background: rgba(0, 200, 0, 0.15); }
-        .bad { background: rgba(255, 0, 0, 0.12); }
-
-        /* PDA: mantener 3 botones en una sola fila */
-        .pda-btn-row div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
-        .pda-btn-row div[data-testid="column"] { flex: 1 1 0 !important; min-width: 0 !important; }
-        .pda-btn-row button { width: 100% !important; white-space: nowrap !important; }
-        </style>
+        .bad { background: rgba(255, 0, 0, 0.12); }        </style>
         """,
         unsafe_allow_html=True
     )
@@ -1749,8 +1749,7 @@ def page_picking():
         autofocus_input(scan_label)
 
     # Botones en una sola fila (PDA)
-    st.markdown('<div class="pda-btn-row">', unsafe_allow_html=True)
-    col2, col3, col4 = st.columns(3, gap="small")
+        col2, col3, col4 = st.columns(3, gap="small")
 
     with col2:
         if st.button("Validar", use_container_width=True):
@@ -1794,8 +1793,7 @@ def page_picking():
             state.pop(str(task_id), None)
             st.rerun()
 
-    st.markdown('</div>', unsafe_allow_html=True)
-
+    
     if s.get("show_manual_confirm", False) and not s["confirmed"]:
         st.info("Confirmación manual")
         st.write(f"✅ {producto_show}")
