@@ -639,7 +639,7 @@ def init_db():
         # picking_tasks (nuevas columnas para reordenar por "Surtido en venta")
     _ensure_col("picking_tasks", "defer_rank", "INTEGER DEFAULT 0")
     _ensure_col("picking_tasks", "defer_at", "TEXT")
-_ensure_col("picking_incidences", "note", "TEXT")
+    _ensure_col("picking_incidences", "note", "TEXT")
 
     # picking_incidences
     _ensure_col("picking_incidences", "product", "TEXT")
