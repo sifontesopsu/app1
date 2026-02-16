@@ -473,6 +473,7 @@ def init_db():
         qty_picked INTEGER,
         qty_missing INTEGER,
         reason TEXT,
+        note TEXT,
         created_at TEXT
     );
     """)
@@ -637,6 +638,7 @@ def init_db():
         # picking_tasks (nuevas columnas para reordenar por "Surtido en venta")
     _ensure_col("picking_tasks", "defer_rank", "INTEGER DEFAULT 0")
     _ensure_col("picking_tasks", "defer_at", "TEXT")
+    _ensure_col("picking_incidences", "note", "TEXT")
 
 # sorting_manifests
     _ensure_col("sorting_manifests", "name", "TEXT")
@@ -1839,14 +1841,45 @@ def page_picking():
         colA, colB = st.columns(2)
 
         with colA:
-            if st.button("A incidencias y seguir"):
-                q = int(s["qty_input"])
-                missing = int(qty_total) - q
+            # Incidencia con nota (igual que Sorting): pedir motivo antes de guardar
+            if "pick_inc_pending" not in st.session_state:
+                st.session_state["pick_inc_pending"] = None
 
-                c.execute("""
-                    INSERT INTO picking_incidences (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, created_at)
-                    VALUES (?,?,?,?,?,?,?)
-                """, (ot_id, sku_expected, int(qty_total), q, missing, "FALTANTE", now_iso()))
+            pending = st.session_state.get("pick_inc_pending")
+            is_pending = bool(pending and pending.get("task_id") == task_id)
+
+            if (not is_pending) and st.button("A incidencias y seguir"):
+                st.session_state["pick_inc_pending"] = {"task_id": task_id}
+                st.rerun()
+
+            if is_pending:
+                st.warning("Incidencia: escribe el motivo antes de guardar.")
+                note_val = st.text_area("Motivo / Nota", key=f"pick_inc_note_{task_id}", height=90,
+                                        placeholder="Ej: Falta producto, no se encontró en ubicación, etc.")
+                c1, c2 = st.columns([1, 1])
+                if c1.button("💾 Guardar incidencia", key=f"pick_inc_save_{task_id}"):
+                    q = int(s["qty_input"])
+                    missing = int(qty_total) - q
+
+                    c.execute("""INSERT INTO picking_incidences
+                                 (ot_id, sku_ml, qty_total, qty_picked, qty_missing, reason, note, created_at)
+                                 VALUES (?,?,?,?,?,?,?,?)""",
+                              (ot_id, sku_expected, int(qty_total), q, missing, "FALTANTE", note_val or "", now_iso()))
+
+                    c.execute("""UPDATE picking_tasks
+                                 SET qty_picked=?, status='INCIDENCE', decided_at=?, confirm_mode=?
+                                 WHERE id=?""",
+                              (q, now_iso(), s["confirm_mode"], task_id))
+
+                    conn.commit()
+                    st.session_state["pick_inc_pending"] = None
+                    state.pop(str(task_id), None)
+                    st.success("Enviado a incidencias. Siguiente…")
+                    st.rerun()
+
+                if c2.button("Cancelar", key=f"pick_inc_cancel_{task_id}"):
+                    st.session_state["pick_inc_pending"] = None
+                    st.rerun()
 
                 c.execute("""
                     UPDATE picking_tasks
@@ -2589,6 +2622,15 @@ def page_full_admin():
     if inc:
         df_inc = pd.DataFrame(inc, columns=["SKU", "Req", "Chk", "Diff", "Motivo", "Hora"])
         df_inc["Hora"] = df_inc["Hora"].apply(to_chile_display)
+        # Producto (nombre técnico): usar maestro si existe, si no SKU
+        if isinstance(inv_map_sku, dict) and not df_inc.empty:
+            def _pname(sku):
+                k = str(sku).strip()
+                return inv_map_sku.get(k) or master_raw_title_lookup(MASTER_FILE, k) or k
+            df_inc["Producto"] = df_inc["SKU"].apply(_pname)
+        else:
+            df_inc["Producto"] = df_inc["SKU"].astype(str)
+        df_inc = df_inc[["OT","Picker","SKU","Producto","Solicitado","Pickeado","Faltante","Motivo","Nota","Hora"]]
         st.dataframe(df_inc, use_container_width=True)
     else:
         st.info("Sin incidencias registradas para este lote.")
@@ -2693,7 +2735,7 @@ def page_admin():
 
     st.subheader("Incidencias")
     c.execute("""
-        SELECT po.ot_code, pk.name, pi.sku_ml, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.created_at
+        SELECT po.ot_code, pk.name, pi.sku_ml, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.note, pi.created_at
         FROM picking_incidences pi
         JOIN picking_ots po ON po.id = pi.ot_id
         JOIN pickers pk ON pk.id = po.picker_id
@@ -2701,7 +2743,7 @@ def page_admin():
     """)
     inc_rows = c.fetchall()
     if inc_rows:
-        df_inc = pd.DataFrame(inc_rows, columns=["OT", "Picker", "SKU", "Solicitado", "Pickeado", "Faltante", "Motivo", "Hora"])
+        df_inc = pd.DataFrame(inc_rows, columns=["OT","Picker","SKU","Solicitado","Pickeado","Faltante","Motivo","Nota","Hora"])
         df_inc["Hora"] = df_inc["Hora"].apply(to_chile_display)
         st.dataframe(df_inc)
     else:
@@ -3097,7 +3139,6 @@ def _s2_create_tables():
         qty INTEGER NOT NULL,
         picked INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'PENDING',
-        incidence_note TEXT,
         PRIMARY KEY (manifest_id, sale_id, sku)
     );""")
     c.execute("""CREATE TABLE IF NOT EXISTS s2_labels (
@@ -3116,15 +3157,6 @@ def _s2_create_tables():
             c.execute("ALTER TABLE s2_sales ADD COLUMN customer TEXT;")
     except Exception:
         pass
-
-    # s2_items: nota de incidencia (para BD antiguas)
-    try:
-        cols_it = [r[1] for r in c.execute("PRAGMA table_info(s2_items);").fetchall()]
-        if "incidence_note" not in cols_it:
-            c.execute("ALTER TABLE s2_items ADD COLUMN incidence_note TEXT;")
-    except Exception:
-        pass
-
 
     # Mapa Pack ID -> Shipment ID (necesario para Colecta)
     c.execute("""CREATE TABLE IF NOT EXISTS s2_pack_ship (
@@ -3830,7 +3862,7 @@ def _s2_find_sale_for_pack_scan(mid:int, mesa:int, pack_id:str):
 def _s2_sale_items(mid:int, sale_id:str):
     conn=get_conn()
     c=conn.cursor()
-    c.execute("""SELECT sku, description, qty, picked, status, incidence_note
+    c.execute("""SELECT sku, description, qty, picked, status
                  FROM s2_items WHERE manifest_id=? AND sale_id=? ORDER BY sku;""", (mid, sale_id))
     rows=c.fetchall()
     conn.close()
@@ -3859,7 +3891,7 @@ def _s2_apply_pick(mid:int, sale_id:str, sku:str, add_qty:int):
 def _s2_mark_incidence(mid:int, sale_id:str, sku:str, note:str=""):
     conn=get_conn()
     c=conn.cursor()
-    c.execute("UPDATE s2_items SET status='INCIDENCE', incidence_note=? WHERE manifest_id=? AND sale_id=? AND sku=?;", (note or "", mid, sale_id, sku))
+    c.execute("UPDATE s2_items SET status='INCIDENCE' WHERE manifest_id=? AND sale_id=? AND sku=?;", (mid, sale_id, sku))
     conn.commit()
     conn.close()
 
@@ -4029,8 +4061,6 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         return
 
     sale_id = st.session_state["s2_sale_open"]
-    if "s2_inc_pending" not in st.session_state:
-        st.session_state["s2_inc_pending"] = None
     st.info(f"Venta abierta: {sale_id}")
 
 
@@ -4064,11 +4094,11 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
     st.markdown("### Productos de la venta")
     total_items = len(items)
-    done_items = sum(1 for _sku,_d,_q,_p,stx,_note in items if stx in ("DONE","INCIDENCE"))
+    done_items = sum(1 for _sku,_d,_q,_p,stx in items if stx in ("DONE","INCIDENCE"))
     st.progress(0 if total_items==0 else done_items/total_items)
     st.caption(f"{done_items}/{total_items} ítems finalizados (DONE o INCIDENCE)")
 
-    for sku, desc, qty, picked, status, inc_note in items:
+    for sku, desc, qty, picked, status in items:
         title = None
         if isinstance(inv_map_sku, dict):
             k = str(sku).strip()
@@ -4086,34 +4116,11 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         row1[1].markdown(f"## {int(qty)}")
         row1[2].metric("Hecho", int(picked))
 
-        if str(status) == "INCIDENCE":
-            if inc_note:
-                st.error(f"⚠️ INCIDENCIA: {inc_note}")
-            else:
-                st.error("⚠️ INCIDENCIA (sin nota)")
-
         if status != "DONE" and remaining > 0:
             bcols = st.columns([1,1,6])
-            # Incidencia con nota (se abre cuadro para escribir motivo)
-            inc_pending = st.session_state.get("s2_inc_pending")
-            is_this_pending = bool(inc_pending and inc_pending.get("sale_id")==sale_id and str(inc_pending.get("sku"))==str(sku))
-            if (not is_this_pending) and bcols[0].button("⚠️ Incidencia", key=f"s2_inc_{sale_id}_{sku}"):
-                st.session_state["s2_inc_pending"] = {"sale_id": sale_id, "sku": str(sku)}
+            if bcols[0].button("⚠️ Incidencia", key=f"s2_inc_{sale_id}_{sku}"):
+                _s2_mark_incidence(mid, sale_id, str(sku))
                 st.rerun()
-
-            if is_this_pending:
-                st.warning("Incidencia: escribe el motivo antes de guardar.")
-                note_key = f"s2_inc_note_{sale_id}_{sku}"
-                note_val = st.text_area("Motivo / Nota", key=note_key, height=90, placeholder="Ej: Falta producto, embalaje dañado, SKU no corresponde, etc.")
-                c1, c2 = st.columns([1,1])
-                if c1.button("💾 Guardar incidencia", key=f"s2_inc_save_{sale_id}_{sku}"):
-                    _s2_mark_incidence(mid, sale_id, str(sku), note_val)
-                    st.session_state["s2_inc_pending"] = None
-                    st.rerun()
-                if c2.button("Cancelar", key=f"s2_inc_cancel_{sale_id}_{sku}"):
-                    st.session_state["s2_inc_pending"] = None
-                    st.rerun()
-
             if bcols[1].button("📝 Sin EAN", key=f"s2_noean_{sale_id}_{sku}"):
                 _s2_force_done_no_ean(mid, sale_id, str(sku))
                 st.rerun()
@@ -4305,40 +4312,6 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         st.success("No hay ventas pendientes: todo está cerrado.")
 
     # conn.close()  # moved to end (avoid closed cursor)
-
-
-
-    st.divider()
-    st.subheader("Incidencias (items marcados)")
-    inc_rows = c.execute(
-        """SELECT s.sale_id, s.mesa, s.shipment_id, i.sku, i.description, i.qty, i.picked, i.incidence_note
-             FROM s2_items i
-             JOIN s2_sales s ON s.manifest_id=i.manifest_id AND s.sale_id=i.sale_id
-             WHERE i.manifest_id=? AND i.status='INCIDENCE'
-             ORDER BY s.mesa, s.sale_id, i.sku;""",
-        (mid,)
-    ).fetchall()
-    if inc_rows:
-        df_inc = pd.DataFrame(inc_rows, columns=["Venta","Mesa","Envío","SKU","Descripción","Solicitado","Hecho","Nota"])
-        # Producto (nombre técnico): usar maestro si existe, si no la descripción del control
-        if isinstance(inv_map_sku, dict) and not df_inc.empty:
-            def _name_from_master(sku, desc):
-                k = str(sku).strip()
-                t = inv_map_sku.get(k)
-                if t is None and k.isdigit():
-                    try:
-                        t = inv_map_sku.get(str(int(k)))
-                    except Exception:
-                        t = None
-                return t or (desc or str(sku))
-            df_inc["Producto"] = df_inc.apply(lambda r: _name_from_master(r["SKU"], r["Descripción"]), axis=1)
-        else:
-            df_inc["Producto"] = df_inc["Descripción"].fillna(df_inc["SKU"].astype(str))
-        # Reorden columnas
-        df_inc = df_inc[["Venta","Mesa","Envío","SKU","Producto","Solicitado","Hecho","Nota"]]
-        st.dataframe(df_inc, use_container_width=True, hide_index=True)
-    else:
-        st.info("No hay incidencias registradas en este manifiesto.")
 
 
     st.subheader("Estado del manifiesto activo")
