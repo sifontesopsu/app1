@@ -411,6 +411,19 @@ def autofocus_input(label: str):
 # DB INIT
 # =========================
 def init_db():
+
+    st.markdown(
+        """
+        <style>
+        /* --- PDA: mantener 3 botones en una sola fila --- */
+        div.pda-btn-row div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
+        div.pda-btn-row div[data-testid="column"] { flex: 1 1 0 !important; min-width: 0 !important; }
+        div.pda-btn-row button { width: 100% !important; white-space: nowrap !important; padding: 0.6rem 0.4rem !important; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
     conn = get_conn()
     c = conn.cursor()
 
@@ -1719,35 +1732,39 @@ def page_picking():
         )
         st.markdown(f'<span class="scanok bad">❌ ERROR</span> {s["scan_msg"]}', unsafe_allow_html=True)
 
-    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+    
+    # --- Layout PDA: escaneo arriba + 3 botones en una fila ---
+    scan_label = "Escaneo"
+    scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
 
-    with col1:
-        scan_label = "Escaneo"
-        scan = st.text_input(scan_label, value=s["scan_value"], key=f"scan_{task_id}")
+    # Autofocus en PDA: después de elegir desde la lista, dejar listo el campo de escaneo
+    if st.session_state.get("focus_scan", False):
+        components.html(
+            "<script>"
+            "setTimeout(function(){"
+            "const el=document.querySelector('input[type=\"text\"]');"
+            "if(el){el.focus(); if(el.select){el.select();}}"
+            "}, 50);"
+            "</script>",
+            height=0,
+        )
+        st.session_state["focus_scan"] = False
 
-        # Autofocus en PDA: después de elegir desde la lista, dejar listo el campo de escaneo
-        if st.session_state.get("focus_scan", False):
-            components.html(
-                "<script>"
-                "setTimeout(function(){"
-                "const el=document.querySelector('input[type=\"text\"]');"
-                "if(el){el.focus(); if(el.select){el.select();}}"
-                "}, 50);"
-                "</script>",
-                height=0,
-            )
-            st.session_state["focus_scan"] = False
-        force_tel_keyboard(scan_label)
-        # Autofocus inteligente:
-        # - Si ya validó el producto (confirmed), llevar el foco a "Cantidad"
-        # - Si no, mantener foco en "Escaneo"
-        if s.get("confirmed", False):
-            autofocus_input("Cantidad")
-        else:
-            autofocus_input(scan_label)
+    force_tel_keyboard(scan_label)
 
-    with col2:
-        if st.button("Validar"):
+    # Autofocus inteligente:
+    # - Si ya validó el producto (confirmed), llevar el foco a "Cantidad"
+    # - Si no, mantener foco en "Escaneo"
+    if s.get("confirmed", False):
+        autofocus_input("Cantidad")
+    else:
+        autofocus_input(scan_label)
+
+    st.markdown('<div class="pda-btn-row">', unsafe_allow_html=True)
+    b1, b2, b3 = st.columns(3, gap="small")
+
+    with b1:
+        if st.button("Validar", use_container_width=True):
             sku_detected = resolve_scan_to_sku(scan, barcode_to_sku)
             if not sku_detected:
                 s["scan_status"] = "bad"
@@ -1767,13 +1784,13 @@ def page_picking():
                 s["scan_value"] = scan
             st.rerun()
 
-    with col3:
-        if st.button("Sin EAN"):
+    with b2:
+        if st.button("Sin EAN", use_container_width=True):
             s["show_manual_confirm"] = True
             st.rerun()
 
-    with col4:
-        if st.button("Siguiente"):
+    with b3:
+        if st.button("Siguiente", use_container_width=True):
             # Siempre manda este SKU al final de la fila (rotación circular).
             # Implementación: defer_rank = (máximo defer_rank en esta OT) + 1
             try:
@@ -1791,7 +1808,8 @@ def page_picking():
             state.pop(str(task_id), None)
             st.rerun()
 
-    if s.get("show_manual_confirm", False) and not s["confirmed"]:
+    st.markdown('</div>', unsafe_allow_html=True)
+if s.get("show_manual_confirm", False) and not s["confirmed"]:
         st.info("Confirmación manual")
         st.write(f"✅ {producto_show}")
         if st.button("Confirmar", key=f"confirm_manual_{task_id}"):
