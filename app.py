@@ -71,8 +71,10 @@ except ImportError:
 # UTILIDADES
 # =========================
 def now_iso():
-    # Guardamos UTC naive ISO (sin tz). Luego to_chile_display lo convierte a hora Chile.
-    return datetime.utcnow().isoformat(timespec="seconds")
+    """ISO timestamp in Chile time (America/Santiago) with UTC offset."""
+    if CL_TZ is not None:
+        return datetime.now(CL_TZ).isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="seconds")
 
 
 
@@ -95,16 +97,20 @@ def split_title_ubc(title: str):
     return t, ubc
 
 def to_chile_display(iso_str: str) -> str:
-    """Convierte ISO guardado (asumido UTC server) a hora Chile para mostrar."""
+    """Muestra timestamps en hora Chile.
+
+    - Si el ISO trae zona/offset, se convierte a America/Santiago.
+    - Si es naive (sin zona), se muestra tal cual (asumido ya en hora Chile).
+    """
     if not iso_str:
         return ""
     try:
         dt = datetime.fromisoformat(str(iso_str))
-        if CL_TZ is None or UTC_TZ is None:
+        if CL_TZ is None:
             return dt.strftime("%Y-%m-%d %H:%M:%S")
-        dt_utc = dt.replace(tzinfo=UTC_TZ)
-        dt_cl = dt_utc.astimezone(CL_TZ)
-        return dt_cl.strftime("%Y-%m-%d %H:%M:%S")
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(CL_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(iso_str)
 
@@ -1767,7 +1773,7 @@ def page_picking():
             st.rerun()
 
     with col4:
-        if st.button("Surtido en venta"):
+        if st.button("Siguiente producto"):
             # Siempre manda este SKU al final de la fila (rotación circular).
             # Implementación: defer_rank = (máximo defer_rank en esta OT) + 1
             try:
@@ -2227,7 +2233,7 @@ def page_full_upload(inv_map_sku: dict):
         return
 
     # Nombre de lote automático (no se muestra)
-    batch_name = f"FULL_{datetime.now().strftime('%Y-%m-%d_%H%M')}"
+    batch_name = f"FULL_{(datetime.now(CL_TZ) if CL_TZ else datetime.now()).strftime('%Y-%m-%d_%H%M')}"
 
     file = st.file_uploader("Excel de preparación Full (xlsx)", type=["xlsx"], key="full_excel")
     if not file:
@@ -2800,8 +2806,6 @@ def page_admin():
 # SORTING (CAMARERO)
 # =========================
 
-def now_iso():
-    return datetime.now(CL_TZ).isoformat() if CL_TZ else datetime.now().isoformat()
 
 def get_active_sorting_manifest():
     conn = get_conn()
@@ -3105,8 +3109,10 @@ def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_
 
 
 def _s2_now_iso():
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+    # Timestamp en hora Chile con offset
+    if CL_TZ is not None:
+        return datetime.now(CL_TZ).isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="seconds")
 
 def _s2_create_tables():
     conn = get_conn()
@@ -4304,94 +4310,8 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     else:
         st.info("No hay ventas asignadas a mesas todavía.")
 
-    # Ventas pendientes con progreso por ítems
-    pend = c.execute(
-        "SELECT sale_id, mesa, shipment_id, status FROM s2_sales "
-        "WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, sale_id LIMIT 100;",
-        (mid,)
-    ).fetchall()
-
-    if pend:
-        pend_data = []
-        for sale_id, mesa, shipment_id, status in pend:
-            it = c.execute(
-                "SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) "
-                "FROM s2_items WHERE manifest_id=? AND sale_id=?;",
-                (mid, sale_id)
-            ).fetchone()
-            total = int(it[0] or 0)
-            done = int(it[1] or 0)
-            pend_data.append({
-                "Venta": str(sale_id),
-                "Mesa": int(mesa or 0),
-                "Envío": str(shipment_id or ""),
-                "Estado": str(status),
-                "Items": f"{done}/{total}",
-            })
-        st.dataframe(pend_data, use_container_width=True)
-    else:
-        st.success("No hay ventas pendientes: todo está cerrado.")
-
-    # conn.close()  # moved to end (avoid closed cursor)
-
-
-    st.subheader("Estado del manifiesto activo")
-    colA, colB, colC, colD = st.columns(4)
-    colA.metric("Manifiesto ID", mid)
-    colB.metric("Ventas (Control)", stats["ventas"])
-    colC.metric("Items", stats["items"])
-    colD.metric("Etiquetas", stats["etiquetas"])
-
-    if f:
-        control_name, labels_name, updated_at = f
-        st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
-    else:
-        st.caption("Aún no se han cargado archivos para este manifiesto.")
-
-    with st.expander("Conciliación ventas ↔ etiquetas", expanded=False):
-        st.write(
-            {
-                "Envíos únicos (labels)": stats["distinct_ship_labels"],
-                "Ventas con Pack ID": stats["ventas_with_pack"],
-                "Packs distintos (Control)": stats["distinct_packs"],
-                "Etiquetas con Pack ID": stats["labels_with_pack"],
-                "Etiquetas con Venta": stats["labels_with_sale"],
-                "Ventas matcheadas por Pack": stats["matched_by_pack"],
-                "Ventas sin Envío asignado": stats["missing_ship"],
-            }
-        )
-
-        # Top 20 ventas sin envío para diagnóstico rápido
-        missing = c.execute(
-            "SELECT sale_id, page_no, pack_id FROM s2_sales WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') ORDER BY page_no, sale_id LIMIT 20",
-            (mid,),
-        ).fetchall()
-        if missing:
-            st.warning("Ejemplos de ventas sin envío asignado (primeras 20):")
-            st.table([{"venta": a, "pagina": b, "pack_id": cpid or ""} for (a, b, cpid) in missing])
-
     st.divider()
-    st.subheader("Acciones")
-    st.caption("🔒 Bloqueo duro: para cargar un nuevo manifiesto debes **Cerrar** o **Reiniciar** el manifiesto activo.")
-
-    close_ok = (int(stats.get("sales_total", 0) or 0) > 0 and int(stats.get("sales_pending", 0) or 0) == 0 and int(stats.get("items_pending", 0) or 0) == 0)
-    btn_close = st.button("✅ Cerrar manifiesto (habilitar nuevo)", disabled=not close_ok)
-    if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
-        st.info("Para cerrar el manifiesto: todas las **ventas** deben estar cerradas y no deben quedar **ítems pendientes**. Si necesitas cargar otro manifiesto sin terminar, usa **Reiniciar** (borra todo).")
-
-    if btn_close:
-        _s2_close_manifest(mid)
-        new_mid = _s2_create_new_manifest()
-        # limpiar session del módulo (incluye uploaders)
-        for k in list(st.session_state.keys()):
-            if k.startswith("s2_") or "sorting" in k:
-                del st.session_state[k]
-        st.success(f"Manifiesto {mid} cerrado. Nuevo manifiesto activo: {new_mid}")
-        st.rerun()
-
-
-    st.divider()
-    st.subheader("Incidencias y Sin EAN")
+    st.subheader("Incidencias")
 
     inc_rows = c.execute(
         """SELECT s.sale_id, s.mesa, s.shipment_id,
@@ -4483,6 +4403,95 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
                 del st.session_state[k]
         st.success("Sorting reiniciado completamente.")
         st.rerun()
+
+    # Ventas pendientes con progreso por ítems
+    pend = c.execute(
+        "SELECT sale_id, mesa, shipment_id, status FROM s2_sales "
+        "WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, sale_id LIMIT 100;",
+        (mid,)
+    ).fetchall()
+
+    if pend:
+        pend_data = []
+        for sale_id, mesa, shipment_id, status in pend:
+            it = c.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN status IN ('DONE','INCIDENCE') THEN 1 ELSE 0 END) "
+                "FROM s2_items WHERE manifest_id=? AND sale_id=?;",
+                (mid, sale_id)
+            ).fetchone()
+            total = int(it[0] or 0)
+            done = int(it[1] or 0)
+            pend_data.append({
+                "Venta": str(sale_id),
+                "Mesa": int(mesa or 0),
+                "Envío": str(shipment_id or ""),
+                "Estado": str(status),
+                "Items": f"{done}/{total}",
+            })
+        st.dataframe(pend_data, use_container_width=True)
+    else:
+        st.success("No hay ventas pendientes: todo está cerrado.")
+
+    # conn.close()  # moved to end (avoid closed cursor)
+
+
+    st.subheader("Estado del manifiesto activo")
+    colA, colB, colC, colD = st.columns(4)
+    colA.metric("Manifiesto ID", mid)
+    colB.metric("Ventas (Control)", stats["ventas"])
+    colC.metric("Items", stats["items"])
+    colD.metric("Etiquetas", stats["etiquetas"])
+
+    if f:
+        control_name, labels_name, updated_at = f
+        st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
+    else:
+        st.caption("Aún no se han cargado archivos para este manifiesto.")
+
+    with st.expander("Conciliación ventas ↔ etiquetas", expanded=False):
+        st.write(
+            {
+                "Envíos únicos (labels)": stats["distinct_ship_labels"],
+                "Ventas con Pack ID": stats["ventas_with_pack"],
+                "Packs distintos (Control)": stats["distinct_packs"],
+                "Etiquetas con Pack ID": stats["labels_with_pack"],
+                "Etiquetas con Venta": stats["labels_with_sale"],
+                "Ventas matcheadas por Pack": stats["matched_by_pack"],
+                "Ventas sin Envío asignado": stats["missing_ship"],
+            }
+        )
+
+        # Top 20 ventas sin envío para diagnóstico rápido
+        missing = c.execute(
+            "SELECT sale_id, page_no, pack_id FROM s2_sales WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') ORDER BY page_no, sale_id LIMIT 20",
+            (mid,),
+        ).fetchall()
+        if missing:
+            st.warning("Ejemplos de ventas sin envío asignado (primeras 20):")
+            st.table([{"venta": a, "pagina": b, "pack_id": cpid or ""} for (a, b, cpid) in missing])
+
+    st.divider()
+    st.subheader("Acciones")
+    st.caption("🔒 Bloqueo duro: para cargar un nuevo manifiesto debes **Cerrar** o **Reiniciar** el manifiesto activo.")
+
+    close_ok = (int(stats.get("sales_total", 0) or 0) > 0 and int(stats.get("sales_pending", 0) or 0) == 0 and int(stats.get("items_pending", 0) or 0) == 0)
+    btn_close = st.button("✅ Cerrar manifiesto (habilitar nuevo)", disabled=not close_ok)
+    if not close_ok and int(stats.get("sales_total", 0) or 0) > 0:
+        st.info("Para cerrar el manifiesto: todas las **ventas** deben estar cerradas y no deben quedar **ítems pendientes**. Si necesitas cargar otro manifiesto sin terminar, usa **Reiniciar** (borra todo).")
+
+    if btn_close:
+        _s2_close_manifest(mid)
+        new_mid = _s2_create_new_manifest()
+        # limpiar session del módulo (incluye uploaders)
+        for k in list(st.session_state.keys()):
+            if k.startswith("s2_") or "sorting" in k:
+                del st.session_state[k]
+        st.success(f"Manifiesto {mid} cerrado. Nuevo manifiesto activo: {new_mid}")
+        st.rerun()
+
+
+
+
 def get_next_run_for_mesa(mesa: int):
     conn = get_conn()
     c = conn.cursor()
