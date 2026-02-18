@@ -526,27 +526,6 @@ def init_db():
     );
     """)
 
-    # --- CONTADOR DE PAQUETES (Flex/Colecta) ---
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS pkg_counter_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT,               -- FLEX / COLECTA
-    status TEXT DEFAULT 'OPEN',
-    created_at TEXT,
-    closed_at TEXT
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS pkg_counter_scans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER,
-    label_key TEXT,
-    raw TEXT,
-    scanned_at TEXT,
-    UNIQUE(run_id, label_key)
-    );
-    """)
-
     # --- FULL: Acopio ---
     c.execute("""
     CREATE TABLE IF NOT EXISTS full_batches (
@@ -714,6 +693,50 @@ def init_db():
     except Exception:
         pass
 
+    
+    # --- DESPACHO (control de salida) ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS dispatch_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT,                 -- FLEX / COLECTA
+    name TEXT,
+    status TEXT DEFAULT 'OPEN',
+    created_at TEXT,
+    closed_at TEXT
+    );
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS dispatch_expected (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER,
+    shipment_id TEXT,
+    source TEXT,               -- PDF / LABELS
+    UNIQUE(batch_id, shipment_id)
+    );
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS dispatch_label_map (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER,
+    shipment_id TEXT,
+    venta TEXT,
+    pack_id TEXT,
+    raw_hint TEXT,
+    UNIQUE(batch_id, shipment_id)
+    );
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS dispatch_scans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER,
+    shipment_id TEXT,
+    raw TEXT,
+    status TEXT,               -- OK / EXTRA / WRONG_TYPE
+    scanned_at TEXT,
+    UNIQUE(batch_id, shipment_id)
+    );
+    """)
+    
     conn.commit()
     conn.close()
 
@@ -1369,6 +1392,7 @@ def page_app_lobby():
         st.markdown("</div>", unsafe_allow_html=True)
         st.caption("Camarero por mesa/página (1 página = 1 mesa).")
 
+
     with colC:
         st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
         if st.button("🏷️ Preparación productos Full", key="mode_full"):
@@ -1377,14 +1401,19 @@ def page_app_lobby():
         st.markdown("</div>", unsafe_allow_html=True)
         st.caption("Control de acopio Full (escaneo + chequeo vs Excel).")
 
+    # Segunda fila de módulos
+    colD, colE, colF = st.columns(3)
+    with colD:
+        st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
+        if st.button("🚚 Despacho", key="mode_dispatch"):
+            st.session_state.app_mode = "DISPATCH"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.caption("Control de salida: carga control + etiquetas, escanea y revisa pendientes.")
+
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
-    if st.button("🧮 Contador de paquetes", key="mode_pkg_counter"):
-        st.session_state.app_mode = "PKG_COUNT"
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.caption("Escanea etiquetas y cuenta paquetes; evita duplicados.")
+
 def page_import(inv_map_sku: dict):
     st.header("Importar ventas")
     # Bloqueo duro: no permitir cargar otra tanda si hay una en curso
@@ -4611,77 +4640,209 @@ def maybe_close_manifest_if_done():
 
 
 
-# =========================
-# CONTADOR DE PAQUETES (Flex/Colecta)
-# =========================
-def _pkg_norm_label(raw: str) -> str:
-    r = str(raw or "").strip()
-    d = only_digits(r)
-    return d if d else r
 
-def _pkg_get_open_run(kind: str):
+# =========================
+# DESPACHO (control de salida)
+# =========================
+
+def _dsp_detect_kind_from_scan(raw: str) -> str:
+    s = str(raw or "").strip()
+    if s.startswith("{") and "\"hash_code\"" in s:
+        return "FLEX"
+    if re.fullmatch(r"\d+", s or ""):
+        return "COLECTA"
+    return "UNKNOWN"
+
+def _dsp_extract_shipment_id(raw: str, kind: str) -> str:
+    s = str(raw or "").strip()
+    if kind == "FLEX" and s.startswith("{"):
+        try:
+            import json
+            obj = json.loads(s)
+            return only_digits(obj.get("id", "")) or ""
+        except Exception:
+            return ""
+    return only_digits(s) or ""
+
+def _dsp_parse_labels_zpl(text: str):
+    """
+    Extrae shipment_id + Venta/Pack ID desde texto ZPL.
+    Devuelve dict shipment_id -> {"venta":..., "pack_id":..., "raw_hint":...}
+    """
+    t = str(text or "")
+    chunks = re.split(r"\^XZ", t)
+    out = {}
+    for ch in chunks:
+        if not ch.strip():
+            continue
+
+        ship = ""
+        m = re.search(r"\^FD>:\s*([0-9]{8,20})", ch)
+        if m:
+            ship = m.group(1)
+        if not ship:
+            m = re.search(r"\"id\"\s*:\s*\"([0-9]{8,20})\"", ch)
+            if m:
+                ship = m.group(1)
+        if not ship:
+            continue
+
+        venta = ""
+        pack_id = ""
+
+        mv = re.search(r"Venta:\s*([0-9]{6,25})", ch)
+        if mv:
+            venta = mv.group(1)
+
+        mp = re.search(r"Pack ID:\s*([0-9]{6,25})", ch)
+        if mp:
+            pack_id = mp.group(1)
+
+        # hint: primera línea ^FD...^FS (corta)
+        raw_hint = ""
+        mh = re.search(r"\^FD([^\^]{0,60})\^FS", ch)
+        if mh:
+            raw_hint = mh.group(1).strip()
+
+        out[str(ship)] = {"venta": venta, "pack_id": pack_id, "raw_hint": raw_hint}
+    return out
+
+def _dsp_parse_control_pdf_shipments(pdf_file) -> list:
+    """Extrae shipment_id (10-14 dígitos) desde PDF control (típicamente FLEX)."""
+    if not HAS_PDF_LIB:
+        return []
+    try:
+        ships = []
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text() or ""
+                for m in re.finditer(r"\b([0-9]{10,14})\b", txt):
+                    ships.append(m.group(1))
+        seen = set()
+        out = []
+        for s in ships:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+    except Exception:
+        return []
+
+def _dsp_get_open_batch(kind: str):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "SELECT id, created_at FROM pkg_counter_runs WHERE kind=? AND status='OPEN' ORDER BY id DESC LIMIT 1;",
-        (str(kind),),
-    )
+    c.execute("SELECT id, name, created_at FROM dispatch_batches WHERE kind=? AND status='OPEN' ORDER BY id DESC LIMIT 1;", (str(kind),))
     row = c.fetchone()
     conn.close()
     if not row:
         return None
-    return {"id": int(row[0]), "created_at": row[1]}
+    return {"id": int(row[0]), "name": row[1] or "", "created_at": row[2] or ""}
 
-def _pkg_create_run(kind: str) -> int:
+def _dsp_create_batch(kind: str, name: str):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO pkg_counter_runs (kind, status, created_at) VALUES (?, 'OPEN', ?);",
-        (str(kind), now_iso()),
-    )
-    rid = int(c.lastrowid)
+    c.execute("INSERT INTO dispatch_batches (kind, name, status, created_at) VALUES (?, ?, 'OPEN', ?);", (str(kind), str(name or ""), now_iso()))
+    bid = c.lastrowid
     conn.commit()
     conn.close()
-    return rid
+    return int(bid)
 
-def _pkg_close_run(run_id: int):
+def _dsp_close_batch(batch_id: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE pkg_counter_runs SET status='DONE', closed_at=? WHERE id=?;", (now_iso(), int(run_id)))
+    c.execute("UPDATE dispatch_batches SET status='CLOSED', closed_at=? WHERE id=?;", (now_iso(), int(batch_id)))
     conn.commit()
     conn.close()
 
-def _pkg_run_count(run_id: int) -> int:
+def _dsp_clear_batch(batch_id: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT COUNT(1) FROM pkg_counter_scans WHERE run_id=?;", (int(run_id),))
-    n = int(c.fetchone()[0] or 0)
+    c.execute("DELETE FROM dispatch_expected WHERE batch_id=?;", (int(batch_id),))
+    c.execute("DELETE FROM dispatch_label_map WHERE batch_id=?;", (int(batch_id),))
+    c.execute("DELETE FROM dispatch_scans WHERE batch_id=?;", (int(batch_id),))
+    conn.commit()
     conn.close()
-    return n
 
-def _pkg_last_scans(run_id: int, limit: int = 15):
+def _dsp_upsert_expected(batch_id: int, shipment_ids: list, source: str):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "SELECT label_key, scanned_at FROM pkg_counter_scans WHERE run_id=? ORDER BY id DESC LIMIT ?;",
-        (int(run_id), int(limit)),
-    )
+    for sid in shipment_ids or []:
+        sid = only_digits(sid)
+        if not sid:
+            continue
+        c.execute("INSERT OR IGNORE INTO dispatch_expected (batch_id, shipment_id, source) VALUES (?, ?, ?);", (int(batch_id), sid, str(source)))
+    conn.commit()
+    conn.close()
+
+def _dsp_upsert_label_map(batch_id: int, mapping: dict):
+    conn = get_conn()
+    c = conn.cursor()
+    for sid, info in (mapping or {}).items():
+        sid = only_digits(sid)
+        if not sid:
+            continue
+        venta = str(info.get("venta") or "")
+        pack_id = str(info.get("pack_id") or "")
+        raw_hint = str(info.get("raw_hint") or "")
+        c.execute(
+            "INSERT OR REPLACE INTO dispatch_label_map (batch_id, shipment_id, venta, pack_id, raw_hint) VALUES (?, ?, ?, ?, ?);",
+            (int(batch_id), sid, venta, pack_id, raw_hint),
+        )
+    conn.commit()
+    conn.close()
+
+def _dsp_get_map_for(batch_id: int, shipment_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT venta, pack_id, raw_hint FROM dispatch_label_map WHERE batch_id=? AND shipment_id=? LIMIT 1;", (int(batch_id), str(shipment_id)))
+    r = c.fetchone()
+    conn.close()
+    if not r:
+        return {"venta": "", "pack_id": "", "raw_hint": ""}
+    return {"venta": r[0] or "", "pack_id": r[1] or "", "raw_hint": r[2] or ""}
+
+def _dsp_expected_set(batch_id: int) -> set:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT shipment_id FROM dispatch_expected WHERE batch_id=?;", (int(batch_id),))
+    s = {str(r[0]) for r in c.fetchall() if r and r[0]}
+    conn.close()
+    return s
+
+def _dsp_counts(batch_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(1) FROM dispatch_expected WHERE batch_id=?;", (int(batch_id),))
+    total_expected = int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(1) FROM dispatch_scans WHERE batch_id=? AND status='OK';", (int(batch_id),))
+    ok = int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(1) FROM dispatch_scans WHERE batch_id=? AND status='EXTRA';", (int(batch_id),))
+    extra = int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(1) FROM dispatch_scans WHERE batch_id=? AND status='WRONG_TYPE';", (int(batch_id),))
+    wrong = int(c.fetchone()[0] or 0)
+    conn.close()
+    pending = max(total_expected - ok, 0)
+    return total_expected, ok, pending, extra, wrong
+
+def _dsp_last_scans(batch_id: int, limit: int = 20):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT shipment_id, status, scanned_at FROM dispatch_scans WHERE batch_id=? ORDER BY id DESC LIMIT ?;", (int(batch_id), int(limit)))
     rows = c.fetchall()
     conn.close()
-    return rows
+    return rows or []
 
-def _pkg_register_scan(run_id: int, label_key: str, raw: str):
+def _dsp_register_scan(batch_id: int, shipment_id: str, raw: str, status: str):
     conn = get_conn()
     c = conn.cursor()
     try:
         c.execute(
-            "INSERT INTO pkg_counter_scans (run_id, label_key, raw, scanned_at) VALUES (?, ?, ?, ?);",
-            (int(run_id), str(label_key), str(raw or ""), now_iso()),
+            "INSERT INTO dispatch_scans (batch_id, shipment_id, raw, status, scanned_at) VALUES (?, ?, ?, ?, ?);",
+            (int(batch_id), str(shipment_id), str(raw or ""), str(status), now_iso()),
         )
         conn.commit()
         return True, None
     except Exception as e:
-        # SQLite lanza error por UNIQUE(run_id,label_key) => repetido
         msg = str(e).lower()
         if "unique" in msg or "constraint" in msg:
             return False, "DUP"
@@ -4689,163 +4850,260 @@ def _pkg_register_scan(run_id: int, label_key: str, raw: str):
     finally:
         conn.close()
 
-def _pkg_reset_kind(kind: str):
-    """Borra historial COMPLETO de ese tipo (Flex/Colecta): runs + scans."""
-    conn = get_conn()
-    c = conn.cursor()
-    # obtener runs
-    c.execute("SELECT id FROM pkg_counter_runs WHERE kind=?;", (str(kind),))
-    rids = [int(r[0]) for r in c.fetchall()]
-    if rids:
-        qmarks = ",".join(["?"] * len(rids))
-        c.execute(f"DELETE FROM pkg_counter_scans WHERE run_id IN ({qmarks});", tuple(rids))
-    c.execute("DELETE FROM pkg_counter_runs WHERE kind=?;", (str(kind),))
-    conn.commit()
-    conn.close()
+def page_dispatch_ops():
+    st.header("🚚 Despacho")
+    st.caption("Escanea etiquetas. Muestra venta asociada y progreso del despacho.")
 
-def page_pkg_counter():
-    st.header("🧮 Contador de paquetes")
+    if "dispatch_kind" not in st.session_state:
+        st.session_state["dispatch_kind"] = "FLEX"
+    kind = st.radio("Tipo", options=["FLEX", "COLECTA"], horizontal=True, key="dispatch_kind")
 
-    # Selección manual (opción A): FLEX vs COLECTA
-    # - FLEX: el lector entrega JSON con hash_code
-    # - COLECTA: el lector entrega solo dígitos (shipment_id)
-    if "pkg_kind" not in st.session_state:
-        st.session_state["pkg_kind"] = "FLEX"
+    batch = _dsp_get_open_batch(kind)
 
-    st.radio(
-        "Tipo",
-        options=["FLEX", "COLECTA"],
-        horizontal=True,
-        key="pkg_kind",
-    )
+    with st.expander("📥 Carga de control y etiquetas", expanded=(batch is None)):
+        name = st.text_input("Nombre del despacho (opcional)", value="", key=f"dispatch_name_{kind}")
+        control_pdf = st.file_uploader("PDF Control", type=["pdf"], key=f"dispatch_control_{kind}")
+        labels_file = st.file_uploader("Archivo de etiquetas (txt / zpl)", type=["txt"], key=f"dispatch_labels_{kind}")
 
-    def _scan_detect_kind(raw: str) -> str:
-        s = str(raw or "").strip()
-        if s.startswith("{") and "\"hash_code\"" in s:
-            return "FLEX"
-        if re.fullmatch(r"\d+", s or ""):
-            return "COLECTA"
-        return "UNKNOWN"
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Crear / Reemplazar despacho", use_container_width=True, key=f"dispatch_create_{kind}"):
+                if batch:
+                    bid = int(batch["id"])
+                    _dsp_clear_batch(bid)
+                else:
+                    bid = _dsp_create_batch(kind, name.strip() or f"{kind} {now_iso()}")
 
-    def _scan_extract_label_key(raw: str, kind: str) -> str:
-        s = str(raw or "").strip()
-        if kind == "FLEX" and s.startswith("{"):
-            try:
-                import json
-                obj = json.loads(s)
-                val = obj.get("id", "")
-                return only_digits(val) or _pkg_norm_label(s)
-            except Exception:
-                return _pkg_norm_label(s)
-        # COLECTA: número puro
-        return only_digits(s) or _pkg_norm_label(s)
+                mapping = {}
+                if labels_file:
+                    txt = labels_file.read().decode("utf-8", errors="ignore")
+                    mapping = _dsp_parse_labels_zpl(txt)
+                    _dsp_upsert_label_map(bid, mapping)
+                    _dsp_upsert_expected(bid, list(mapping.keys()), "LABELS")
 
-    def ensure_run(kind: str) -> dict:
-        run = _pkg_get_open_run(kind)
-        if not run:
-            rid = _pkg_create_run(kind)
-            run = {"id": rid, "created_at": now_iso()}
-        return run
+                # Si el PDF trae envíos (típico Flex), también lo guardamos para contraste/validación.
+                if control_pdf:
+                    pdf_ships = _dsp_parse_control_pdf_shipments(control_pdf)
+                    if pdf_ships:
+                        _dsp_upsert_expected(bid, pdf_ships, "PDF")
 
-    # Reinicio sin confirmación (debe ocurrir ANTES de crear el widget de input)
-    reset_kind = st.session_state.pop("pkg_reset_trigger_kind", None)
-    if reset_kind:
-        _pkg_reset_kind(str(reset_kind))
-        _ = _pkg_create_run(str(reset_kind))
+                st.rerun()
+        with col2:
+            if batch and st.button("Cerrar despacho", use_container_width=True, key=f"dispatch_close_{kind}"):
+                _dsp_close_batch(int(batch["id"]))
+                st.rerun()
+
+    batch = _dsp_get_open_batch(kind)
+    if not batch:
+        st.info("Crea un despacho para comenzar.")
+        return
+
+    batch_id = int(batch["id"])
+    total_expected, ok, pending, extra, wrong = _dsp_counts(batch_id)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total esperado", total_expected)
+    c2.metric("✅ OK", ok)
+    c3.metric("Pendientes", pending)
+    c4.metric("⚠ EXTRA", extra)
+    c5.metric("❌ WRONG_TYPE", wrong)
+
+    # flash
+    if "dispatch_flash" in st.session_state:
+        k, msg = st.session_state.get("dispatch_flash", ("info", ""))
+        if msg:
+            if k == "ok":
+                st.success(msg)
+            elif k == "warn":
+                st.warning(msg)
+            else:
+                st.error(msg)
+        st.session_state.pop("dispatch_flash", None)
+
+    # reiniciar escaneo (solo scans)
+    if st.button("🔄 Reiniciar escaneo", use_container_width=True, key=f"dispatch_reset_{kind}"):
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM dispatch_scans WHERE batch_id=?;", (batch_id,))
+        conn.commit()
+        conn.close()
         try:
-            if "pkg_scan_input" in st.session_state:
-                del st.session_state["pkg_scan_input"]
+            if "dispatch_scan_input" in st.session_state:
+                del st.session_state["dispatch_scan_input"]
         except Exception:
             pass
         st.rerun()
+
+    expected = _dsp_expected_set(batch_id)
 
     def handle_scan(input_key: str):
         raw = str(st.session_state.get(input_key, "") or "").strip()
         if not raw:
             return
 
-        selected_kind = str(st.session_state.get("pkg_kind") or "FLEX")
-        detected = _scan_detect_kind(raw)
+        detected = _dsp_detect_kind_from_scan(raw)
+        if detected != kind:
+            # registramos como WRONG_TYPE con un id sintético para no chocar UNIQUE
+            sid = hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+            _dsp_register_scan(batch_id, sid, raw, "WRONG_TYPE")
+            st.session_state["dispatch_flash"] = ("err", "❌ WRONG_TYPE")
+            st.session_state[input_key] = ""
+            st.rerun()
 
-        if detected == "UNKNOWN":
-            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
+        shipment_id = _dsp_extract_shipment_id(raw, kind)
+        if not shipment_id:
+            st.session_state["dispatch_flash"] = ("err", "Etiqueta inválida.")
             st.session_state[input_key] = ""
             return
 
-        if detected != selected_kind:
-            st.session_state["pkg_flash"] = ("err", f"Etiqueta {detected}. Estás en {selected_kind}.")
-            st.session_state[input_key] = ""
-            return
+        status = "OK" if shipment_id in expected else "EXTRA"
+        ok_insert, err = _dsp_register_scan(batch_id, shipment_id, raw, status)
 
-        run = ensure_run(selected_kind)
-        run_id = int(run["id"])
-
-        label_key = _scan_extract_label_key(raw, selected_kind)
-        if not label_key:
-            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            st.session_state[input_key] = ""
-            return
-
-        ok, err = _pkg_register_scan(run_id, label_key, raw)
-        if ok:
-            st.session_state["pkg_flash"] = ("ok", "OK")
+        if not ok_insert and err == "DUP":
+            st.session_state["dispatch_flash"] = ("warn", "🔁 DUPLICADO")
         else:
-            if err == "DUP":
-                st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
+            if status == "OK":
+                mp = _dsp_get_map_for(batch_id, shipment_id)
+                venta = mp.get("venta") or ""
+                pack_id = mp.get("pack_id") or ""
+                if venta:
+                    st.session_state["dispatch_flash"] = ("ok", f"✅ OK — Venta {venta}")
+                elif pack_id:
+                    st.session_state["dispatch_flash"] = ("ok", f"✅ OK — Pack {pack_id}")
+                else:
+                    st.session_state["dispatch_flash"] = ("ok", "✅ OK")
             else:
-                st.session_state["pkg_flash"] = ("err", "Error al registrar")
+                st.session_state["dispatch_flash"] = ("warn", "⚠ EXTRA")
 
-        # dejar el campo en blanco para el siguiente escaneo
         st.session_state[input_key] = ""
+        st.rerun()
 
-    # asegura corrida activa del tipo seleccionado
-    KIND = str(st.session_state.get("pkg_kind") or "FLEX")
-    run = ensure_run(KIND)
-    run_id = int(run["id"])
-
-    # aviso minimalista (una vez)
-    if "pkg_flash" in st.session_state:
-        k, msg = st.session_state.get("pkg_flash", ("info", ""))
-        if msg:
-            if k == "ok":
-                st.success(msg)
-            elif k == "dup":
-                st.warning(msg)
-            else:
-                st.error(msg)
-        st.session_state.pop("pkg_flash", None)
-
-    total = _pkg_run_count(run_id)
-    st.metric("Paquetes contabilizados", total)
-
-    # Escaneo automático (sin botones)
-    input_key = "pkg_scan_input"
-    st.text_input(
-        "Escaneo (lector)",
-        key=input_key,
-        on_change=handle_scan,
-        args=(input_key,),
-    )
+    input_key = "dispatch_scan_input"
+    st.text_input("Escaneo (lector)", key=input_key, on_change=handle_scan, args=(input_key,))
     force_tel_keyboard("Escaneo (lector)")
     autofocus_input("Escaneo (lector)")
 
-    # Últimos escaneos
-    rows = _pkg_last_scans(run_id, 15)
+    rows = _dsp_last_scans(batch_id, 15)
     if rows:
-        df_last = pd.DataFrame(rows, columns=["Etiqueta", "Hora"])
-        df_last["Hora"] = df_last["Hora"].apply(to_chile_display)
-        st.dataframe(df_last, use_container_width=True, hide_index=True)
+        df = pd.DataFrame(rows, columns=["Envío", "Estado", "Hora"])
+        df["Hora"] = df["Hora"].apply(to_chile_display)
+        def _fmt(s):
+            if s == "OK":
+                return "✅ OK"
+            if s == "EXTRA":
+                return "⚠ EXTRA"
+            if s == "WRONG_TYPE":
+                return "❌ WRONG_TYPE"
+            return "🔁 DUPLICADO"
+        df["Estado"] = df["Estado"].apply(_fmt)
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        st.info("Aún no hay paquetes en esta corrida.")
+        st.info("Aún no hay escaneos.")
 
-    # Única acción
-    if st.button("🔄 Reiniciar corrida", use_container_width=True, key="pkg_reset_now"):
-        st.session_state["pkg_reset_trigger_kind"] = KIND
-        st.rerun()
+def page_dispatch_admin():
+    st.header("🚚 Despacho – Administrador")
+
+    kind = st.radio("Tipo", options=["FLEX", "COLECTA"], horizontal=True, key="dispatch_kind_admin")
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, name, status, created_at, closed_at FROM dispatch_batches WHERE kind=? ORDER BY id DESC LIMIT 25;", (str(kind),))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        st.info("No hay despachos registrados para este tipo.")
+        return
+
+    df_batches = pd.DataFrame(rows, columns=["ID", "Nombre", "Estado", "Creado", "Cerrado"])
+    df_batches["Creado"] = df_batches["Creado"].apply(to_chile_display)
+    df_batches["Cerrado"] = df_batches["Cerrado"].apply(to_chile_display)
+    st.dataframe(df_batches, use_container_width=True, hide_index=True)
+
+    batch_id = int(rows[0][0])
+
+    total_expected, ok, pending, extra, wrong = _dsp_counts(batch_id)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total esperado", total_expected)
+    c2.metric("✅ OK", ok)
+    c3.metric("Pendientes", pending)
+    c4.metric("⚠ EXTRA", extra)
+    c5.metric("❌ WRONG_TYPE", wrong)
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT e.shipment_id, m.venta, m.pack_id
+        FROM dispatch_expected e
+        LEFT JOIN dispatch_scans s
+          ON s.batch_id=e.batch_id AND s.shipment_id=e.shipment_id AND s.status='OK'
+        LEFT JOIN dispatch_label_map m
+          ON m.batch_id=e.batch_id AND m.shipment_id=e.shipment_id
+        WHERE e.batch_id=? AND s.id IS NULL
+        ORDER BY e.id;
+    """, (batch_id,))
+    pend = c.fetchall()
+
+    c.execute("""
+        SELECT s.shipment_id, s.status, s.scanned_at, m.venta, m.pack_id
+        FROM dispatch_scans s
+        LEFT JOIN dispatch_label_map m
+          ON m.batch_id=s.batch_id AND m.shipment_id=s.shipment_id
+        WHERE s.batch_id=? AND s.status='OK'
+        ORDER BY s.id DESC;
+    """, (batch_id,))
+    oks = c.fetchall()
+
+    c.execute("""
+        SELECT s.shipment_id, s.status, s.scanned_at
+        FROM dispatch_scans s
+        WHERE s.batch_id=? AND s.status='EXTRA'
+        ORDER BY s.id DESC;
+    """, (batch_id,))
+    extras = c.fetchall()
+
+    c.execute("""
+        SELECT s.shipment_id, s.status, s.scanned_at
+        FROM dispatch_scans s
+        WHERE s.batch_id=? AND s.status='WRONG_TYPE'
+        ORDER BY s.id DESC;
+    """, (batch_id,))
+    wrongs = c.fetchall()
+    conn.close()
+
+    tab1, tab2, tab3, tab4 = st.tabs(["Pendientes", "Despachados OK", "Extras", "Wrong type"])
+    with tab1:
+        if pend:
+            dfp = pd.DataFrame(pend, columns=["Envío", "Venta", "Pack ID"])
+            st.dataframe(dfp, use_container_width=True, hide_index=True)
+            st.download_button("Descargar pendientes (CSV)", dfp.to_csv(index=False).encode("utf-8"), file_name="pendientes.csv", mime="text/csv")
+        else:
+            st.success("No hay pendientes.")
+    with tab2:
+        if oks:
+            dfo = pd.DataFrame(oks, columns=["Envío", "Estado", "Hora", "Venta", "Pack ID"])
+            dfo["Hora"] = dfo["Hora"].apply(to_chile_display)
+            st.dataframe(dfo, use_container_width=True, hide_index=True)
+            st.download_button("Descargar OK (CSV)", dfo.to_csv(index=False).encode("utf-8"), file_name="ok.csv", mime="text/csv")
+        else:
+            st.info("Sin escaneos OK.")
+    with tab3:
+        if extras:
+            dfe = pd.DataFrame(extras, columns=["Envío", "Estado", "Hora"])
+            dfe["Hora"] = dfe["Hora"].apply(to_chile_display)
+            st.dataframe(dfe, use_container_width=True, hide_index=True)
+            st.download_button("Descargar extras (CSV)", dfe.to_csv(index=False).encode("utf-8"), file_name="extras.csv", mime="text/csv")
+        else:
+            st.info("Sin extras.")
+    with tab4:
+        if wrongs:
+            dfw = pd.DataFrame(wrongs, columns=["Envío", "Estado", "Hora"])
+            dfw["Hora"] = dfw["Hora"].apply(to_chile_display)
+            st.dataframe(dfw, use_container_width=True, hide_index=True)
+            st.download_button("Descargar wrong type (CSV)", dfw.to_csv(index=False).encode("utf-8"), file_name="wrong_type.csv", mime="text/csv")
+        else:
+            st.info("Sin wrong type.")
 
 
 def main():
-
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
     init_db()
 
@@ -4913,16 +5171,22 @@ def main():
         else:
             page_sorting_admin(inv_map_sku, barcode_to_sku)
 
+
+elif mode == "DISPATCH":
+    pages = [
+        "1) Operación (PDA)",
+        "2) Administrador",
+    ]
+    page = st.sidebar.radio("Menú", pages, index=0)
+
+    if page.startswith("1"):
+        page_dispatch_ops()
+    else:
+        page_dispatch_admin()
+
     # ==========
     # MODO FULL (nuevo módulo completo)
     # ==========
-    elif mode == "PKG_COUNT":
-        pages = [
-            "1) Contador de paquetes",
-        ]
-        _ = st.sidebar.radio("Menú", pages, index=0)
-        page_pkg_counter()
-
     else:
         pages = [
             "1) Cargar Excel Full",
