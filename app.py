@@ -1379,7 +1379,6 @@ def page_app_lobby():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.divider()
     st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
     if st.button("🧮 Contador de paquetes", key="mode_pkg_counter"):
         st.session_state.app_mode = "PKG_COUNT"
