@@ -4725,6 +4725,19 @@ def page_pkg_counter():
         run = ensure_run()
         run_id = int(run["id"])
 
+    # Reinicio sin confirmación (manejado antes de crear el widget para evitar StreamlitAPIException)
+    if st.session_state.pop("pkg_reset_trigger", False):
+        _pkg_reset_kind(KIND)
+        _ = _pkg_create_run(KIND)
+        # limpiar input del lector antes de renderizar el widget
+        try:
+            if "pkg_scan_input" in st.session_state:
+                del st.session_state["pkg_scan_input"]
+        except Exception:
+            pass
+        st.rerun()
+
+
         label_key = _pkg_norm_label(raw)
         if not label_key:
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
@@ -4784,9 +4797,7 @@ def page_pkg_counter():
 
     # Única acción
     if st.button("🔄 Reiniciar corrida", use_container_width=True, key="pkg_reset_now"):
-        _pkg_reset_kind(KIND)
-        _ = _pkg_create_run(KIND)
-        st.session_state[input_key] = ""
+        st.session_state["pkg_reset_trigger"] = True
         st.rerun()
 
 
