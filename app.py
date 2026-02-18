@@ -1381,7 +1381,7 @@ def page_app_lobby():
 
     st.divider()
     st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
-    if st.button("🧮 Contador de paquetes (Flex / Colecta)", key="mode_pkg_counter"):
+    if st.button("🧮 Contador de paquetes", key="mode_pkg_counter"):
         st.session_state.app_mode = "PKG_COUNT"
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
@@ -4706,31 +4706,50 @@ def _pkg_reset_kind(kind: str):
 
 def page_pkg_counter():
     st.header("🧮 Contador de paquetes")
+    st.caption("Escanea para contar. Si repites una etiqueta, se avisa y NO suma.")
 
-    kind_ui = st.radio("Tipo de envío", ["Flex", "Colecta"], horizontal=True)
-    kind = "FLEX" if kind_ui == "Flex" else "COLECTA"
+    KIND = "GENERAL"
 
-    # Run activo por tipo
-    run = _pkg_get_open_run(kind)
-    if not run:
-        rid = _pkg_create_run(kind)
-        run = {"id": rid, "created_at": now_iso()}
+    def ensure_run() -> dict:
+        run = _pkg_get_open_run(KIND)
+        if not run:
+            rid = _pkg_create_run(KIND)
+            run = {"id": rid, "created_at": now_iso()}
+        return run
 
+    def handle_scan(input_key: str):
+        raw = str(st.session_state.get(input_key, "") or "").strip()
+        if not raw:
+            return
+
+        run = ensure_run()
+        run_id = int(run["id"])
+
+        label_key = _pkg_norm_label(raw)
+        if not label_key:
+            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
+            st.session_state[input_key] = ""
+            return
+
+        ok, err = _pkg_register_scan(run_id, label_key, raw)
+        if ok:
+            st.session_state["pkg_flash"] = ("ok", "OK")
+        else:
+            if err == "DUP":
+                st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
+            else:
+                st.session_state["pkg_flash"] = ("err", "Error al registrar")
+
+        # dejar el campo en blanco para el siguiente escaneo
+        st.session_state[input_key] = ""
+
+    # asegura corrida activa
+    run = ensure_run()
     run_id = int(run["id"])
-    total = _pkg_run_count(run_id)
 
-    st.caption(f"Corrida activa: #{run_id} — creada: {to_chile_display(run.get('created_at',''))}")
-    col1, col2, col3 = st.columns([1, 1, 1])
-    col1.metric("Paquetes contabilizados", total)
-    col2.metric("Tipo", kind_ui)
-    col3.metric("Estado", "ACTIVA")
-
-    st.divider()
-
-    # Mensaje flash (para PDA, se ve 1 vez)
-    flash_key = f"pkg_flash_{kind}"
-    if flash_key in st.session_state:
-        k, msg = st.session_state.get(flash_key, ("info", ""))
+    # aviso minimalista (una vez)
+    if "pkg_flash" in st.session_state:
+        k, msg = st.session_state.get("pkg_flash", ("info", ""))
         if msg:
             if k == "ok":
                 st.success(msg)
@@ -4738,86 +4757,41 @@ def page_pkg_counter():
                 st.warning(msg)
             else:
                 st.error(msg)
-        st.session_state.pop(flash_key, None)
+        st.session_state.pop("pkg_flash", None)
 
-    # Input scan
-    nonce_key = f"pkg_nonce_{kind}"
-    if nonce_key not in st.session_state:
-        st.session_state[nonce_key] = 0
+    total = _pkg_run_count(run_id)
+    st.metric("Paquetes contabilizados", total)
 
-    scan_key = f"pkg_scan_{kind}_{st.session_state[nonce_key]}"
-    label = st.text_input("Etiqueta (escaneo)", key=scan_key)
-    force_tel_keyboard("Etiqueta (escaneo)")
-    autofocus_input("Etiqueta (escaneo)")
-
-    cA, cB = st.columns([2, 1])
-    with cA:
-        if st.button("➕ Registrar paquete", use_container_width=True, key=f"pkg_add_{kind}"):
-            raw = str(label or "").strip()
-            label_key = _pkg_norm_label(raw)
-
-            if not label_key:
-                st.session_state[flash_key] = ("err", "Ingresa/escanea una etiqueta válida.")
-                st.rerun()
-
-            ok, err = _pkg_register_scan(run_id, label_key, raw)
-            if ok:
-                st.session_state[flash_key] = ("ok", "✅ Paquete contabilizado.")
-            else:
-                if err == "DUP":
-                    st.session_state[flash_key] = ("dup", f"⚠️ Etiqueta repetida: {label_key}. No se contabiliza.")
-                else:
-                    st.session_state[flash_key] = ("err", f"No pude registrar: {err}")
-
-            st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
-            st.rerun()
-
-    with cB:
-        if st.button("🧹 Limpiar", use_container_width=True, key=f"pkg_clear_{kind}"):
-            st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
-            st.rerun()
-
-    st.divider()
+    # Escaneo automático (sin botones)
+    input_key = "pkg_scan_input"
+    st.text_input(
+        "Escaneo (lector)",
+        key=input_key,
+        on_change=handle_scan,
+        args=(input_key,),
+    )
+    force_tel_keyboard("Escaneo (lector)")
+    autofocus_input("Escaneo (lector)")
 
     # Últimos escaneos
-    st.subheader("Últimos escaneos")
     rows = _pkg_last_scans(run_id, 15)
-    if not rows:
-        st.info("Aún no hay paquetes contabilizados en esta corrida.")
+    if rows:
+        df_last = pd.DataFrame(rows, columns=["Etiqueta", "Hora"])
+        df_last["Hora"] = df_last["Hora"].apply(to_chile_display)
+        st.dataframe(df_last, use_container_width=True, hide_index=True)
     else:
-        st.dataframe(pd.DataFrame(rows, columns=["Etiqueta", "Hora"]).assign(Hora=lambda d: d["Hora"].apply(to_chile_display)))
+        st.info("Aún no hay paquetes en esta corrida.")
 
-    st.divider()
+    # Única acción
+    if st.button("🔄 Reiniciar corrida", use_container_width=True, key="pkg_reset_now"):
+        _pkg_reset_kind(KIND)
+        _ = _pkg_create_run(KIND)
+        st.session_state[input_key] = ""
+        st.rerun()
 
-    # Acciones
-    colX, colY = st.columns([1, 1])
-    with colX:
-        close_ok = total > 0
-        if st.button("✅ Cerrar corrida (iniciar nueva)", disabled=not close_ok, use_container_width=True, key=f"pkg_close_{kind}"):
-            _pkg_close_run(run_id)
-            _ = _pkg_create_run(kind)
-            st.success("Corrida cerrada. Nueva corrida creada.")
-            # limpiar inputs
-            st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
-            st.rerun()
-        if not close_ok:
-            st.caption("Cierra cuando ya tengas al menos 1 paquete contabilizado.")
-
-    with colY:
-        if f"pkg_reset_arm_{kind}" not in st.session_state:
-            st.session_state[f"pkg_reset_arm_{kind}"] = False
-        arm = st.checkbox("Quiero reiniciar (borra todo este tipo)", value=st.session_state[f"pkg_reset_arm_{kind}"], key=f"pkg_arm_{kind}")
-        st.session_state[f"pkg_reset_arm_{kind}"] = bool(arm)
-        txt = st.text_input("Escribe BORRAR para confirmar", value="", disabled=not arm, key=f"pkg_cf_{kind}")
-        if st.button("🗑️ Reiniciar", type="primary", disabled=not (arm and txt.strip().upper() == "BORRAR"), use_container_width=True, key=f"pkg_reset_{kind}"):
-            _pkg_reset_kind(kind)
-            st.success("Reiniciado. Corrida nueva creada.")
-            # asegurar nueva corrida
-            _ = _pkg_create_run(kind)
-            st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
-            st.rerun()
 
 def main():
+
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
     init_db()
 
