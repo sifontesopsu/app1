@@ -4705,30 +4705,53 @@ def _pkg_reset_kind(kind: str):
 
 def page_pkg_counter():
     st.header("🧮 Contador de paquetes")
-    st.caption("Escanea para contar. Si repites una etiqueta, se avisa y NO suma.")
 
-    KIND = "GENERAL"
+    # Selección manual (opción A): FLEX vs COLECTA
+    # - FLEX: el lector entrega JSON con hash_code
+    # - COLECTA: el lector entrega solo dígitos (shipment_id)
+    if "pkg_kind" not in st.session_state:
+        st.session_state["pkg_kind"] = "FLEX"
 
-    def ensure_run() -> dict:
-        run = _pkg_get_open_run(KIND)
+    st.radio(
+        "Tipo",
+        options=["FLEX", "COLECTA"],
+        horizontal=True,
+        key="pkg_kind",
+    )
+
+    def _scan_detect_kind(raw: str) -> str:
+        s = str(raw or "").strip()
+        if s.startswith("{") and "\"hash_code\"" in s:
+            return "FLEX"
+        if re.fullmatch(r"\d+", s or ""):
+            return "COLECTA"
+        return "UNKNOWN"
+
+    def _scan_extract_label_key(raw: str, kind: str) -> str:
+        s = str(raw or "").strip()
+        if kind == "FLEX" and s.startswith("{"):
+            try:
+                import json
+                obj = json.loads(s)
+                val = obj.get("id", "")
+                return only_digits(val) or _pkg_norm_label(s)
+            except Exception:
+                return _pkg_norm_label(s)
+        # COLECTA: número puro
+        return only_digits(s) or _pkg_norm_label(s)
+
+    def ensure_run(kind: str) -> dict:
+        run = _pkg_get_open_run(kind)
         if not run:
-            rid = _pkg_create_run(KIND)
+            rid = _pkg_create_run(kind)
             run = {"id": rid, "created_at": now_iso()}
         return run
 
-    def handle_scan(input_key: str):
-        raw = str(st.session_state.get(input_key, "") or "").strip()
-        if not raw:
-            return
-
-        run = ensure_run()
-        run_id = int(run["id"])
-
-    # Reinicio sin confirmación (manejado antes de crear el widget para evitar StreamlitAPIException)
-    if st.session_state.pop("pkg_reset_trigger", False):
-        _pkg_reset_kind(KIND)
-        _ = _pkg_create_run(KIND)
-        # limpiar input del lector antes de renderizar el widget
+    # Reinicio sin confirmación (debe ocurrir ANTES de crear el widget de input)
+    reset_kind = st.session_state.pop("pkg_reset_trigger_kind", None)
+    if reset_kind:
+        _pkg_reset_kind(str(reset_kind))
+        _ = _pkg_create_run(str(reset_kind))
         try:
             if "pkg_scan_input" in st.session_state:
                 del st.session_state["pkg_scan_input"]
@@ -4736,8 +4759,28 @@ def page_pkg_counter():
             pass
         st.rerun()
 
+    def handle_scan(input_key: str):
+        raw = str(st.session_state.get(input_key, "") or "").strip()
+        if not raw:
+            return
 
-        label_key = _pkg_norm_label(raw)
+        selected_kind = str(st.session_state.get("pkg_kind") or "FLEX")
+        detected = _scan_detect_kind(raw)
+
+        if detected == "UNKNOWN":
+            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
+            st.session_state[input_key] = ""
+            return
+
+        if detected != selected_kind:
+            st.session_state["pkg_flash"] = ("err", f"Etiqueta {detected}. Estás en {selected_kind}.")
+            st.session_state[input_key] = ""
+            return
+
+        run = ensure_run(selected_kind)
+        run_id = int(run["id"])
+
+        label_key = _scan_extract_label_key(raw, selected_kind)
         if not label_key:
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
             st.session_state[input_key] = ""
@@ -4755,8 +4798,9 @@ def page_pkg_counter():
         # dejar el campo en blanco para el siguiente escaneo
         st.session_state[input_key] = ""
 
-    # asegura corrida activa
-    run = ensure_run()
+    # asegura corrida activa del tipo seleccionado
+    KIND = str(st.session_state.get("pkg_kind") or "FLEX")
+    run = ensure_run(KIND)
     run_id = int(run["id"])
 
     # aviso minimalista (una vez)
@@ -4796,7 +4840,7 @@ def page_pkg_counter():
 
     # Única acción
     if st.button("🔄 Reiniciar corrida", use_container_width=True, key="pkg_reset_now"):
-        st.session_state["pkg_reset_trigger"] = True
+        st.session_state["pkg_reset_trigger_kind"] = KIND
         st.rerun()
 
 
