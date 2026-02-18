@@ -5171,23 +5171,19 @@ def main():
         else:
             page_sorting_admin(inv_map_sku, barcode_to_sku)
 
+    elif mode == "DISPATCH":
+        pages = [
+            "1) Operación (PDA)",
+            "2) Administrador",
+        ]
+        page = st.sidebar.radio("Menú", pages, index=0)
 
-elif mode == "DISPATCH":
-    pages = [
-        "1) Operación (PDA)",
-        "2) Administrador",
-    ]
-    page = st.sidebar.radio("Menú", pages, index=0)
+        if page.startswith("1"):
+            page_dispatch_ops()
+        else:
+            page_dispatch_admin()
 
-    if page.startswith("1"):
-        page_dispatch_ops()
-    else:
-        page_dispatch_admin()
-
-    # ==========
-    # MODO FULL (nuevo módulo completo)
-    # ==========
-    else:
+    elif mode == "FULL":
         pages = [
             "1) Cargar Excel Full",
             "2) Supervisor de acopio",
@@ -5202,6 +5198,7 @@ elif mode == "DISPATCH":
         else:
             page_full_admin()
 
-
+    else:
+        page_app_lobby()
 if __name__ == "__main__":
     main()
