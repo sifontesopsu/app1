@@ -526,6 +526,27 @@ def init_db():
     );
     """)
 
+    # --- CONTADOR DE PAQUETES (Flex/Colecta) ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS pkg_counter_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT,               -- FLEX / COLECTA
+    status TEXT DEFAULT 'OPEN',
+    created_at TEXT,
+    closed_at TEXT
+    );
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS pkg_counter_scans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER,
+    label_key TEXT,
+    raw TEXT,
+    scanned_at TEXT,
+    UNIQUE(run_id, label_key)
+    );
+    """)
+
     # --- FULL: Acopio ---
     c.execute("""
     CREATE TABLE IF NOT EXISTS full_batches (
@@ -1357,6 +1378,14 @@ def page_app_lobby():
         st.caption("Control de acopio Full (escaneo + chequeo vs Excel).")
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
+    if st.button("🧮 Contador de paquetes (Flex / Colecta)", key="mode_pkg_counter"):
+        st.session_state.app_mode = "PKG_COUNT"
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.caption("Escanea etiquetas y cuenta paquetes; evita duplicados.")
 def page_import(inv_map_sku: dict):
     st.header("Importar ventas")
     # Bloqueo duro: no permitir cargar otra tanda si hay una en curso
@@ -4583,6 +4612,211 @@ def maybe_close_manifest_if_done():
 
 
 
+# =========================
+# CONTADOR DE PAQUETES (Flex/Colecta)
+# =========================
+def _pkg_norm_label(raw: str) -> str:
+    r = str(raw or "").strip()
+    d = only_digits(r)
+    return d if d else r
+
+def _pkg_get_open_run(kind: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, created_at FROM pkg_counter_runs WHERE kind=? AND status='OPEN' ORDER BY id DESC LIMIT 1;",
+        (str(kind),),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": int(row[0]), "created_at": row[1]}
+
+def _pkg_create_run(kind: str) -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO pkg_counter_runs (kind, status, created_at) VALUES (?, 'OPEN', ?);",
+        (str(kind), now_iso()),
+    )
+    rid = int(c.lastrowid)
+    conn.commit()
+    conn.close()
+    return rid
+
+def _pkg_close_run(run_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE pkg_counter_runs SET status='DONE', closed_at=? WHERE id=?;", (now_iso(), int(run_id)))
+    conn.commit()
+    conn.close()
+
+def _pkg_run_count(run_id: int) -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(1) FROM pkg_counter_scans WHERE run_id=?;", (int(run_id),))
+    n = int(c.fetchone()[0] or 0)
+    conn.close()
+    return n
+
+def _pkg_last_scans(run_id: int, limit: int = 15):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT label_key, scanned_at FROM pkg_counter_scans WHERE run_id=? ORDER BY id DESC LIMIT ?;",
+        (int(run_id), int(limit)),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def _pkg_register_scan(run_id: int, label_key: str, raw: str):
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute(
+            "INSERT INTO pkg_counter_scans (run_id, label_key, raw, scanned_at) VALUES (?, ?, ?, ?);",
+            (int(run_id), str(label_key), str(raw or ""), now_iso()),
+        )
+        conn.commit()
+        return True, None
+    except Exception as e:
+        # SQLite lanza error por UNIQUE(run_id,label_key) => repetido
+        msg = str(e).lower()
+        if "unique" in msg or "constraint" in msg:
+            return False, "DUP"
+        return False, str(e)
+    finally:
+        conn.close()
+
+def _pkg_reset_kind(kind: str):
+    """Borra historial COMPLETO de ese tipo (Flex/Colecta): runs + scans."""
+    conn = get_conn()
+    c = conn.cursor()
+    # obtener runs
+    c.execute("SELECT id FROM pkg_counter_runs WHERE kind=?;", (str(kind),))
+    rids = [int(r[0]) for r in c.fetchall()]
+    if rids:
+        qmarks = ",".join(["?"] * len(rids))
+        c.execute(f"DELETE FROM pkg_counter_scans WHERE run_id IN ({qmarks});", tuple(rids))
+    c.execute("DELETE FROM pkg_counter_runs WHERE kind=?;", (str(kind),))
+    conn.commit()
+    conn.close()
+
+def page_pkg_counter():
+    st.header("🧮 Contador de paquetes")
+
+    kind_ui = st.radio("Tipo de envío", ["Flex", "Colecta"], horizontal=True)
+    kind = "FLEX" if kind_ui == "Flex" else "COLECTA"
+
+    # Run activo por tipo
+    run = _pkg_get_open_run(kind)
+    if not run:
+        rid = _pkg_create_run(kind)
+        run = {"id": rid, "created_at": now_iso()}
+
+    run_id = int(run["id"])
+    total = _pkg_run_count(run_id)
+
+    st.caption(f"Corrida activa: #{run_id} — creada: {to_chile_display(run.get('created_at',''))}")
+    col1, col2, col3 = st.columns([1, 1, 1])
+    col1.metric("Paquetes contabilizados", total)
+    col2.metric("Tipo", kind_ui)
+    col3.metric("Estado", "ACTIVA")
+
+    st.divider()
+
+    # Mensaje flash (para PDA, se ve 1 vez)
+    flash_key = f"pkg_flash_{kind}"
+    if flash_key in st.session_state:
+        k, msg = st.session_state.get(flash_key, ("info", ""))
+        if msg:
+            if k == "ok":
+                st.success(msg)
+            elif k == "dup":
+                st.warning(msg)
+            else:
+                st.error(msg)
+        st.session_state.pop(flash_key, None)
+
+    # Input scan
+    nonce_key = f"pkg_nonce_{kind}"
+    if nonce_key not in st.session_state:
+        st.session_state[nonce_key] = 0
+
+    scan_key = f"pkg_scan_{kind}_{st.session_state[nonce_key]}"
+    label = st.text_input("Etiqueta (escaneo)", key=scan_key)
+    force_tel_keyboard("Etiqueta (escaneo)")
+    autofocus_input("Etiqueta (escaneo)")
+
+    cA, cB = st.columns([2, 1])
+    with cA:
+        if st.button("➕ Registrar paquete", use_container_width=True, key=f"pkg_add_{kind}"):
+            raw = str(label or "").strip()
+            label_key = _pkg_norm_label(raw)
+
+            if not label_key:
+                st.session_state[flash_key] = ("err", "Ingresa/escanea una etiqueta válida.")
+                st.rerun()
+
+            ok, err = _pkg_register_scan(run_id, label_key, raw)
+            if ok:
+                st.session_state[flash_key] = ("ok", "✅ Paquete contabilizado.")
+            else:
+                if err == "DUP":
+                    st.session_state[flash_key] = ("dup", f"⚠️ Etiqueta repetida: {label_key}. No se contabiliza.")
+                else:
+                    st.session_state[flash_key] = ("err", f"No pude registrar: {err}")
+
+            st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
+            st.rerun()
+
+    with cB:
+        if st.button("🧹 Limpiar", use_container_width=True, key=f"pkg_clear_{kind}"):
+            st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
+            st.rerun()
+
+    st.divider()
+
+    # Últimos escaneos
+    st.subheader("Últimos escaneos")
+    rows = _pkg_last_scans(run_id, 15)
+    if not rows:
+        st.info("Aún no hay paquetes contabilizados en esta corrida.")
+    else:
+        st.dataframe(pd.DataFrame(rows, columns=["Etiqueta", "Hora"]).assign(Hora=lambda d: d["Hora"].apply(to_chile_display)))
+
+    st.divider()
+
+    # Acciones
+    colX, colY = st.columns([1, 1])
+    with colX:
+        close_ok = total > 0
+        if st.button("✅ Cerrar corrida (iniciar nueva)", disabled=not close_ok, use_container_width=True, key=f"pkg_close_{kind}"):
+            _pkg_close_run(run_id)
+            _ = _pkg_create_run(kind)
+            st.success("Corrida cerrada. Nueva corrida creada.")
+            # limpiar inputs
+            st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
+            st.rerun()
+        if not close_ok:
+            st.caption("Cierra cuando ya tengas al menos 1 paquete contabilizado.")
+
+    with colY:
+        if f"pkg_reset_arm_{kind}" not in st.session_state:
+            st.session_state[f"pkg_reset_arm_{kind}"] = False
+        arm = st.checkbox("Quiero reiniciar (borra todo este tipo)", value=st.session_state[f"pkg_reset_arm_{kind}"], key=f"pkg_arm_{kind}")
+        st.session_state[f"pkg_reset_arm_{kind}"] = bool(arm)
+        txt = st.text_input("Escribe BORRAR para confirmar", value="", disabled=not arm, key=f"pkg_cf_{kind}")
+        if st.button("🗑️ Reiniciar", type="primary", disabled=not (arm and txt.strip().upper() == "BORRAR"), use_container_width=True, key=f"pkg_reset_{kind}"):
+            _pkg_reset_kind(kind)
+            st.success("Reiniciado. Corrida nueva creada.")
+            # asegurar nueva corrida
+            _ = _pkg_create_run(kind)
+            st.session_state[nonce_key] = int(st.session_state[nonce_key]) + 1
+            st.rerun()
+
 def main():
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
     init_db()
@@ -4654,6 +4888,13 @@ def main():
     # ==========
     # MODO FULL (nuevo módulo completo)
     # ==========
+    elif mode == "PKG_COUNT":
+        pages = [
+            "1) Contador de paquetes",
+        ]
+        _ = st.sidebar.radio("Menú", pages, index=0)
+        page_pkg_counter()
+
     else:
         pages = [
             "1) Cargar Excel Full",
