@@ -1,68 +1,6 @@
 import os
 import streamlit as st
 import streamlit.components.v1 as components
-
-# =====================
-# Retro SFX (best-effort, nunca debe botar la app)
-# =====================
-def sfx(kind: str):
-    """Dispara un sonido retro en el siguiente render. kind: ok|extra|duplicate|error"""
-    st.session_state["_sfx_kind"] = kind
-    st.session_state["_sfx_nonce"] = int(st.session_state.get("_sfx_nonce", 0)) + 1
-
-def _sfx_render():
-    kind = st.session_state.get("_sfx_kind")
-    if not kind:
-        return
-
-    # Perfil de sonidos tipo arcade
-    if kind == "ok":
-        # tipo moneda (dos tonos ascendentes rápidos)
-        tones = [(988, 90), (1319, 110)]  # Hz, ms
-    elif kind == "duplicate":
-        # repetido (dos tonos iguales cortos)
-        tones = [(740, 80), (740, 80)]
-    elif kind == "extra":
-        # extra (tono medio corto)
-        tones = [(659, 140)]
-    else:
-        # error (tono grave largo)
-        tones = [(220, 260)]
-
-    seq_js = ",".join([f"{{f:{f},d:{d}}}" for (f,d) in tones])
-
-    js = f"""<script>
-    try {{
-      const seq = [{seq_js}];
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx();
-      const now = ctx.currentTime;
-      let t = now;
-      seq.forEach((x) => {{
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'square';
-        osc.frequency.value = x.f;
-        gain.gain.value = 0.12;
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(t);
-        osc.stop(t + (x.d/1000.0));
-        t += (x.d/1000.0) + 0.02;
-      }});
-      setTimeout(() => {{ try {{ ctx.close(); }} catch(e) {{}} }}, 800);
-    }} catch(e) {{}}
-    </script>"""
-
-    try:
-        # height=1 evita algunos TypeError raros; no usamos key/scrolling por compatibilidad
-        components.html(js, height=1)
-    except Exception:
-        pass
-
-    # Limpieza para que no se repita en rerun
-    st.session_state["_sfx_kind"] = None
-
 import pandas as pd
 import sqlite3
 from datetime import datetime
@@ -585,27 +523,6 @@ def init_db():
     CREATE TABLE IF NOT EXISTS sku_barcodes (
         barcode TEXT PRIMARY KEY,
         sku_ml TEXT
-    );
-    """)
-
-    # --- CONTADOR DE PAQUETES (Flex/Colecta) ---
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS pkg_counter_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT,               -- FLEX / COLECTA
-    status TEXT DEFAULT 'OPEN',
-    created_at TEXT,
-    closed_at TEXT
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS pkg_counter_scans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER,
-    label_key TEXT,
-    raw TEXT,
-    scanned_at TEXT,
-    UNIQUE(run_id, label_key)
     );
     """)
 
@@ -1440,13 +1357,6 @@ def page_app_lobby():
         st.caption("Control de acopio Full (escaneo + chequeo vs Excel).")
 
     st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
-    if st.button("🧮 Contador de paquetes", key="mode_pkg_counter"):
-        st.session_state.app_mode = "PKG_COUNT"
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.caption("Escanea etiquetas y cuenta paquetes; evita duplicados.")
 def page_import(inv_map_sku: dict):
     st.header("Importar ventas")
     # Bloqueo duro: no permitir cargar otra tanda si hay una en curso
@@ -1818,12 +1728,14 @@ def page_picking():
         # Autofocus en PDA: después de elegir desde la lista, dejar listo el campo de escaneo
         if st.session_state.get("focus_scan", False):
             components.html(
-                "<script>"
-                "setTimeout(function(){"
-                "const el=document.querySelector('input[type=\"text\"]');"
-                "if(el){el.focus(); if(el.select){el.select();}}"
-                "}, 50);"
-                "</script>",
+                """
+                <script>
+                setTimeout(function(){
+                  const el = document.querySelector('input[type="text"]');
+                  if(el){ el.focus(); if(el.select){ el.select(); } }
+                }, 50);
+                </script>
+                """,
                 height=0,
             )
             st.session_state["focus_scan"] = False
@@ -2302,7 +2214,12 @@ def page_full_upload(inv_map_sku: dict):
 
     if st.session_state.get("scroll_to_scan", False):
         components.html(
-            "<script>const el=document.getElementById('scan_top'); if(el){el.scrollIntoView({behavior:'smooth', block:'start'});}</script>",
+            """
+            <script>
+            const el = document.getElementById('scan_top');
+            if(el){ el.scrollIntoView({behavior:'smooth', block:'start'}); }
+            </script>
+            """,
             height=0,
         )
         st.session_state["scroll_to_scan"] = False
@@ -4673,248 +4590,8 @@ def maybe_close_manifest_if_done():
 
 
 
-# =========================
-# CONTADOR DE PAQUETES (Flex/Colecta)
-# =========================
-def _pkg_norm_label(raw: str) -> str:
-    r = str(raw or "").strip()
-    d = only_digits(r)
-    return d if d else r
-
-def _pkg_get_open_run(kind: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT id, created_at FROM pkg_counter_runs WHERE kind=? AND status='OPEN' ORDER BY id DESC LIMIT 1;",
-        (str(kind),),
-    )
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"id": int(row[0]), "created_at": row[1]}
-
-def _pkg_create_run(kind: str) -> int:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO pkg_counter_runs (kind, status, created_at) VALUES (?, 'OPEN', ?);",
-        (str(kind), now_iso()),
-    )
-    rid = int(c.lastrowid)
-    conn.commit()
-    conn.close()
-    return rid
-
-def _pkg_close_run(run_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE pkg_counter_runs SET status='DONE', closed_at=? WHERE id=?;", (now_iso(), int(run_id)))
-    conn.commit()
-    conn.close()
-
-def _pkg_run_count(run_id: int) -> int:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(1) FROM pkg_counter_scans WHERE run_id=?;", (int(run_id),))
-    n = int(c.fetchone()[0] or 0)
-    conn.close()
-    return n
-
-def _pkg_last_scans(run_id: int, limit: int = 15):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT label_key, scanned_at FROM pkg_counter_scans WHERE run_id=? ORDER BY id DESC LIMIT ?;",
-        (int(run_id), int(limit)),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-def _pkg_register_scan(run_id: int, label_key: str, raw: str):
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        c.execute(
-            "INSERT INTO pkg_counter_scans (run_id, label_key, raw, scanned_at) VALUES (?, ?, ?, ?);",
-            (int(run_id), str(label_key), str(raw or ""), now_iso()),
-        )
-        conn.commit()
-        return True, None
-    except Exception as e:
-        # SQLite lanza error por UNIQUE(run_id,label_key) => repetido
-        msg = str(e).lower()
-        if "unique" in msg or "constraint" in msg:
-            return False, "DUP"
-        return False, str(e)
-    finally:
-        conn.close()
-
-def _pkg_reset_kind(kind: str):
-    """Borra historial COMPLETO de ese tipo (Flex/Colecta): runs + scans."""
-    conn = get_conn()
-    c = conn.cursor()
-    # obtener runs
-    c.execute("SELECT id FROM pkg_counter_runs WHERE kind=?;", (str(kind),))
-    rids = [int(r[0]) for r in c.fetchall()]
-    if rids:
-        qmarks = ",".join(["?"] * len(rids))
-        c.execute(f"DELETE FROM pkg_counter_scans WHERE run_id IN ({qmarks});", tuple(rids))
-    c.execute("DELETE FROM pkg_counter_runs WHERE kind=?;", (str(kind),))
-    conn.commit()
-    conn.close()
-
-def page_pkg_counter():
-    st.header("🧮 Contador de paquetes")
-
-    # Selección manual (opción A): FLEX vs COLECTA
-    # - FLEX: el lector entrega JSON con hash_code
-    # - COLECTA: el lector entrega solo dígitos (shipment_id)
-    if "pkg_kind" not in st.session_state:
-        st.session_state["pkg_kind"] = "FLEX"
-
-    st.radio(
-        "Tipo",
-        options=["FLEX", "COLECTA"],
-        horizontal=True,
-        key="pkg_kind",
-    )
-
-    def _scan_detect_kind(raw: str) -> str:
-        s = str(raw or "").strip()
-        if s.startswith("{") and "\"hash_code\"" in s:
-            return "FLEX"
-        if re.fullmatch(r"\d+", s or ""):
-            return "COLECTA"
-        return "UNKNOWN"
-
-    def _scan_extract_label_key(raw: str, kind: str) -> str:
-        s = str(raw or "").strip()
-        if kind == "FLEX" and s.startswith("{"):
-            try:
-                import json
-                obj = json.loads(s)
-                val = obj.get("id", "")
-                return only_digits(val) or _pkg_norm_label(s)
-            except Exception:
-                return _pkg_norm_label(s)
-        # COLECTA: número puro
-        return only_digits(s) or _pkg_norm_label(s)
-
-    def ensure_run(kind: str) -> dict:
-        run = _pkg_get_open_run(kind)
-        if not run:
-            rid = _pkg_create_run(kind)
-            run = {"id": rid, "created_at": now_iso()}
-        return run
-
-    # Reinicio sin confirmación (debe ocurrir ANTES de crear el widget de input)
-    reset_kind = st.session_state.pop("pkg_reset_trigger_kind", None)
-    if reset_kind:
-        _pkg_reset_kind(str(reset_kind))
-        _ = _pkg_create_run(str(reset_kind))
-        try:
-            if "pkg_scan_input" in st.session_state:
-                del st.session_state["pkg_scan_input"]
-        except Exception:
-            pass
-        st.rerun()
-
-    def handle_scan(input_key: str):
-        raw = str(st.session_state.get(input_key, "") or "").strip()
-        if not raw:
-            return
-
-        selected_kind = str(st.session_state.get("pkg_kind") or "FLEX")
-        detected = _scan_detect_kind(raw)
-
-        if detected == "UNKNOWN":
-            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            st.session_state[input_key] = ""
-            return
-
-        if detected != selected_kind:
-            st.session_state["pkg_flash"] = ("err", f"Etiqueta {detected}. Estás en {selected_kind}.")
-            st.session_state[input_key] = ""
-            return
-
-        run = ensure_run(selected_kind)
-        run_id = int(run["id"])
-
-        label_key = _scan_extract_label_key(raw, selected_kind)
-        if not label_key:
-            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            st.session_state[input_key] = ""
-            return
-
-        ok, err = _pkg_register_scan(run_id, label_key, raw)
-        if ok:
-            st.session_state["pkg_flash"] = ("ok", "OK")
-        else:
-            if err == "DUP":
-                st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
-            else:
-                st.session_state["pkg_flash"] = ("err", "Error al registrar")
-
-        # dejar el campo en blanco para el siguiente escaneo
-        st.session_state[input_key] = ""
-
-    # asegura corrida activa del tipo seleccionado
-    KIND = str(st.session_state.get("pkg_kind") or "FLEX")
-    run = ensure_run(KIND)
-    run_id = int(run["id"])
-
-    # aviso minimalista (una vez)
-    if "pkg_flash" in st.session_state:
-        k, msg = st.session_state.get("pkg_flash", ("info", ""))
-        if msg:
-            if k == "ok":
-                st.success(msg)
-            elif k == "dup":
-                st.warning(msg)
-            else:
-                st.error(msg)
-        st.session_state.pop("pkg_flash", None)
-
-    total = _pkg_run_count(run_id)
-    st.metric("Paquetes contabilizados", total)
-
-    # Escaneo automático (sin botones)
-    input_key = "pkg_scan_input"
-    st.text_input(
-        "Escaneo (lector)",
-        key=input_key,
-        on_change=handle_scan,
-        args=(input_key,),
-    )
-    force_tel_keyboard("Escaneo (lector)")
-    autofocus_input("Escaneo (lector)")
-
-    # Últimos escaneos
-    rows = _pkg_last_scans(run_id, 15)
-    if rows:
-        df_last = pd.DataFrame(rows, columns=["Etiqueta", "Hora"])
-        df_last["Hora"] = df_last["Hora"].apply(to_chile_display)
-        st.dataframe(df_last, use_container_width=True, hide_index=True)
-    else:
-        st.info("Aún no hay paquetes en esta corrida.")
-
-    # Única acción
-    if st.button("🔄 Reiniciar corrida", use_container_width=True, key="pkg_reset_now"):
-        st.session_state["pkg_reset_trigger_kind"] = KIND
-        st.rerun()
-
-
 def main():
-
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
-    # Render SFX (best-effort): nunca debe botar la app
-    try:
-        _sfx_render()
-    except Exception:
-        pass
-
     init_db()
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
@@ -4984,13 +4661,6 @@ def main():
     # ==========
     # MODO FULL (nuevo módulo completo)
     # ==========
-    elif mode == "PKG_COUNT":
-        pages = [
-            "1) Contador de paquetes",
-        ]
-        _ = st.sidebar.radio("Menú", pages, index=0)
-        page_pkg_counter()
-
     else:
         pages = [
             "1) Cargar Excel Full",
