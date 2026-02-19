@@ -9,6 +9,83 @@ import hashlib
 import html
 
 # =========================
+# SFX (sonidos retro)
+# =========================
+# Reproduce un sonido corto (tipo "moneda" arcade) cuando una acción es OK,
+# y sonidos distintos para DUPLICADO / EXTRA / ERROR. No bloquea el beep del PDA.
+def _sfx_trigger(kind: str):
+    try:
+        st.session_state["_sfx_nonce"] = int(st.session_state.get("_sfx_nonce", 0)) + 1
+        st.session_state["_sfx_kind"] = str(kind or "").upper()
+    except Exception:
+        pass
+
+def _sfx_render():
+    kind = str(st.session_state.get("_sfx_kind", "") or "").upper()
+    nonce = int(st.session_state.get("_sfx_nonce", 0) or 0)
+    if not kind or nonce <= 0:
+        return
+
+    # WebAudio (sin archivos externos)
+    js = f"""
+    <script>
+    (function(){{
+      const kind = {kind!r};
+      try {{
+        const AC = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AC();
+        const now = ctx.currentTime;
+
+        function tone(freq, t0, dur, type, gain){{
+          const o = ctx.createOscillator();
+          const g = ctx.createGain();
+          o.type = type || 'square';
+          o.frequency.setValueAtTime(freq, t0);
+          g.gain.setValueAtTime(0.0001, t0);
+          g.gain.exponentialRampToValueAtTime(gain || 0.12, t0 + 0.01);
+          g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+          o.connect(g); g.connect(ctx.destination);
+          o.start(t0); o.stop(t0 + dur + 0.02);
+        }}
+
+        // "Moneda" tipo arcade (arpegio corto)
+        function coin(){{
+          tone(988, now+0.00, 0.07, 'square', 0.14);
+          tone(1319, now+0.08, 0.07, 'square', 0.13);
+          tone(1760, now+0.16, 0.06, 'square', 0.12);
+        }}
+
+        // Duplicado: "rebote" (dos tonos descendentes)
+        function dup(){{
+          tone(660, now+0.00, 0.08, 'sawtooth', 0.10);
+          tone(440, now+0.10, 0.10, 'sawtooth', 0.10);
+        }}
+
+        // Extra: "power-up" suave
+        function extra(){{
+          tone(523, now+0.00, 0.06, 'triangle', 0.10);
+          tone(659, now+0.07, 0.06, 'triangle', 0.10);
+          tone(784, now+0.14, 0.08, 'triangle', 0.10);
+        }}
+
+        // Error: buzzer corto
+        function err(){{
+          tone(220, now+0.00, 0.18, 'square', 0.12);
+        }}
+
+        if (kind === 'OK') coin();
+        else if (kind === 'DUP' || kind === 'DUPLICADO') dup();
+        else if (kind === 'EXTRA') extra();
+        else err();
+        setTimeout(()=>{{ try{{ctx.close();}}catch(e){{}} }}, 600);
+      }} catch(e) {{}}
+    }})();
+    </script>
+    """
+    components.html(js, height=0, key=f"_sfx_{nonce}")
+
+
+# =========================
 # CONFIG
 # =========================
 DB_NAME = "aurora_ml.db"
@@ -883,11 +960,18 @@ def upsert_barcodes_to_db(barcode_to_sku: dict):
 
 
 def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
-    raw = str(scan).strip()
+    raw = str(scan or "").strip()
     digits = only_digits(raw)
+    sku = ""
     if digits and digits in barcode_to_sku:
-        return barcode_to_sku[digits]
-    return normalize_sku(raw)
+        sku = barcode_to_sku[digits]
+    else:
+        sku = normalize_sku(raw)
+
+    # SFX: solo si realmente se intentó escanear algo
+    if raw:
+        _sfx_trigger("OK" if sku else "ERROR")
+    return sku
 
 
 def extract_location_suffix(text: str) -> str:
@@ -4705,53 +4789,52 @@ def _pkg_reset_kind(kind: str):
 
 def page_pkg_counter():
     st.header("🧮 Contador de paquetes")
+    st.caption("Escanea para contar. Si repites una etiqueta, se avisa y NO suma.")
 
-    # Selección manual (opción A): FLEX vs COLECTA
-    # - FLEX: el lector entrega JSON con hash_code
-    # - COLECTA: el lector entrega solo dígitos (shipment_id)
-    if "pkg_kind" not in st.session_state:
-        st.session_state["pkg_kind"] = "FLEX"
+    KIND = "GENERAL"
 
-    st.radio(
-        "Tipo",
-        options=["FLEX", "COLECTA"],
-        horizontal=True,
-        key="pkg_kind",
-    )
-
-    def _scan_detect_kind(raw: str) -> str:
-        s = str(raw or "").strip()
-        if s.startswith("{") and "\"hash_code\"" in s:
-            return "FLEX"
-        if re.fullmatch(r"\d+", s or ""):
-            return "COLECTA"
-        return "UNKNOWN"
-
-    def _scan_extract_label_key(raw: str, kind: str) -> str:
-        s = str(raw or "").strip()
-        if kind == "FLEX" and s.startswith("{"):
-            try:
-                import json
-                obj = json.loads(s)
-                val = obj.get("id", "")
-                return only_digits(val) or _pkg_norm_label(s)
-            except Exception:
-                return _pkg_norm_label(s)
-        # COLECTA: número puro
-        return only_digits(s) or _pkg_norm_label(s)
-
-    def ensure_run(kind: str) -> dict:
-        run = _pkg_get_open_run(kind)
+    def ensure_run() -> dict:
+        run = _pkg_get_open_run(KIND)
         if not run:
-            rid = _pkg_create_run(kind)
+            rid = _pkg_create_run(KIND)
             run = {"id": rid, "created_at": now_iso()}
         return run
 
-    # Reinicio sin confirmación (debe ocurrir ANTES de crear el widget de input)
-    reset_kind = st.session_state.pop("pkg_reset_trigger_kind", None)
-    if reset_kind:
-        _pkg_reset_kind(str(reset_kind))
-        _ = _pkg_create_run(str(reset_kind))
+    def handle_scan(input_key: str):
+        raw = str(st.session_state.get(input_key, "") or "").strip()
+        if not raw:
+            return
+
+        run = ensure_run()
+        run_id = int(run["id"])
+
+        label_key = _pkg_norm_label(raw)
+        if not label_key:
+            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
+            _sfx_trigger("ERROR")
+            st.session_state[input_key] = ""
+            return
+
+        ok, err = _pkg_register_scan(run_id, label_key, raw)
+        if ok:
+            st.session_state["pkg_flash"] = ("ok", "OK")
+            _sfx_trigger("OK")
+        else:
+            if err == "DUP":
+                st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
+                _sfx_trigger("DUPLICADO")
+            else:
+                st.session_state["pkg_flash"] = ("err", "Error al registrar")
+                _sfx_trigger("ERROR")
+
+        # dejar el campo en blanco para el siguiente escaneo
+        st.session_state[input_key] = ""
+
+    # Reinicio sin confirmación (manejado antes de crear el widget para evitar StreamlitAPIException)
+    if st.session_state.pop("pkg_reset_trigger", False):
+        _pkg_reset_kind(KIND)
+        _ = _pkg_create_run(KIND)
+        # limpiar input del lector antes de renderizar el widget
         try:
             if "pkg_scan_input" in st.session_state:
                 del st.session_state["pkg_scan_input"]
@@ -4759,48 +4842,8 @@ def page_pkg_counter():
             pass
         st.rerun()
 
-    def handle_scan(input_key: str):
-        raw = str(st.session_state.get(input_key, "") or "").strip()
-        if not raw:
-            return
-
-        selected_kind = str(st.session_state.get("pkg_kind") or "FLEX")
-        detected = _scan_detect_kind(raw)
-
-        if detected == "UNKNOWN":
-            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            st.session_state[input_key] = ""
-            return
-
-        if detected != selected_kind:
-            st.session_state["pkg_flash"] = ("err", f"Etiqueta {detected}. Estás en {selected_kind}.")
-            st.session_state[input_key] = ""
-            return
-
-        run = ensure_run(selected_kind)
-        run_id = int(run["id"])
-
-        label_key = _scan_extract_label_key(raw, selected_kind)
-        if not label_key:
-            st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            st.session_state[input_key] = ""
-            return
-
-        ok, err = _pkg_register_scan(run_id, label_key, raw)
-        if ok:
-            st.session_state["pkg_flash"] = ("ok", "OK")
-        else:
-            if err == "DUP":
-                st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
-            else:
-                st.session_state["pkg_flash"] = ("err", "Error al registrar")
-
-        # dejar el campo en blanco para el siguiente escaneo
-        st.session_state[input_key] = ""
-
-    # asegura corrida activa del tipo seleccionado
-    KIND = str(st.session_state.get("pkg_kind") or "FLEX")
-    run = ensure_run(KIND)
+    # asegura corrida activa
+    run = ensure_run()
     run_id = int(run["id"])
 
     # aviso minimalista (una vez)
@@ -4840,14 +4883,16 @@ def page_pkg_counter():
 
     # Única acción
     if st.button("🔄 Reiniciar corrida", use_container_width=True, key="pkg_reset_now"):
-        st.session_state["pkg_reset_trigger_kind"] = KIND
+        st.session_state["pkg_reset_trigger"] = True
         st.rerun()
-
 
 def main():
 
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
     init_db()
+
+    # SFX global (se dispara con _sfx_trigger en los módulos)
+    _sfx_render()
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
     inv_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
