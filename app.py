@@ -683,7 +683,11 @@ def init_db():
     _ensure_col("sorting_labels", "address", "TEXT")
     _ensure_col("sorting_labels", "raw", "TEXT")
 
-    # Asegurar índices/constraints para UPSERT (BD antiguas)
+        # dispatch_label_map (Despacho)
+    _ensure_col("dispatch_label_map", "recipient", "TEXT")
+    _ensure_col("dispatch_label_map", "address", "TEXT")
+
+# Asegurar índices/constraints para UPSERT (BD antiguas)
     try:
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sorting_labels_manifest_pack ON sorting_labels(manifest_id, pack_id);")
     except Exception:
@@ -4653,16 +4657,50 @@ def _dsp_detect_kind_from_scan(raw: str) -> str:
         return "COLECTA"
     return "UNKNOWN"
 
-def _dsp_extract_shipment_id(raw: str, kind: str) -> str:
+def _dsp_extract_shipment_ids(raw: str, kind: str) -> list[str]:
+    """Extrae uno o más shipment_id desde un escaneo.
+
+    - FLEX: normalmente viene como JSON {"id":"..."}; si el lector concatena 2 lecturas,
+      queda JSON inválido, así que buscamos todos los "id" con regex.
+    - COLECTA: normalmente es solo dígitos; si concatena 2 lecturas, extraemos por patrón.
+    """
     s = str(raw or "").strip()
-    if kind == "FLEX" and s.startswith("{"):
-        try:
-            import json
-            obj = json.loads(s)
-            return only_digits(obj.get("id", "")) or ""
-        except Exception:
-            return ""
-    return only_digits(s) or ""
+    ids: list[str] = []
+
+    # 1) Si hay JSON de FLEX (o concatenación)
+    if '"id"' in s:
+        for m in re.finditer(r'"id"\s*:\s*"([0-9]{8,20})"', s):
+            d = only_digits(m.group(1))
+            if d:
+                ids.append(d)
+
+    # 2) Buscar IDs típicos (en ambos): 11 dígitos que empiezan con 46 (ej: 46393452311)
+    for m in re.finditer(r'(46\d{9})', s):
+        ids.append(m.group(1))
+
+    # 3) Fallback: solo dígitos (por si el lector manda puro número)
+    d = only_digits(s)
+    if d:
+        if len(d) == 11 and d.startswith("46"):
+            ids.append(d)
+        elif len(d) > 11 and d.startswith("46") and (len(d) % 11 == 0):
+            # concatenación limpia (22, 33, ...)
+            for i in range(0, len(d), 11):
+                ids.append(d[i:i+11])
+
+    # Unique manteniendo orden
+    seen = set()
+    out = []
+    for x in ids:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def _dsp_extract_shipment_id(raw: str, kind: str) -> str:
+    """Compat: devuelve el primer shipment_id encontrado."""
+    xs = _dsp_extract_shipment_ids(raw, kind)
+    return xs[0] if xs else ""
 
 def _dsp_parse_labels_zpl(text: str):
     """
@@ -4704,20 +4742,40 @@ def _dsp_parse_labels_zpl(text: str):
         if mh:
             raw_hint = mh.group(1).strip()
 
-        out[str(ship)] = {"venta": venta, "pack_id": pack_id, "raw_hint": raw_hint}
+        # Heurística: extraer destinatario/dirección desde los ^FD...^FS
+        fields = [m.group(1).strip() for m in re.finditer(r"\^FD([^\^]{1,90})\^FS", ch)]
+        bad_tokens = ["venta:", "pack id", "envio", "código", "codigo", ">:", "{\"id\"", "mercado libre"]
+        clean = []
+        for f in fields:
+            low = f.lower()
+            if any(bt in low for bt in bad_tokens):
+                continue
+            if len(f) < 3:
+                continue
+            clean.append(f)
+        recipient = clean[0] if clean else ""
+        address = ""
+        if len(clean) >= 2:
+            address = clean[1]
+            if len(clean) >= 3 and (any(ch.isdigit() for ch in clean[2]) or "," in clean[2] or "chile" in clean[2].lower()):
+                address = f"{address} — {clean[2]}".strip()
+
+        out[str(ship)] = {"venta": venta, "pack_id": pack_id, "raw_hint": raw_hint, "recipient": recipient, "address": address}
     return out
 
-def _dsp_parse_control_pdf_shipments(pdf_file) -> list:
-    """Extrae shipment_id (10-14 dígitos) desde PDF control (típicamente FLEX)."""
+def _dsp_parse_control_pdf_shipments(pdf_file) -> list[str]:
+    """Extrae shipment_id desde PDF Control de forma estricta (evita capturar SKU)."""
     if not HAS_PDF_LIB:
         return []
     try:
+        pages = parse_control_pdf_by_page(pdf_file)
         ships = []
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                txt = page.extract_text() or ""
-                for m in re.finditer(r"\b([0-9]{10,14})\b", txt):
-                    ships.append(m.group(1))
+        for rec in (pages or []):
+            if not isinstance(rec, dict):
+                continue
+            sid = only_digits(rec.get("shipment_id", ""))
+            if sid and sid.startswith("46") and 10 <= len(sid) <= 14:
+                ships.append(sid)
         seen = set()
         out = []
         for s in ships:
@@ -4784,22 +4842,44 @@ def _dsp_upsert_label_map(batch_id: int, mapping: dict):
         venta = str(info.get("venta") or "")
         pack_id = str(info.get("pack_id") or "")
         raw_hint = str(info.get("raw_hint") or "")
-        c.execute(
-            "INSERT OR REPLACE INTO dispatch_label_map (batch_id, shipment_id, venta, pack_id, raw_hint) VALUES (?, ?, ?, ?, ?);",
-            (int(batch_id), sid, venta, pack_id, raw_hint),
-        )
+        recipient = str(info.get("recipient") or "")
+        address = str(info.get("address") or "")
+        try:
+            c.execute(
+                "INSERT OR REPLACE INTO dispatch_label_map (batch_id, shipment_id, venta, pack_id, raw_hint, recipient, address) VALUES (?, ?, ?, ?, ?, ?, ?);",
+                (int(batch_id), sid, venta, pack_id, raw_hint, recipient, address),
+            )
+        except Exception:
+            c.execute(
+                "INSERT OR REPLACE INTO dispatch_label_map (batch_id, shipment_id, venta, pack_id, raw_hint) VALUES (?, ?, ?, ?, ?);",
+                (int(batch_id), sid, venta, pack_id, raw_hint),
+            )
     conn.commit()
     conn.close()
 
 def _dsp_get_map_for(batch_id: int, shipment_id: str):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT venta, pack_id, raw_hint FROM dispatch_label_map WHERE batch_id=? AND shipment_id=? LIMIT 1;", (int(batch_id), str(shipment_id)))
-    r = c.fetchone()
-    conn.close()
-    if not r:
-        return {"venta": "", "pack_id": "", "raw_hint": ""}
-    return {"venta": r[0] or "", "pack_id": r[1] or "", "raw_hint": r[2] or ""}
+    try:
+        c.execute(
+            "SELECT venta, pack_id, raw_hint, recipient, address FROM dispatch_label_map WHERE batch_id=? AND shipment_id=? LIMIT 1;",
+            (int(batch_id), str(shipment_id)),
+        )
+        r = c.fetchone()
+        if not r:
+            return {"venta": "", "pack_id": "", "raw_hint": "", "recipient": "", "address": ""}
+        return {"venta": r[0] or "", "pack_id": r[1] or "", "raw_hint": r[2] or "", "recipient": r[3] or "", "address": r[4] or ""}
+    except Exception:
+        c.execute(
+            "SELECT venta, pack_id, raw_hint FROM dispatch_label_map WHERE batch_id=? AND shipment_id=? LIMIT 1;",
+            (int(batch_id), str(shipment_id)),
+        )
+        r = c.fetchone()
+        if not r:
+            return {"venta": "", "pack_id": "", "raw_hint": "", "recipient": "", "address": ""}
+        return {"venta": r[0] or "", "pack_id": r[1] or "", "raw_hint": r[2] or "", "recipient": "", "address": ""}
+    finally:
+        conn.close()
 
 def _dsp_expected_set(batch_id: int) -> set:
     conn = get_conn()
@@ -4861,7 +4941,6 @@ def page_dispatch_ops():
     batch = _dsp_get_open_batch(kind)
 
     with st.expander("📥 Carga de control y etiquetas", expanded=(batch is None)):
-        name = st.text_input("Nombre del despacho (opcional)", value="", key=f"dispatch_name_{kind}")
         control_pdf = st.file_uploader("PDF Control", type=["pdf"], key=f"dispatch_control_{kind}")
         labels_file = st.file_uploader("Archivo de etiquetas (txt / zpl)", type=["txt"], key=f"dispatch_labels_{kind}")
 
@@ -4872,7 +4951,7 @@ def page_dispatch_ops():
                     bid = int(batch["id"])
                     _dsp_clear_batch(bid)
                 else:
-                    bid = _dsp_create_batch(kind, name.strip() or f"{kind} {now_iso()}")
+                    bid = _dsp_create_batch(kind, f"{kind} {now_iso()}")
 
                 mapping = {}
                 if labels_file:
@@ -4881,11 +4960,8 @@ def page_dispatch_ops():
                     _dsp_upsert_label_map(bid, mapping)
                     _dsp_upsert_expected(bid, list(mapping.keys()), "LABELS")
 
-                # Si el PDF trae envíos (típico Flex), también lo guardamos para contraste/validación.
-                if control_pdf:
-                    pdf_ships = _dsp_parse_control_pdf_shipments(control_pdf)
-                    if pdf_ships:
-                        _dsp_upsert_expected(bid, pdf_ships, "PDF")
+                # PDF Control: hoy lo usamos solo como referencia (no suma al "Total esperado" para evitar contar SKU).
+                # Si quieres, después podemos usarlo para validar ventas/datos extras.
 
                 st.rerun()
         with col2:
@@ -4905,7 +4981,7 @@ def page_dispatch_ops():
     c2.metric("✅ OK", ok)
     c3.metric("Pendientes", pending)
     c4.metric("⚠ EXTRA", extra)
-    c5.metric("❌ WRONG_TYPE", wrong)
+    c5.metric("❌ TIPO INCORRECTO", wrong)
 
     # flash
     if "dispatch_flash" in st.session_state:
@@ -4945,34 +5021,48 @@ def page_dispatch_ops():
             # registramos como WRONG_TYPE con un id sintético para no chocar UNIQUE
             sid = hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
             _dsp_register_scan(batch_id, sid, raw, "WRONG_TYPE")
-            st.session_state["dispatch_flash"] = ("err", "❌ WRONG_TYPE")
+            st.session_state["dispatch_flash"] = ("err", "❌ TIPO INCORRECTO")
             st.session_state[input_key] = ""
             st.rerun()
 
-        shipment_id = _dsp_extract_shipment_id(raw, kind)
-        if not shipment_id:
+        # Extraer 1 o más IDs (evita el bug de concatenación de 2 escaneos)
+        ids = _dsp_extract_shipment_ids(raw, kind)
+        if not ids:
             st.session_state["dispatch_flash"] = ("err", "Etiqueta inválida.")
             st.session_state[input_key] = ""
-            return
+            st.rerun()
 
-        status = "OK" if shipment_id in expected else "EXTRA"
-        ok_insert, err = _dsp_register_scan(batch_id, shipment_id, raw, status)
+        msgs = []
+        for shipment_id in ids:
+            status = "OK" if shipment_id in expected else "EXTRA"
+            ok_insert, err = _dsp_register_scan(batch_id, shipment_id, raw, status)
 
-        if not ok_insert and err == "DUP":
-            st.session_state["dispatch_flash"] = ("warn", "🔁 DUPLICADO")
-        else:
+            if not ok_insert and err == "DUP":
+                msgs.append("🔁 DUPLICADO")
+                continue
+
             if status == "OK":
                 mp = _dsp_get_map_for(batch_id, shipment_id)
                 venta = mp.get("venta") or ""
                 pack_id = mp.get("pack_id") or ""
                 if venta:
-                    st.session_state["dispatch_flash"] = ("ok", f"✅ OK — Venta {venta}")
+                    msgs.append(f"✅ OK — Venta {venta}")
                 elif pack_id:
-                    st.session_state["dispatch_flash"] = ("ok", f"✅ OK — Pack {pack_id}")
+                    msgs.append(f"✅ OK — Pack {pack_id}")
                 else:
-                    st.session_state["dispatch_flash"] = ("ok", "✅ OK")
+                    msgs.append("✅ OK")
             else:
-                st.session_state["dispatch_flash"] = ("warn", "⚠ EXTRA")
+                msgs.append("⚠ EXTRA")
+
+        # Mostrar un solo flash (resumen)
+        if msgs:
+            # priorizar error/extra/dup según aparezcan
+            if any("⚠ EXTRA" in m for m in msgs):
+                st.session_state["dispatch_flash"] = ("warn", " | ".join(msgs))
+            elif any("DUPLICADO" in m for m in msgs):
+                st.session_state["dispatch_flash"] = ("warn", " | ".join(msgs))
+            else:
+                st.session_state["dispatch_flash"] = ("ok", " | ".join(msgs))
 
         st.session_state[input_key] = ""
         st.rerun()
@@ -4992,7 +5082,7 @@ def page_dispatch_ops():
             if s == "EXTRA":
                 return "⚠ EXTRA"
             if s == "WRONG_TYPE":
-                return "❌ WRONG_TYPE"
+                return "❌ TIPO INCORRECTO"
             return "🔁 DUPLICADO"
         df["Estado"] = df["Estado"].apply(_fmt)
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -5026,12 +5116,12 @@ def page_dispatch_admin():
     c2.metric("✅ OK", ok)
     c3.metric("Pendientes", pending)
     c4.metric("⚠ EXTRA", extra)
-    c5.metric("❌ WRONG_TYPE", wrong)
+    c5.metric("❌ TIPO INCORRECTO", wrong)
 
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT e.shipment_id, m.venta, m.pack_id
+        SELECT e.shipment_id, m.venta, m.pack_id, m.recipient, m.address
         FROM dispatch_expected e
         LEFT JOIN dispatch_scans s
           ON s.batch_id=e.batch_id AND s.shipment_id=e.shipment_id AND s.status='OK'
@@ -5043,7 +5133,7 @@ def page_dispatch_admin():
     pend = c.fetchall()
 
     c.execute("""
-        SELECT s.shipment_id, s.status, s.scanned_at, m.venta, m.pack_id
+        SELECT s.shipment_id, s.status, s.scanned_at, m.venta, m.pack_id, m.recipient, m.address
         FROM dispatch_scans s
         LEFT JOIN dispatch_label_map m
           ON m.batch_id=s.batch_id AND m.shipment_id=s.shipment_id
@@ -5069,17 +5159,17 @@ def page_dispatch_admin():
     wrongs = c.fetchall()
     conn.close()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Pendientes", "Despachados OK", "Extras", "Wrong type"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Pendientes", "Despachados OK", "Extras", "Tipo incorrecto"])
     with tab1:
         if pend:
-            dfp = pd.DataFrame(pend, columns=["Envío", "Venta", "Pack ID"])
+            dfp = pd.DataFrame(pend, columns=["Envío", "Venta", "Pack ID", "Destinatario", "Dirección"])
             st.dataframe(dfp, use_container_width=True, hide_index=True)
             st.download_button("Descargar pendientes (CSV)", dfp.to_csv(index=False).encode("utf-8"), file_name="pendientes.csv", mime="text/csv")
         else:
             st.success("No hay pendientes.")
     with tab2:
         if oks:
-            dfo = pd.DataFrame(oks, columns=["Envío", "Estado", "Hora", "Venta", "Pack ID"])
+            dfo = pd.DataFrame(oks, columns=["Envío", "Estado", "Hora", "Venta", "Pack ID", "Destinatario", "Dirección"])
             dfo["Hora"] = dfo["Hora"].apply(to_chile_display)
             st.dataframe(dfo, use_container_width=True, hide_index=True)
             st.download_button("Descargar OK (CSV)", dfo.to_csv(index=False).encode("utf-8"), file_name="ok.csv", mime="text/csv")
@@ -5098,9 +5188,9 @@ def page_dispatch_admin():
             dfw = pd.DataFrame(wrongs, columns=["Envío", "Estado", "Hora"])
             dfw["Hora"] = dfw["Hora"].apply(to_chile_display)
             st.dataframe(dfw, use_container_width=True, hide_index=True)
-            st.download_button("Descargar wrong type (CSV)", dfw.to_csv(index=False).encode("utf-8"), file_name="wrong_type.csv", mime="text/csv")
+            st.download_button("Descargar tipo incorrecto (CSV)", dfw.to_csv(index=False).encode("utf-8"), file_name="wrong_type.csv", mime="text/csv")
         else:
-            st.info("Sin wrong type.")
+            st.info("Sin etiquetas de tipo incorrecto.")
 
 
 def main():
