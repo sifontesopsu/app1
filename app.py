@@ -7,6 +7,7 @@ from datetime import datetime
 import re
 import hashlib
 import html
+import json
 
 # =========================
 # CONFIG
@@ -47,6 +48,192 @@ MASTER_FILE = "maestro_sku_ean.xlsx"
 
 # Maestro de SKUs para CORTES (rollos / corte manual)
 CORTES_FILE = "CORTES.xlsx"
+
+# =========================
+# SFX (Sistema A: CLICK + OK/ERR) — estable para Chrome/Android
+# =========================
+def _sfx_init_state():
+    ss = st.session_state
+    if "sfx_enabled" not in ss:
+        ss["sfx_enabled"] = True
+    if "sfx_volume" not in ss:
+        ss["sfx_volume"] = 0.55  # 0..1
+    if "sfx_unlocked" not in ss:
+        ss["sfx_unlocked"] = False
+    if "_sfx_kind" not in ss:
+        ss["_sfx_kind"] = ""
+    if "_sfx_nonce" not in ss:
+        ss["_sfx_nonce"] = 0
+
+def sfx_sidebar():
+    _sfx_init_state()
+    with st.sidebar.expander("🔊 Sonidos", expanded=True):
+        st.session_state["sfx_enabled"] = st.toggle("Sonido", value=st.session_state["sfx_enabled"], key="sfx_enabled_toggle")
+        vol_pct = st.slider("Volumen", min_value=0, max_value=100, value=int(st.session_state["sfx_volume"]*100), step=5, key="sfx_volume_slider")
+        st.session_state["sfx_volume"] = max(0.0, min(1.0, vol_pct/100.0))
+
+        if st.button("Activar sonido", disabled=bool(st.session_state.get("sfx_unlocked", False)), use_container_width=True):
+            st.session_state["sfx_unlocked"] = True
+            st.rerun()
+
+        if st.session_state.get("sfx_unlocked", False):
+            st.success("Audio habilitado ✅")
+        else:
+            st.info("En Chrome debes tocar “Activar sonido” una vez.")
+
+def _sfx_unlock_render():
+    _sfx_init_state()
+    if not st.session_state.get("sfx_enabled", True):
+        return
+    if not st.session_state.get("sfx_unlocked", False):
+        return
+
+    components.html(
+        '''
+        <script>
+        (function(){
+          try{
+            const root = window.parent || window;
+            const AC = root.AudioContext || root.webkitAudioContext;
+            if(!root.__auroraAudio && AC){
+              root.__auroraAudio = new AC();
+            }
+            if(root.__auroraAudio && root.__auroraAudio.state === "suspended"){
+              root.__auroraAudio.resume();
+            }
+          }catch(e){}
+        })();
+        </script>
+        ''',
+        height=0,
+    )
+
+def _sfx_global_click_hook():
+    _sfx_init_state()
+    enabled = bool(st.session_state.get("sfx_enabled", True))
+    unlocked = bool(st.session_state.get("sfx_unlocked", False))
+    vol = float(st.session_state.get("sfx_volume", 0.55))
+
+    cfg_js = json.dumps({"enabled": enabled, "unlocked": unlocked, "volume": vol})
+
+    components.html(
+        '''
+        <script>
+        (function(){
+          try{
+            const root = window.parent || window;
+            root.__auroraSfxCfg = __CFG__;
+            const doc = root.document;
+            if(root.__auroraClickHookInstalled) return;
+            root.__auroraClickHookInstalled = true;
+
+            function playClick(){
+              try{
+                const cfg = root.__auroraSfxCfg || {enabled:false, unlocked:false, volume:0.5};
+                if(!cfg.enabled || !cfg.unlocked) return;
+                const ctx = root.__auroraAudio;
+                if(!ctx) return;
+                const now = ctx.currentTime;
+                const o = ctx.createOscillator();
+                const g = ctx.createGain();
+                o.type = "square";
+                o.frequency.setValueAtTime(1200, now);
+                g.gain.setValueAtTime(0.0001, now);
+                g.gain.exponentialRampToValueAtTime(Math.max(0.02, cfg.volume*0.10), now+0.005);
+                g.gain.exponentialRampToValueAtTime(0.0001, now+0.03);
+                o.connect(g); g.connect(ctx.destination);
+                o.start(now); o.stop(now+0.04);
+              }catch(e){}
+            }
+
+            doc.addEventListener("click", function(ev){
+              const t = ev.target;
+              if(!t) return;
+              const btn = t.closest ? t.closest("button") : null;
+              if(!btn) return;
+              playClick();
+            }, true);
+          }catch(e){}
+        })();
+        </script>
+        '''.replace("__CFG__", cfg_js),
+        height=0,
+    )
+
+def sfx_emit(kind: str):
+    _sfx_init_state()
+    if not st.session_state.get("sfx_enabled", True):
+        return
+    if not st.session_state.get("sfx_unlocked", False):
+        return
+    kind = (kind or "").upper().strip()
+    if kind not in ("OK", "ERR"):
+        kind = "ERR"
+    st.session_state["_sfx_kind"] = kind
+    st.session_state["_sfx_nonce"] = int(st.session_state.get("_sfx_nonce", 0)) + 1
+
+def sfx_render_pending():
+    _sfx_init_state()
+    if not st.session_state.get("sfx_enabled", True):
+        return
+    if not st.session_state.get("sfx_unlocked", False):
+        return
+    kind = (st.session_state.get("_sfx_kind") or "").upper().strip()
+    if not kind:
+        return
+
+    st.session_state["_sfx_kind"] = ""
+    nonce = int(st.session_state.get("_sfx_nonce", 0))
+
+    kind_js = json.dumps(kind)
+
+    components.html(
+        '''
+        <script>
+        (function(){
+          try{
+            const root = window.parent || window;
+            const cfg = root.__auroraSfxCfg || {enabled:false, unlocked:false, volume:0.5};
+            if(!cfg.enabled || !cfg.unlocked) return;
+            const ctx = root.__auroraAudio;
+            if(!ctx) return;
+
+            const kind = __KIND__;
+            const vol = Math.max(0.0, Math.min(1.0, cfg.volume || 0.5));
+            const now = ctx.currentTime;
+
+            function tone(freq, t0, dur, type, gain){
+              const o = ctx.createOscillator();
+              const g = ctx.createGain();
+              o.type = type || "square";
+              o.frequency.setValueAtTime(freq, t0);
+              g.gain.setValueAtTime(0.0001, t0);
+              g.gain.exponentialRampToValueAtTime(Math.max(0.02, vol*(gain||0.12)), t0+0.01);
+              g.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
+              o.connect(g); g.connect(ctx.destination);
+              o.start(t0); o.stop(t0+dur+0.02);
+            }
+
+            function ok(){
+              tone(988,  now+0.00, 0.06, "square", 0.14);
+              tone(1319, now+0.07, 0.06, "square", 0.13);
+              tone(1760, now+0.14, 0.06, "square", 0.12);
+            }
+            function err(){
+              tone(220, now+0.00, 0.16, "square", 0.12);
+              tone(180, now+0.10, 0.18, "square", 0.10);
+            }
+
+            if(kind === "OK") ok();
+            else err();
+          }catch(e){}
+        })();
+        </script>
+        <!-- nonce:__NONCE__ -->
+        '''.replace("__KIND__", kind_js).replace("__NONCE__", str(nonce)),
+        height=0,
+    )
+
 # =========================
 # TIMEZONE CHILE
 # =========================
@@ -1793,6 +1980,10 @@ def page_picking():
                 s["confirmed"] = True
                 s["confirm_mode"] = "SCAN"
                 s["scan_value"] = scan
+            if s.get("scan_status") == "ok":
+                sfx_emit("OK")
+            elif s.get("scan_status") == "bad":
+                sfx_emit("ERR")
             st.rerun()
 
     with col3:
@@ -1844,6 +2035,7 @@ def page_picking():
             q = int(str(qty_in).strip())
         except Exception:
             st.error("Ingresa un número válido.")
+            sfx_emit("ERR")
             q = None
 
         if q is not None:
@@ -1872,6 +2064,7 @@ def page_picking():
                 conn.commit()
                 state.pop(str(task_id), None)
                 st.success("OK. Siguiente…")
+                sfx_emit("OK")
                 st.rerun()
             else:
                 missing = int(qty_total) - q
@@ -4847,6 +5040,12 @@ def page_pkg_counter():
 def main():
 
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
+
+    # 🔊 Sonidos globales (Sistema A)
+    sfx_sidebar()
+    _sfx_unlock_render()
+    _sfx_global_click_hook()
+    sfx_render_pending()
     init_db()
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
