@@ -8,6 +8,86 @@ import re
 import hashlib
 import html
 
+
+# =========================
+# SFX (Arcade) - Seguro (no puede botar la app)
+# =========================
+def _sfx_set(kind: str):
+    """Dispara un sonido en el siguiente rerun.
+    kind: ok | extra | duplicate | error
+    """
+    try:
+        st.session_state["_sfx_kind"] = str(kind or "")
+        st.session_state["_sfx_nonce"] = int(st.session_state.get("_sfx_nonce", 0)) + 1
+    except Exception:
+        pass
+
+def _sfx_render():
+    """Renderiza (best-effort) el sonido pendiente, si existe.
+    - Nunca debe lanzar excepción.
+    - Si el navegador bloquea audio, simplemente no sonará.
+    """
+    try:
+        kind = st.session_state.get("_sfx_kind")
+        if not kind:
+            return
+
+        # Limpiar ANTES para evitar loops si algo falla
+        st.session_state["_sfx_kind"] = None
+
+        # Escapar para JS
+        _k = str(kind).replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
+        js = f"""
+<script>
+(function() {{
+  try {{
+    const kind = "{_k}";
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+    function beep(freq, ms, when) {{
+      const t0 = ctx.currentTime + (when || 0);
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = 'square';
+      o.frequency.setValueAtTime(freq, t0);
+      g.gain.setValueAtTime(0.12, t0);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t0);
+      o.stop(t0 + ms/1000.0);
+    }}
+
+    if (kind === 'ok') {{
+      // "moneda" (dos tonos ascendentes rápidos)
+      beep(880, 90, 0.00);
+      beep(1320, 110, 0.09);
+    }} else if (kind === 'duplicate') {{
+      // "repetido"
+      beep(660, 80, 0.00);
+      beep(440, 120, 0.08);
+    }} else if (kind === 'extra') {{
+      // "extra" (doble beep)
+      beep(740, 70, 0.00);
+      beep(740, 70, 0.08);
+    }} else {{
+      // error (grave descendente)
+      beep(220, 220, 0.00);
+      beep(165, 260, 0.20);
+    }}
+
+    setTimeout(() => {{ try {{ ctx.close(); }} catch(e) {{}} }}, 900);
+  }} catch(e) {{}}
+}})();
+</script>
+"""
+
+        # OJO: components.html puede fallar en algunos entornos -> no debe botar la app
+        try:
+            components.html(js, height=1)
+        except Exception:
+            pass
+    except Exception:
+        return
+
 # =========================
 # CONFIG
 # =========================
@@ -1782,17 +1862,20 @@ def page_picking():
                 s["scan_msg"] = "No se pudo leer el código."
                 s["confirmed"] = False
                 s["confirm_mode"] = None
+                _sfx_set("error")
             elif sku_detected != sku_expected:
                 s["scan_status"] = "bad"
                 s["scan_msg"] = f"Leído: {sku_detected}"
                 s["confirmed"] = False
                 s["confirm_mode"] = None
+                _sfx_set("error")
             else:
                 s["scan_status"] = "ok"
                 s["scan_msg"] = "Producto correcto."
                 s["confirmed"] = True
                 s["confirm_mode"] = "SCAN"
                 s["scan_value"] = scan
+                _sfx_set("ok")
             st.rerun()
 
     with col3:
@@ -1844,6 +1927,7 @@ def page_picking():
             q = int(str(qty_in).strip())
         except Exception:
             st.error("Ingresa un número válido.")
+            _sfx_set("error")
             q = None
 
         if q is not None:
@@ -1851,6 +1935,7 @@ def page_picking():
 
             if q > int(qty_total):
                 st.error(f"La cantidad ({q}) supera solicitado ({qty_total}).")
+                _sfx_set("error")
                 s["needs_decision"] = False
 
             elif q == int(qty_total):
@@ -1872,12 +1957,14 @@ def page_picking():
                 conn.commit()
                 state.pop(str(task_id), None)
                 st.success("OK. Siguiente…")
+                _sfx_set("ok")
                 st.rerun()
             else:
                 missing = int(qty_total) - q
                 s["needs_decision"] = True
                 s["missing"] = missing
                 st.warning(f"Faltan {missing}. Debes decidir (incidencias o reintentar).")
+                _sfx_set("extra")
 
     if s["needs_decision"]:
         st.error(f"DECISIÓN: faltan {s['missing']} unidades.")
@@ -4769,6 +4856,7 @@ def page_pkg_counter():
 
         if detected == "UNKNOWN":
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
+            _sfx_set("error")
             st.session_state[input_key] = ""
             return
 
@@ -4783,17 +4871,21 @@ def page_pkg_counter():
         label_key = _scan_extract_label_key(raw, selected_kind)
         if not label_key:
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
+            _sfx_set("error")
             st.session_state[input_key] = ""
             return
 
         ok, err = _pkg_register_scan(run_id, label_key, raw)
         if ok:
             st.session_state["pkg_flash"] = ("ok", "OK")
+            _sfx_set("ok")
         else:
             if err == "DUP":
                 st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
+                _sfx_set("duplicate")
             else:
                 st.session_state["pkg_flash"] = ("err", "Error al registrar")
+                _sfx_set("error")
 
         # dejar el campo en blanco para el siguiente escaneo
         st.session_state[input_key] = ""
@@ -4848,6 +4940,9 @@ def main():
 
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
     init_db()
+
+    # SFX (nunca debe botar la app)
+    _sfx_render()
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
     inv_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
