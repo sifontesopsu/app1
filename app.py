@@ -2587,6 +2587,7 @@ def page_full_supervisor(inv_map_sku: dict):
             if not sku:
                 sst["msg_kind"] = "bad"
                 sst["msg"] = "No se pudo leer el código."
+                sfx_emit("ERR")
                 st.rerun()
 
             conn = get_conn()
@@ -2603,9 +2604,11 @@ def page_full_supervisor(inv_map_sku: dict):
                 sst["msg_kind"] = "bad"
                 sst["msg"] = f"{sku} no pertenece a este lote."
                 sst["sku_current"] = ""
+                sfx_emit("ERR")
             else:
                 sst["msg_kind"] = "ok"
                 sst["msg"] = "SKU encontrado."
+                sfx_emit("OK")
             st.rerun()
 
     with colB:
@@ -4287,6 +4290,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             sid = _s2_extract_shipment_id(scan)
             if not sid:
                 st.error("No pude leer el ID de envío desde el escaneo.")
+                sfx_emit("ERR")
             else:
                 sale_id = _s2_find_sale_for_scan(mid, int(mesa), sid)
                 if (not sale_id) and sid:
@@ -4299,12 +4303,14 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                     info=c.fetchall(); conn.close()
                     if info:
                         st.warning(f"Etiqueta encontrada pero no pendiente en mesa {mesa}. Coincidencias: {info}")
+                        sfx_emit("ERR")
                     else:
                         st.error("No encontré esta etiqueta en corridas pendientes.")
+                        sfx_emit("ERR")
                 else:
                     st.session_state["s2_sale_open"] = sale_id
                     st.session_state["s2_clear_label_scan"] = True
-                    st.rerun()
+                    sfx_emit("OK")
                     st.rerun()
         return
 
@@ -4413,6 +4419,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
         if not row:
             st.error("SKU/EAN no pertenece a esta venta.")
+            sfx_emit("ERR")
         else:
             qty_req, picked_now, desc_ml = int(row[0]), int(row[1]), row[2]
             remaining = max(0, qty_req - picked_now)
@@ -4427,8 +4434,10 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             if remaining <= 0:
                 st.info(f"✅ Ya está completo: {title_show}")
                 st.session_state["s2_clear_prod_scan"] = True
+                sfx_emit("ERR")
                 st.rerun()
             else:
+                sfx_emit("OK")
                 st.session_state["s2_pending_sku"] = str(sku)
                 st.session_state["s2_pending_qty"] = int(remaining)
                 st.session_state["s2_pending_title"] = str(title_show)
@@ -4448,7 +4457,9 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 ok, msg = _s2_apply_pick(mid, sale_id, str(pending_sku), int(pending_qty))
                 if not ok:
                     st.error(msg or "No se pudo aplicar.")
+                    sfx_emit("ERR")
                 else:
+                    sfx_emit("OK")
                     st.session_state["s2_pending_sku"] = None
                     st.session_state["s2_pending_qty"] = 0
                     st.session_state["s2_pending_title"] = ""
@@ -4962,11 +4973,13 @@ def page_pkg_counter():
 
         if detected == "UNKNOWN":
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
+            sfx_emit("ERR")
             st.session_state[input_key] = ""
             return
 
         if detected != selected_kind:
             st.session_state["pkg_flash"] = ("err", f"Etiqueta {detected}. Estás en {selected_kind}.")
+            sfx_emit("ERR")
             st.session_state[input_key] = ""
             return
 
@@ -4982,11 +4995,14 @@ def page_pkg_counter():
         ok, err = _pkg_register_scan(run_id, label_key, raw)
         if ok:
             st.session_state["pkg_flash"] = ("ok", "OK")
+            sfx_emit("OK")
         else:
             if err == "DUP":
                 st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
+                sfx_emit("ERR")
             else:
                 st.session_state["pkg_flash"] = ("err", "Error al registrar")
+                sfx_emit("ERR")
 
         # dejar el campo en blanco para el siguiente escaneo
         st.session_state[input_key] = ""
