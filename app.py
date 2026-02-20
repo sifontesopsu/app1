@@ -2087,11 +2087,6 @@ def page_picking():
         if len(pics) > 1:
             with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
                 st.image(pics, use_container_width=True)
-    if pub_link:
-        try:
-            st.link_button("Ver imagen", pub_link, use_container_width=True)
-        except Exception:
-            st.write(f"Publicación: {pub_link}")
 
     st.markdown(f"### Solicitado: {qty_total}")
 
@@ -4708,6 +4703,24 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         row1[0].markdown(f"### {title}  \nSKU: `{sku}`")
         row1[1].markdown(f"## {int(qty)}")
         row1[2].metric("Hecho", int(picked))
+
+        # Imagen (solo bajo demanda para no ocupar espacio)
+        _img_state_key = f"s2_showimg_{sale_id}_{sku}"
+        if _img_state_key not in st.session_state:
+            st.session_state[_img_state_key] = False
+
+        if st.button("🖼️ Ver imagen", key=f"s2_btnimg_{sale_id}_{sku}"):
+            st.session_state[_img_state_key] = not bool(st.session_state.get(_img_state_key, False))
+
+        if st.session_state.get(_img_state_key, False):
+            try:
+                pics, _pub_link = get_picture_urls_for_sku(str(sku))
+            except Exception:
+                pics, _pub_link = [], ""
+            if pics:
+                st.image(pics[0], use_container_width=True)
+            else:
+                st.caption("Sin imagen disponible")
 
         if status != "DONE" and remaining > 0:
             bcols = st.columns([1,1,6])
