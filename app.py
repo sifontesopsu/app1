@@ -8,7 +8,8 @@ import re
 import hashlib
 import html
 import json
-
+import random
+import string
 # =========================
 # CONFIG
 # =========================
@@ -2962,6 +2963,139 @@ def page_admin():
     df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    st.divider()
+    st.subheader("Liberar y repartir tareas pendientes (por SKU)")
+
+    # Nota: aquí "OT" se refiere a la tarea/línea (SKU + cantidad). Solo mueve tareas PENDING (sin avance).
+    try:
+        c.execute("SELECT id, name FROM pickers ORDER BY id")
+        pickers_rows = c.fetchall()
+    except Exception:
+        pickers_rows = []
+    if not pickers_rows:
+        st.info("No hay pickeadores creados todavía.")
+    else:
+        picker_id_to_name = {int(pid): pname for pid, pname in pickers_rows}
+        picker_names = [pname for _, pname in pickers_rows]
+        picker_name_to_id = {pname: int(pid) for pid, pname in pickers_rows}
+
+        colA, colB = st.columns([1, 2])
+        with colA:
+            src_name = st.selectbox("Picker origen", picker_names, key="adm_reassign_src_picker")
+        src_id = picker_name_to_id.get(src_name)
+
+        # Traer tareas PENDING del picker origen (sin avance)
+        c.execute("""
+            SELECT pt.id,
+                   po.ot_code,
+                   pt.sku_ml,
+                   COALESCE(NULLIF(pt.title_tec,''), NULLIF(pt.title_ml,''), pt.sku_ml) AS producto,
+                   pt.qty_total
+            FROM picking_tasks pt
+            JOIN picking_ots po ON po.id = pt.ot_id
+            WHERE po.picker_id = ?
+              AND pt.status = 'PENDING'
+              AND COALESCE(pt.qty_picked,0) = 0
+            ORDER BY pt.id
+        """, (src_id,))
+        task_rows = c.fetchall()
+
+        if not task_rows:
+            st.info(f"No hay tareas pendientes para {src_name}.")
+        else:
+            df_tasks = pd.DataFrame(task_rows, columns=["task_id","OT_origen","SKU","Producto","Cantidad"])
+            # Editor con selección
+            df_edit = df_tasks.copy()
+            df_edit.insert(0, "Mover", False)
+
+            st.caption("Selecciona las tareas (SKU + cantidad) que quieres mover. Solo aparecen tareas 100% pendientes (sin avance).")
+            edited = st.data_editor(
+                df_edit,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Mover": st.column_config.CheckboxColumn("Mover", help="Marca para mover esta tarea a otro pickeador"),
+                    "task_id": st.column_config.NumberColumn("ID", disabled=True),
+                    "OT_origen": st.column_config.TextColumn("OT origen", disabled=True),
+                    "SKU": st.column_config.TextColumn("SKU", disabled=True),
+                    "Producto": st.column_config.TextColumn("Producto", disabled=True),
+                    "Cantidad": st.column_config.NumberColumn("Cant.", disabled=True),
+                },
+                disabled=["task_id","OT_origen","SKU","Producto","Cantidad"]
+            )
+
+            selected_ids = [int(r["task_id"]) for _, r in edited.iterrows() if bool(r.get("Mover"))]
+            n_sel = len(selected_ids)
+            st.write(f"**Seleccionadas:** {n_sel}")
+
+            if n_sel > 0:
+                other_picker_names = [n for n in picker_names if n != src_name]
+                if not other_picker_names:
+                    st.warning("No hay pickeadores destino disponibles.")
+                else:
+                    dests = st.multiselect("Pickeadores destino", other_picker_names, default=other_picker_names, key="adm_reassign_dests")
+                    if not dests:
+                        st.info("Elige al menos un pickeador destino.")
+                    else:
+                        st.caption("Define cuántas tareas mover a cada destino. La suma debe ser igual a las seleccionadas.")
+                        dest_counts = {}
+                        cols = st.columns(min(4, len(dests)))
+                        for i, dname in enumerate(dests):
+                            with cols[i % len(cols)]:
+                                dest_counts[dname] = st.number_input(f"{dname}", min_value=0, max_value=n_sel, value=0, step=1, key=f"adm_reassign_cnt_{dname}")
+
+                        total_move = int(sum(dest_counts.values()))
+                        st.write(f"**Total a mover según reparto:** {total_move} / {n_sel}")
+
+                        def _new_ot_code(prefix: str = "LIB"):
+                            ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                            rnd = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+                            return f"{prefix}-{ts}-{rnd}"
+
+                        if st.button("Repartir tareas seleccionadas", type="primary"):
+                            if total_move != n_sel:
+                                sfx_emit("ERR")
+                                st.error("La suma por destino debe ser exactamente igual al número de tareas seleccionadas.")
+                            else:
+                                # Reparto determinístico: por id ascendente
+                                selected_ids_sorted = sorted(selected_ids)
+                                cursor = 0
+                                moved_total = 0
+                                try:
+                                    for dname, cnt in dest_counts.items():
+                                        cnt = int(cnt)
+                                        if cnt <= 0:
+                                            continue
+                                        chunk = selected_ids_sorted[cursor:cursor+cnt]
+                                        cursor += cnt
+                                        if not chunk:
+                                            continue
+                                        dest_id = picker_name_to_id.get(dname)
+                                        # Crear OT nueva para el destino
+                                        new_code = _new_ot_code("LIB")
+                                        now_iso_ts = now_iso()
+                                        c.execute(
+                                            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at) VALUES (?,?,?,?,NULL)",
+                                            (new_code, dest_id, "OPEN", now_iso_ts)
+                                        )
+                                        new_ot_id = int(c.lastrowid)
+
+                                        qmarks = ",".join(["?"] * len(chunk))
+                                        c.execute(f"UPDATE picking_tasks SET ot_id=? WHERE id IN ({qmarks})", [new_ot_id] + chunk)
+                                        moved_total += len(chunk)
+
+                                    conn.commit()
+                                    sfx_emit("OK")
+                                    st.success(f"Listo: movidas {moved_total} tareas desde {src_name}. Se crearon OTs 'LIB-*' para los destinos.")
+                                    st.rerun()
+                                except Exception as e:
+                                    conn.rollback()
+                                    sfx_emit("ERR")
+                                    st.error(f"No se pudo repartir: {e}")
+            else:
+                st.caption("Marca al menos una tarea para habilitar el reparto.")
+
+
     st.subheader("Incidencias")
     c.execute("""
         SELECT po.ot_code, pk.name, pi.sku_ml, pi.qty_total, pi.qty_picked, pi.qty_missing, pi.reason, pi.note, pi.created_at
@@ -4923,84 +5057,26 @@ def page_pkg_counter():
         key="pkg_kind",
     )
 
-    def _maybe_unconcat(raw: str) -> tuple[str, bool]:
-        """Si el lector pega el mismo contenido 2 veces (concatenado), devuelve solo 1."""
-        s = str(raw or "").strip()
-        if not s:
-            return s, False
-        # Caso simple: el string completo es A+A
-        if len(s) >= 8 and len(s) % 2 == 0:
-            half = len(s) // 2
-            if s[:half] == s[half:]:
-                return s[:half], True
-        return s, False
-
-    def _first_json_object(s: str) -> tuple[str, bool]:
-        """Si vienen 2 JSON pegados (ej: {...}{...}), toma solo el primero."""
-        ss = str(s or "").strip()
-        if not ss.startswith("{"):
-            return ss, False
-        # Heurística rápida: si aparece '}{' asumimos 2 objetos pegados
-        if "}{" in ss:
-            first = ss.split("}{", 1)[0] + "}"
-            return first, True
-        return ss, False
-
     def _scan_detect_kind(raw: str) -> str:
-        s0 = str(raw or "").strip()
-        s, _ = _maybe_unconcat(s0)
-        if not s:
-            return "UNKNOWN"
-        if s.startswith("{") and ("hash_code" in s or "hashCode" in s or '"id"' in s or '"shipment"' in s):
-            return "FLEX"
-        if "hash_code=" in s or "hashCode=" in s:
+        s = str(raw or "").strip()
+        if s.startswith("{") and "\"hash_code\"" in s:
             return "FLEX"
         if re.fullmatch(r"\d+", s or ""):
             return "COLECTA"
         return "UNKNOWN"
 
-    def _scan_extract_label_key(raw: str, kind: str) -> tuple[str, str, bool]:
-        """Devuelve (label_key, raw_limpio, flag_concat)."""
-        s0 = str(raw or "").strip()
-        s, flag_concat = _maybe_unconcat(s0)
-
-        # COLECTA: número puro; si llega A+A (dígitos), ya lo partimos arriba
-        if kind == "COLECTA":
-            return (only_digits(s) or _pkg_norm_label(s)), s, flag_concat
-
-        # FLEX: normalmente QR entrega JSON; a veces viene URL con hash_code=...
-        ss, flag_json = _first_json_object(s)
-        flag_concat = flag_concat or flag_json
-
-        # URL con hash_code=...
-        if "hash_code=" in ss or "hashCode=" in ss:
-            try:
-                import urllib.parse
-                qs = urllib.parse.urlparse(ss).query
-                params = urllib.parse.parse_qs(qs)
-                v = (params.get("hash_code") or params.get("hashCode") or [""])[0]
-                v = str(v or "").strip()
-                if v:
-                    return v, ss, flag_concat
-            except Exception:
-                pass
-
-        if ss.startswith("{"):
+    def _scan_extract_label_key(raw: str, kind: str) -> str:
+        s = str(raw or "").strip()
+        if kind == "FLEX" and s.startswith("{"):
             try:
                 import json
-                obj = json.loads(ss)
-                # Prioridad de llaves posibles en lectores/formatos distintos
-                for k in ["hash_code", "hashCode", "id", "shipment_id", "shipmentId", "tracking_id", "trackingId", "code"]:
-                    if k in obj and obj.get(k):
-                        v = str(obj.get(k)).strip()
-                        return v, ss, flag_concat
-                # fallback
-                return (_pkg_norm_label(ss)), ss, flag_concat
+                obj = json.loads(s)
+                val = obj.get("id", "")
+                return only_digits(val) or _pkg_norm_label(s)
             except Exception:
-                return (_pkg_norm_label(ss)), ss, flag_concat
-
-        # Si no es JSON ni URL, guarda normalizado
-        return (_pkg_norm_label(ss)), ss, flag_concat
+                return _pkg_norm_label(s)
+        # COLECTA: número puro
+        return only_digits(s) or _pkg_norm_label(s)
 
     def ensure_run(kind: str) -> dict:
         run = _pkg_get_open_run(kind)
@@ -5022,12 +5098,12 @@ def page_pkg_counter():
         st.rerun()
 
     def handle_scan(input_key: str):
-        raw_in = str(st.session_state.get(input_key, "") or "").strip()
-        if not raw_in:
+        raw = str(st.session_state.get(input_key, "") or "").strip()
+        if not raw:
             return
 
         selected_kind = str(st.session_state.get("pkg_kind") or "FLEX")
-        detected = _scan_detect_kind(raw_in)
+        detected = _scan_detect_kind(raw)
 
         if detected == "UNKNOWN":
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
@@ -5044,21 +5120,16 @@ def page_pkg_counter():
         run = ensure_run(selected_kind)
         run_id = int(run["id"])
 
-        label_key, raw_clean, flag_concat = _scan_extract_label_key(raw_in, selected_kind)
+        label_key = _scan_extract_label_key(raw, selected_kind)
         if not label_key:
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            sfx_emit("ERR")
             st.session_state[input_key] = ""
             return
 
-        ok, err = _pkg_register_scan(run_id, label_key, raw_clean)
+        ok, err = _pkg_register_scan(run_id, label_key, raw)
         if ok:
-            if flag_concat:
-                st.session_state["pkg_flash"] = ("dup", f"Lectura doble detectada: se usó 1 etiqueta ({label_key})")
-                sfx_emit("ERR")
-            else:
-                st.session_state["pkg_flash"] = ("ok", "OK")
-                sfx_emit("OK")
+            st.session_state["pkg_flash"] = ("ok", "OK")
+            sfx_emit("OK")
         else:
             if err == "DUP":
                 st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
