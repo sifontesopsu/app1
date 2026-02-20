@@ -4923,43 +4923,84 @@ def page_pkg_counter():
         key="pkg_kind",
     )
 
-    def _scan_detect_kind(raw: str) -> str:
+    def _maybe_unconcat(raw: str) -> tuple[str, bool]:
+        """Si el lector pega el mismo contenido 2 veces (concatenado), devuelve solo 1."""
         s = str(raw or "").strip()
-        if s.startswith("{") and "\"hash_code\"" in s:
+        if not s:
+            return s, False
+        # Caso simple: el string completo es A+A
+        if len(s) >= 8 and len(s) % 2 == 0:
+            half = len(s) // 2
+            if s[:half] == s[half:]:
+                return s[:half], True
+        return s, False
+
+    def _first_json_object(s: str) -> tuple[str, bool]:
+        """Si vienen 2 JSON pegados (ej: {...}{...}), toma solo el primero."""
+        ss = str(s or "").strip()
+        if not ss.startswith("{"):
+            return ss, False
+        # Heurística rápida: si aparece '}{' asumimos 2 objetos pegados
+        if "}{" in ss:
+            first = ss.split("}{", 1)[0] + "}"
+            return first, True
+        return ss, False
+
+    def _scan_detect_kind(raw: str) -> str:
+        s0 = str(raw or "").strip()
+        s, _ = _maybe_unconcat(s0)
+        if not s:
+            return "UNKNOWN"
+        if s.startswith("{") and ("hash_code" in s or "hashCode" in s or '"id"' in s or '"shipment"' in s):
+            return "FLEX"
+        if "hash_code=" in s or "hashCode=" in s:
             return "FLEX"
         if re.fullmatch(r"\d+", s or ""):
             return "COLECTA"
         return "UNKNOWN"
 
-    def _scan_extract_label_key(raw: str, kind: str) -> str:
-        s = str(raw or "").strip()
+    def _scan_extract_label_key(raw: str, kind: str) -> tuple[str, str, bool]:
+        """Devuelve (label_key, raw_limpio, flag_concat)."""
+        s0 = str(raw or "").strip()
+        s, flag_concat = _maybe_unconcat(s0)
 
-        # FLEX: normalmente viene como JSON con campos tipo hash_code / id.
-        # Para que el conteo sea estable, priorizamos un identificador "fijo" del envío/etiqueta.
-        if kind == "FLEX":
-            # Caso 1: JSON
-            if s.startswith("{"):
-                try:
-                    import json
-                    obj = json.loads(s)
-                    for k in ("hash_code", "hashCode", "id", "shipment_id", "shipmentId", "tracking_id", "trackingId", "code"):
-                        if k in obj and obj.get(k):
-                            val = str(obj.get(k))
-                            return only_digits(val) or val.strip() or _pkg_norm_label(s)
-                except Exception:
-                    pass
+        # COLECTA: número puro; si llega A+A (dígitos), ya lo partimos arriba
+        if kind == "COLECTA":
+            return (only_digits(s) or _pkg_norm_label(s)), s, flag_concat
 
-            # Caso 2: string (algunos lectores entregan URL / texto)
-            m = re.search(r"(hash_code|hashCode)=([A-Za-z0-9_-]+)", s)
-            if m:
-                val = m.group(2)
-                return only_digits(val) or val.strip() or _pkg_norm_label(s)
+        # FLEX: normalmente QR entrega JSON; a veces viene URL con hash_code=...
+        ss, flag_json = _first_json_object(s)
+        flag_concat = flag_concat or flag_json
 
-            # Fallback
-            return _pkg_norm_label(s)
+        # URL con hash_code=...
+        if "hash_code=" in ss or "hashCode=" in ss:
+            try:
+                import urllib.parse
+                qs = urllib.parse.urlparse(ss).query
+                params = urllib.parse.parse_qs(qs)
+                v = (params.get("hash_code") or params.get("hashCode") or [""])[0]
+                v = str(v or "").strip()
+                if v:
+                    return v, ss, flag_concat
+            except Exception:
+                pass
 
-        # COLECTA: número puro (shipment_id / tracking)
-        return only_digits(s) or _pkg_norm_label(s)
+        if ss.startswith("{"):
+            try:
+                import json
+                obj = json.loads(ss)
+                # Prioridad de llaves posibles en lectores/formatos distintos
+                for k in ["hash_code", "hashCode", "id", "shipment_id", "shipmentId", "tracking_id", "trackingId", "code"]:
+                    if k in obj and obj.get(k):
+                        v = str(obj.get(k)).strip()
+                        return v, ss, flag_concat
+                # fallback
+                return (_pkg_norm_label(ss)), ss, flag_concat
+            except Exception:
+                return (_pkg_norm_label(ss)), ss, flag_concat
+
+        # Si no es JSON ni URL, guarda normalizado
+        return (_pkg_norm_label(ss)), ss, flag_concat
 
     def ensure_run(kind: str) -> dict:
         run = _pkg_get_open_run(kind)
@@ -4981,12 +5022,12 @@ def page_pkg_counter():
         st.rerun()
 
     def handle_scan(input_key: str):
-        raw = str(st.session_state.get(input_key, "") or "").strip()
-        if not raw:
+        raw_in = str(st.session_state.get(input_key, "") or "").strip()
+        if not raw_in:
             return
 
         selected_kind = str(st.session_state.get("pkg_kind") or "FLEX")
-        detected = _scan_detect_kind(raw)
+        detected = _scan_detect_kind(raw_in)
 
         if detected == "UNKNOWN":
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
@@ -5003,41 +5044,21 @@ def page_pkg_counter():
         run = ensure_run(selected_kind)
         run_id = int(run["id"])
 
-        label_key = _scan_extract_label_key(raw, selected_kind)
+        label_key, raw_clean, flag_concat = _scan_extract_label_key(raw_in, selected_kind)
         if not label_key:
             st.session_state["pkg_flash"] = ("err", "Etiqueta inválida.")
-            st.session_state[input_key] = ""
-            return
-
-        # Anti "doble lectura" por escaneo muy rápido:
-        # Si el lector dispara dos veces el mismo código en milisegundos,
-        # NO lo contamos como paquete nuevo.
-        now_ts = float(datetime.utcnow().timestamp())
-        last_ts = float(st.session_state.get("pkg_last_scan_ts") or 0.0)
-        last_raw = str(st.session_state.get("pkg_last_raw") or "")
-        last_key = str(st.session_state.get("pkg_last_label_key") or "")
-
-        # 1) misma etiqueta (label_key) en una ventana corta => DUP
-        if last_key and label_key == last_key and (now_ts - last_ts) < 1.5:
-            st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
             sfx_emit("ERR")
             st.session_state[input_key] = ""
             return
 
-        # 2) mismo raw exacto en ventana MUY corta (por si el label_key cambia por ruido)
-        if last_raw and raw == last_raw and (now_ts - last_ts) < 0.8:
-            st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
-            sfx_emit("ERR")
-            st.session_state[input_key] = ""
-            return
-
-        ok, err = _pkg_register_scan(run_id, label_key, raw)
+        ok, err = _pkg_register_scan(run_id, label_key, raw_clean)
         if ok:
-            st.session_state["pkg_flash"] = ("ok", "OK")
-            sfx_emit("OK")
-            st.session_state["pkg_last_scan_ts"] = now_ts
-            st.session_state["pkg_last_raw"] = raw
-            st.session_state["pkg_last_label_key"] = label_key
+            if flag_concat:
+                st.session_state["pkg_flash"] = ("dup", f"Lectura doble detectada: se usó 1 etiqueta ({label_key})")
+                sfx_emit("ERR")
+            else:
+                st.session_state["pkg_flash"] = ("ok", "OK")
+                sfx_emit("OK")
         else:
             if err == "DUP":
                 st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
