@@ -4933,15 +4933,32 @@ def page_pkg_counter():
 
     def _scan_extract_label_key(raw: str, kind: str) -> str:
         s = str(raw or "").strip()
-        if kind == "FLEX" and s.startswith("{"):
-            try:
-                import json
-                obj = json.loads(s)
-                val = obj.get("id", "")
-                return only_digits(val) or _pkg_norm_label(s)
-            except Exception:
-                return _pkg_norm_label(s)
-        # COLECTA: número puro
+
+        # FLEX: normalmente viene como JSON con campos tipo hash_code / id.
+        # Para que el conteo sea estable, priorizamos un identificador "fijo" del envío/etiqueta.
+        if kind == "FLEX":
+            # Caso 1: JSON
+            if s.startswith("{"):
+                try:
+                    import json
+                    obj = json.loads(s)
+                    for k in ("hash_code", "hashCode", "id", "shipment_id", "shipmentId", "tracking_id", "trackingId", "code"):
+                        if k in obj and obj.get(k):
+                            val = str(obj.get(k))
+                            return only_digits(val) or val.strip() or _pkg_norm_label(s)
+                except Exception:
+                    pass
+
+            # Caso 2: string (algunos lectores entregan URL / texto)
+            m = re.search(r"(hash_code|hashCode)=([A-Za-z0-9_-]+)", s)
+            if m:
+                val = m.group(2)
+                return only_digits(val) or val.strip() or _pkg_norm_label(s)
+
+            # Fallback
+            return _pkg_norm_label(s)
+
+        # COLECTA: número puro (shipment_id / tracking)
         return only_digits(s) or _pkg_norm_label(s)
 
     def ensure_run(kind: str) -> dict:
@@ -4992,10 +5009,35 @@ def page_pkg_counter():
             st.session_state[input_key] = ""
             return
 
+        # Anti "doble lectura" por escaneo muy rápido:
+        # Si el lector dispara dos veces el mismo código en milisegundos,
+        # NO lo contamos como paquete nuevo.
+        now_ts = float(datetime.utcnow().timestamp())
+        last_ts = float(st.session_state.get("pkg_last_scan_ts") or 0.0)
+        last_raw = str(st.session_state.get("pkg_last_raw") or "")
+        last_key = str(st.session_state.get("pkg_last_label_key") or "")
+
+        # 1) misma etiqueta (label_key) en una ventana corta => DUP
+        if last_key and label_key == last_key and (now_ts - last_ts) < 1.5:
+            st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
+            sfx_emit("ERR")
+            st.session_state[input_key] = ""
+            return
+
+        # 2) mismo raw exacto en ventana MUY corta (por si el label_key cambia por ruido)
+        if last_raw and raw == last_raw and (now_ts - last_ts) < 0.8:
+            st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
+            sfx_emit("ERR")
+            st.session_state[input_key] = ""
+            return
+
         ok, err = _pkg_register_scan(run_id, label_key, raw)
         if ok:
             st.session_state["pkg_flash"] = ("ok", "OK")
             sfx_emit("OK")
+            st.session_state["pkg_last_scan_ts"] = now_ts
+            st.session_state["pkg_last_raw"] = raw
+            st.session_state["pkg_last_label_key"] = label_key
         else:
             if err == "DUP":
                 st.session_state["pkg_flash"] = ("dup", f"Repetida: {label_key}")
