@@ -10,6 +10,7 @@ import html
 import json
 import random
 import string
+import requests
 # =========================
 # CONFIG
 # =========================
@@ -714,6 +715,18 @@ def init_db():
     );
     """)
 
+
+    # Links / publicaciones (para ver fotos)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS sku_publications (
+        sku_ml TEXT PRIMARY KEY,
+        ml_item_id TEXT,
+        title TEXT,
+        link TEXT,
+        updated_at TEXT
+    );
+    """)
+
     # --- CONTADOR DE PAQUETES (Flex/Colecta) ---
     c.execute("""
     CREATE TABLE IF NOT EXISTS pkg_counter_runs (
@@ -891,6 +904,14 @@ def init_db():
     _ensure_col("sorting_labels", "buyer", "TEXT")
     _ensure_col("sorting_labels", "address", "TEXT")
     _ensure_col("sorting_labels", "raw", "TEXT")
+
+
+    # sku_publications
+    _ensure_col("sku_publications", "sku_ml", "TEXT")
+    _ensure_col("sku_publications", "ml_item_id", "TEXT")
+    _ensure_col("sku_publications", "title", "TEXT")
+    _ensure_col("sku_publications", "link", "TEXT")
+    _ensure_col("sku_publications", "updated_at", "TEXT")
 
     # Asegurar índices/constraints para UPSERT (BD antiguas)
     try:
@@ -1132,6 +1153,146 @@ def master_bootstrap(master_path: str):
     inv_map_sku, barcode_to_sku, conflicts = get_master_cached(master_path)
     upsert_barcodes_to_db(barcode_to_sku)
     return inv_map_sku, barcode_to_sku, conflicts
+
+
+
+# =========================
+# PUBLICACIONES (Links + Fotos por SKU)
+# =========================
+ML_ITEM_RE = re.compile(r"\b(ML[A-Z]{1,3}[-]?(\d+))\b", re.IGNORECASE)
+
+def extract_ml_item_id(value: str) -> str:
+    """Extrae un ID tipo MLC123 o MLC-123 desde un link o celda."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    m = ML_ITEM_RE.search(s)
+    if not m:
+        return ""
+    prefix = m.group(1).upper().replace("-", "")
+    # Normalizar: MLC123456789 (sin guión)
+    return prefix
+
+def import_publication_links_excel(file) -> pd.DataFrame:
+    """Lee Excel con columnas Id, SKU, Título, Link (tolerante)."""
+    df = pd.read_excel(file, dtype=str)
+    # normalizar headers
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    sku_c = cols.get("sku") or cols.get("codigo") or cols.get("código") or cols.get("sku_ml")
+    id_c = cols.get("id") or cols.get("item") or cols.get("item_id") or cols.get("ml_item_id")
+    title_c = cols.get("título") or cols.get("titulo") or cols.get("title")
+    link_c = cols.get("link") or cols.get("url") or cols.get("enlace")
+
+    if not sku_c:
+        raise ValueError("No encuentro columna SKU en el Excel.")
+    if not link_c and not id_c:
+        raise ValueError("El Excel debe traer Link (url) o Id (item).")
+
+    out = pd.DataFrame()
+    out["sku_ml"] = df[sku_c].astype(str).map(normalize_sku)
+    out["title"] = df[title_c].astype(str).fillna("").map(lambda x: str(x).strip()) if title_c else ""
+    out["link"] = df[link_c].astype(str).fillna("").map(lambda x: str(x).strip()) if link_c else ""
+    # item id: preferir Id, si no, extraer desde link
+    if id_c:
+        out["ml_item_id"] = df[id_c].astype(str).fillna("").map(extract_ml_item_id)
+    else:
+        out["ml_item_id"] = ""
+    need = out["ml_item_id"].eq("")
+    if need.any():
+        out.loc[need, "ml_item_id"] = out.loc[need, "link"].map(extract_ml_item_id)
+
+    out = out[out["sku_ml"].ne("")].copy()
+    out = out.drop_duplicates(subset=["sku_ml"], keep="last")
+    return out[["sku_ml", "ml_item_id", "title", "link"]]
+
+def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
+    """Guarda/actualiza publicaciones en DB. Retorna (ok, sin_id)."""
+    if df_pub is None or df_pub.empty:
+        return 0, 0
+    ok = 0
+    noid = 0
+    conn = get_conn()
+    c = conn.cursor()
+    for _, r in df_pub.iterrows():
+        sku = normalize_sku(r.get("sku_ml", ""))
+        if not sku:
+            continue
+        item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
+        title = str(r.get("title", "") or "").strip()
+        link = str(r.get("link", "") or "").strip()
+        if not item_id:
+            noid += 1
+        c.execute(
+            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(sku_ml) DO UPDATE SET
+                 ml_item_id=excluded.ml_item_id,
+                 title=excluded.title,
+                 link=excluded.link,
+                 updated_at=excluded.updated_at
+            """,
+            (sku, item_id, title, link, now_iso())
+        )
+        ok += 1
+    conn.commit()
+    conn.close()
+    return ok, noid
+
+def get_publication_row(sku: str) -> dict:
+    sku = normalize_sku(sku)
+    if not sku:
+        return {}
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT sku_ml, ml_item_id, title, link, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return {}
+    return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def ml_item_pictures_cached(ml_item_id: str) -> list[str]:
+    """Obtiene URLs de fotos desde API pública de Mercado Libre."""
+    item = (ml_item_id or "").strip().upper().replace("-", "")
+    if not item:
+        return []
+    try:
+        url = f"https://api.mercadolibre.com/items/{item}"
+        r = requests.get(url, timeout=6)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        pics = data.get("pictures") or []
+        out = []
+        for p in pics:
+            u = p.get("secure_url") or p.get("url") or ""
+            if u:
+                out.append(u)
+        # fallback: thumbnail
+        if not out:
+            thumb = data.get("thumbnail") or ""
+            if thumb:
+                out = [thumb]
+        # dedupe
+        seen=set(); uniq=[]
+        for u in out:
+            if u not in seen:
+                seen.add(u); uniq.append(u)
+        return uniq
+    except Exception:
+        return []
+
+def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
+    """Retorna (urls, link_publicacion)."""
+    row = get_publication_row(sku)
+    if not row:
+        return [], ""
+    item_id = row.get("ml_item_id") or ""
+    link = row.get("link") or ""
+    urls = ml_item_pictures_cached(item_id) if item_id else []
+    return urls, link
+
 
 
 
@@ -1920,6 +2081,22 @@ def page_picking():
         f'<div class="hero"><div class="prod" style="white-space: normal; overflow-wrap: anywhere; word-break: break-word;">{html.escape(str(producto_show))}</div></div>',
         unsafe_allow_html=True,
     )
+
+    # Fotos del producto (si existe match por SKU en publicaciones)
+    try:
+        pics, pub_link = get_picture_urls_for_sku(sku_expected)
+    except Exception:
+        pics, pub_link = [], ""
+    if pics:
+        st.image(pics[0], use_container_width=True)
+        if len(pics) > 1:
+            with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
+                st.image(pics, use_container_width=True)
+    if pub_link:
+        try:
+            st.link_button("Abrir publicación", pub_link, use_container_width=True)
+        except Exception:
+            st.write(f"Publicación: {pub_link}")
 
     st.markdown(f"### Solicitado: {qty_total}")
 
@@ -2962,6 +3139,28 @@ def page_admin():
     df["Creada"] = df["Creada"].apply(to_chile_display)
     df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("Fotos de productos (Publicaciones)")
+    st.caption("Carga el Excel con columnas SKU + Link/Id para poder mostrar fotos dentro del sistema.")
+    up = st.file_uploader("Excel de links de publicaciones (xlsx)", type=["xlsx"], key="pub_links_xlsx")
+    colA, colB = st.columns([1,1])
+    with colA:
+        do_load = st.button("Cargar / actualizar links", use_container_width=True, key="pub_links_load_btn")
+    with colB:
+        st.info("Tip: con esto podrás ver fotos en Picking/Sorting/Full cuando exista match por SKU.")
+    if do_load:
+        if up is None:
+            st.warning("Sube el Excel primero.")
+        else:
+            try:
+                dfp = import_publication_links_excel(up)
+                ok_n, noid_n = upsert_publications_to_db(dfp)
+                st.success(f"Listo: {ok_n} SKUs guardados/actualizados. Sin ID detectado: {noid_n}.")
+                st.dataframe(dfp.head(30), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"No se pudo cargar: {e}")
+
+    st.divider()
 
     st.divider()
     st.subheader("Liberar y repartir tareas pendientes (por SKU)")
