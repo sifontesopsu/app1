@@ -3008,11 +3008,22 @@ def page_admin():
             df_edit = df_tasks.copy()
             df_edit.insert(0, "Mover", False)
 
-            st.caption("Selecciona las tareas (SKU + cantidad) que quieres mover. Solo aparecen tareas 100% pendientes (sin avance).")
+            # Botón: seleccionar todo (solo afecta la columna "Mover")
+            col_sel1, _ = st.columns([1, 5])
+            with col_sel1:
+                if st.button("Seleccionar todo", key="adm_reassign_select_all"):
+                    st.session_state["adm_reassign_select_all_flag"] = True
+
+            if st.session_state.get("adm_reassign_select_all_flag"):
+                df_edit["Mover"] = True
+                st.session_state["adm_reassign_select_all_flag"] = False
+
             edited = st.data_editor(
                 df_edit,
                 use_container_width=True,
                 hide_index=True,
+                key="adm_reassign_editor",
+                column_order=["Mover", "OT_origen", "SKU", "Producto", "Cantidad"],
                 column_config={
                     "Mover": st.column_config.CheckboxColumn("Mover", help="Marca para mover esta tarea a otro pickeador"),
                     "task_id": st.column_config.NumberColumn("ID", disabled=True),
