@@ -51,9 +51,6 @@ MASTER_FILE = "maestro_sku_ean.xlsx"
 # Maestro de SKUs para CORTES (rollos / corte manual)
 CORTES_FILE = "CORTES.xlsx"
 
-# Excel con links/ids de publicaciones para fotos (en el repo, igual que maestro/cortes)
-PUBLICATIONS_FILE = "links_publicaciones.xlsx"
-
 # =========================
 # SFX (Sistema A: CLICK + OK/ERR) — estable para Chrome/Android
 # =========================
@@ -1241,24 +1238,6 @@ def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
     conn.close()
     return ok, noid
 
-
-@st.cache_data(show_spinner=False)
-def load_publications_from_path(path: str) -> pd.DataFrame:
-    """Carga el Excel de publicaciones desde disco (repo) con cache (por contenido/mtime)."""
-    if not path or not os.path.exists(path):
-        return pd.DataFrame()
-    try:
-        # import_publication_links_excel acepta path o file-like
-        return import_publication_links_excel(path)
-    except Exception:
-        return pd.DataFrame()
-
-def publications_bootstrap(path: str = PUBLICATIONS_FILE) -> tuple[int, int]:
-    """Carga/actualiza sku_publications desde el Excel del repo (igual que maestro/cortes)."""
-    df_pub = load_publications_from_path(path)
-    if df_pub is None or df_pub.empty:
-        return 0, 0
-    return upsert_publications_to_db(df_pub)
 def get_publication_row(sku: str) -> dict:
     sku = normalize_sku(sku)
     if not sku:
@@ -1272,53 +1251,48 @@ def get_publication_row(sku: str) -> dict:
         return {}
     return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
 
+OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+    re.IGNORECASE
+)
+
 @st.cache_data(show_spinner=False, ttl=24*3600)
-def ml_item_pictures_cached(ml_item_id: str) -> list[str]:
-    """Obtiene URLs de fotos desde API pública de Mercado Libre."""
-    item = (ml_item_id or "").strip().upper().replace("-", "")
-    if not item:
-        return []
+def publication_main_image_from_html(link: str) -> str:
+    """Devuelve 1 URL de imagen principal leyendo og:image desde el HTML de la publicación.
+
+    Sin API: solo usa el link público de Mercado Libre.
+    """
+    url = (link or "").strip()
+    if not url:
+        return ""
     try:
-        url = f"https://api.mercadolibre.com/items/{item}"
-        r = requests.get(url, timeout=6)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+        }
+        r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
         if r.status_code != 200:
-            return []
-        data = r.json()
-        pics = data.get("pictures") or []
-        out = []
-        for p in pics:
-            u = p.get("secure_url") or p.get("url") or ""
-            if u:
-                out.append(u)
-        # fallback: thumbnail
-        if not out:
-            thumb = data.get("thumbnail") or ""
-            if thumb:
-                out = [thumb]
-        # dedupe
-        seen=set(); uniq=[]
-        for u in out:
-            if u not in seen:
-                seen.add(u); uniq.append(u)
-        return uniq
+            return ""
+        html_text = r.text or ""
+        m = OG_IMAGE_RE.search(html_text)
+        return m.group(1).strip() if m else ""
     except Exception:
-        return []
+        return ""
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
-    """Retorna (urls, link_publicacion)."""
+    """Retorna (urls, link_publicacion).
+
+    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
+    """
     row = get_publication_row(sku)
     if not row:
         return [], ""
-    item_id = row.get("ml_item_id") or ""
-    link = row.get("link") or ""
-    urls = ml_item_pictures_cached(item_id) if item_id else []
-    return urls, link
-
-
-
-
-
-# =========================
+    link = (row.get("link") or "").strip()
+    if not link:
+        return [], ""
+    img = publication_main_image_from_html(link)
+    urls = [img] if img else []
+    return urls, link# =========================
 # CORTES (lista de SKUs)
 # =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
@@ -2115,7 +2089,7 @@ def page_picking():
                 st.image(pics, use_container_width=True)
     if pub_link:
         try:
-            st.link_button("Abrir publicación", pub_link, use_container_width=True)
+            st.link_button("Ver imagen", pub_link, use_container_width=True)
         except Exception:
             st.write(f"Publicación: {pub_link}")
 
@@ -2879,22 +2853,6 @@ def page_full_supervisor(inv_map_sku: dict):
         unsafe_allow_html=True
     )
 
-    # Fotos del producto (si existe match por SKU en publicaciones)
-    try:
-        pics, pub_link = get_picture_urls_for_sku(sku_db)
-    except Exception:
-        pics, pub_link = [], ""
-    if pics:
-        st.image(pics[0], use_container_width=True)
-        if len(pics) > 1:
-            with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
-                st.image(pics, use_container_width=True)
-    if pub_link:
-        try:
-            st.link_button("Abrir publicación", pub_link, use_container_width=True)
-        except Exception:
-            st.write(pub_link)
-
     qty_label = "Cantidad a acopiar"
     qty_in = st.text_input(qty_label, key=qty_key)
     force_tel_keyboard(qty_label)
@@ -3178,43 +3136,24 @@ def page_admin():
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.subheader("Fotos de productos (Publicaciones)")
-    st.caption("Lee el Excel de links/ids desde el repo (igual que maestro/cortes). No necesitas subirlo todos los días.")
-
-    file_ok = os.path.exists(PUBLICATIONS_FILE)
-    if file_ok:
-        st.success(f"Archivo detectado: {PUBLICATIONS_FILE}")
-    else:
-        st.warning(f"No encuentro {PUBLICATIONS_FILE} en la carpeta de la app. Súbelo al repo junto al app.py.")
-
+    st.caption("Carga el Excel con columnas SKU + Link/Id para poder mostrar fotos dentro del sistema.")
+    up = st.file_uploader("Excel de links de publicaciones (xlsx)", type=["xlsx"], key="pub_links_xlsx")
     colA, colB = st.columns([1,1])
     with colA:
-        do_load_repo = st.button("Cargar / actualizar desde archivo del repo", use_container_width=True, key="pub_links_load_repo_btn", disabled=not file_ok)
+        do_load = st.button("Cargar / actualizar links", use_container_width=True, key="pub_links_load_btn")
     with colB:
-        st.info("Con esto verás fotos en Picking / Sorting / Full cuando exista match por SKU.")
-
-    if do_load_repo and file_ok:
-        try:
-            ok_n, noid_n = publications_bootstrap(PUBLICATIONS_FILE)
-            dfp = load_publications_from_path(PUBLICATIONS_FILE)
-            st.success(f"Listo: {ok_n} SKUs guardados/actualizados. Sin ID detectado: {noid_n}.")
-            if dfp is not None and not dfp.empty:
+        st.info("Tip: con esto podrás ver fotos en Picking/Sorting/Full cuando exista match por SKU.")
+    if do_load:
+        if up is None:
+            st.warning("Sube el Excel primero.")
+        else:
+            try:
+                dfp = import_publication_links_excel(up)
+                ok_n, noid_n = upsert_publications_to_db(dfp)
+                st.success(f"Listo: {ok_n} SKUs guardados/actualizados. Sin ID detectado: {noid_n}.")
                 st.dataframe(dfp.head(30), use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.error(f"No se pudo cargar: {e}")
-
-    with st.expander("Carga manual (opcional)", expanded=False):
-        up = st.file_uploader("Excel de links de publicaciones (xlsx)", type=["xlsx"], key="pub_links_xlsx")
-        if st.button("Cargar manualmente", use_container_width=True, key="pub_links_load_manual_btn"):
-            if up is None:
-                st.warning("Sube el Excel primero.")
-            else:
-                try:
-                    dfp = import_publication_links_excel(up)
-                    ok_n, noid_n = upsert_publications_to_db(dfp)
-                    st.success(f"Listo: {ok_n} SKUs guardados/actualizados. Sin ID detectado: {noid_n}.")
-                    st.dataframe(dfp.head(30), use_container_width=True, hide_index=True)
-                except Exception as e:
-                    st.error(f"No se pudo cargar: {e}")
+            except Exception as e:
+                st.error(f"No se pudo cargar: {e}")
 
     st.divider()
 
@@ -4851,22 +4790,6 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         pending_title = st.session_state.get("s2_pending_title", "") or pending_sku
 
         st.warning(f"Verificar **{pending_qty}** unidad(es) para: **{pending_title}**")
-
-        # Fotos del producto (si existe match por SKU en publicaciones)
-        try:
-            pics, pub_link = get_picture_urls_for_sku(pending_sku)
-        except Exception:
-            pics, pub_link = [], ""
-        if pics:
-            st.image(pics[0], use_container_width=True)
-            if len(pics) > 1:
-                with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
-                    st.image(pics, use_container_width=True)
-        if pub_link:
-            try:
-                st.link_button("Abrir publicación", pub_link, use_container_width=True)
-            except Exception:
-                st.write(pub_link)
         cA, cB = st.columns([2, 1])
         with cA:
             if st.button(f"✅ Verificar {pending_qty} y cerrar producto", key=f"s2_verify_{sale_id}_{pending_sku}", use_container_width=True):
@@ -5482,8 +5405,6 @@ def main():
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
     inv_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
-    # Cargar links/ids de publicaciones desde el repo (para fotos)
-    publications_bootstrap(PUBLICATIONS_FILE)
 
     # Si no hay modo seleccionado, mostramos lobby y salimos
     if "app_mode" not in st.session_state:
