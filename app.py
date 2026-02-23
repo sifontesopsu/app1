@@ -3130,8 +3130,29 @@ def page_admin():
     df["Cerrada"] = df["Cerrada"].apply(to_chile_display)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    st.subheader("Fotos de productos (Publicaciones)")
+    st.caption("Carga el Excel con columnas SKU + Link/Id para poder mostrar fotos dentro del sistema.")
+    up = st.file_uploader("Excel de links de publicaciones (xlsx)", type=["xlsx"], key="pub_links_xlsx")
+    colA, colB = st.columns([1,1])
+    with colA:
+        do_load = st.button("Cargar / actualizar links", use_container_width=True, key="pub_links_load_btn")
+    with colB:
+        st.info("Tip: con esto podrás ver fotos en Picking/Sorting/Full cuando exista match por SKU.")
+    if do_load:
+        if up is None:
+            st.warning("Sube el Excel primero.")
+        else:
+            try:
+                dfp = import_publication_links_excel(up)
+                ok_n, noid_n = upsert_publications_to_db(dfp)
+                st.success(f"Listo: {ok_n} SKUs guardados/actualizados. Sin ID detectado: {noid_n}.")
+                st.dataframe(dfp.head(30), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"No se pudo cargar: {e}")
+
     st.divider()
 
+    st.divider()
     st.subheader("Liberar y repartir tareas pendientes (por SKU)")
 
     # Nota: aquí "OT" se refiere a la tarea/línea (SKU + cantidad). Solo mueve tareas PENDING (sin avance).
