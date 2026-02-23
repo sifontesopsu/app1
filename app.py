@@ -51,6 +51,10 @@ MASTER_FILE = "maestro_sku_ean.xlsx"
 # Maestro de SKUs para CORTES (rollos / corte manual)
 CORTES_FILE = "CORTES.xlsx"
 
+# Links de publicaciones (SKU -> item/link/fotos)
+# Debe estar en el repo, en la misma carpeta que app.py
+PUBLICATIONS_FILE = "links de publicaciones.xlsx"
+
 # =========================
 # SFX (Sistema A: CLICK + OK/ERR) — estable para Chrome/Android
 # =========================
@@ -1459,6 +1463,45 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
                             # al mismo SKU en el mismo bloque (raro, pero seguro).
 
     return pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
+
+
+
+# =========================
+# AUTO-CARGA PUBLICACIONES (desde repo)
+# =========================
+def publications_bootstrap(path: str = PUBLICATIONS_FILE):
+    """Carga/actualiza automáticamente los links de publicaciones desde el repo.
+    - Evita recargar en cada rerun usando mtime.
+    - No requiere upload manual desde el panel administrador.
+    """
+    ss = st.session_state
+    cache_key = "_pub_links_mtime"
+
+    if not path or not os.path.exists(path):
+        ss["_pub_links_status"] = ("missing", str(path or ""))
+        return 0, 0, False
+
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+
+    if ss.get(cache_key) == mtime and ss.get("_pub_links_loaded", False):
+        return int(ss.get("_pub_links_ok", 0) or 0), int(ss.get("_pub_links_noid", 0) or 0), False
+
+    try:
+        dfp = import_publication_links_excel(path)
+        ok_n, noid_n = upsert_publications_to_db(dfp)
+        ss[cache_key] = mtime
+        ss["_pub_links_loaded"] = True
+        ss["_pub_links_ok"] = int(ok_n or 0)
+        ss["_pub_links_noid"] = int(noid_n or 0)
+        ss["_pub_links_status"] = ("ok", str(path))
+        return int(ok_n or 0), int(noid_n or 0), True
+    except Exception as e:
+        ss["_pub_links_status"] = ("err", str(e))
+        return 0, 0, False
+
 
 
 # =========================
@@ -3131,24 +3174,22 @@ def page_admin():
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.subheader("Fotos de productos (Publicaciones)")
-    st.caption("Carga el Excel con columnas SKU + Link/Id para poder mostrar fotos dentro del sistema.")
-    up = st.file_uploader("Excel de links de publicaciones (xlsx)", type=["xlsx"], key="pub_links_xlsx")
-    colA, colB = st.columns([1,1])
-    with colA:
-        do_load = st.button("Cargar / actualizar links", use_container_width=True, key="pub_links_load_btn")
-    with colB:
-        st.info("Tip: con esto podrás ver fotos en Picking/Sorting/Full cuando exista match por SKU.")
-    if do_load:
-        if up is None:
-            st.warning("Sube el Excel primero.")
-        else:
-            try:
-                dfp = import_publication_links_excel(up)
-                ok_n, noid_n = upsert_publications_to_db(dfp)
-                st.success(f"Listo: {ok_n} SKUs guardados/actualizados. Sin ID detectado: {noid_n}.")
-                st.dataframe(dfp.head(30), use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.error(f"No se pudo cargar: {e}")
+    st.caption(f"Se carga automáticamente desde **{PUBLICATIONS_FILE}** (incluido en el repo).")
+    
+    if not os.path.exists(PUBLICATIONS_FILE):
+        st.warning(f"No se encontró el archivo: {PUBLICATIONS_FILE}. (No se mostrarán fotos por SKU)")
+    else:
+        # Estado simple desde DB
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+        try:
+            c2.execute("SELECT COUNT(1), MAX(updated_at) FROM sku_publications;")
+            n_pubs, last_upd = c2.fetchone()
+        except Exception:
+            n_pubs, last_upd = 0, None
+        conn2.close()
+    
+        st.info(f"Links cargados: **{int(n_pubs or 0)}** SKUs. Última actualización: **{to_chile_display(last_upd) if last_upd else '-'}**")
 
     st.divider()
 
@@ -5418,6 +5459,10 @@ def main():
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
     inv_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
+
+    # Auto-carga links de publicaciones (fotos por SKU) desde repo
+    _ = publications_bootstrap(PUBLICATIONS_FILE)
+
 
     # Si no hay modo seleccionado, mostramos lobby y salimos
     if "app_mode" not in st.session_state:
