@@ -4513,6 +4513,20 @@ def _s2_find_sale_for_pack_scan(mid:int, mesa:int, pack_id:str):
     conn.close()
     return row[0] if row else None
 
+def _s2_next_pending_sale_in_sequence(mid:int, mesa:int):
+    """Devuelve la próxima venta pendiente (secuencia obligatoria) para una mesa,
+    ordenada por página y luego por sale_id (orden estable)."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""SELECT sale_id, shipment_id, pack_id, page_no
+                 FROM s2_sales
+                 WHERE manifest_id=? AND mesa=? AND status='PENDING'
+                 ORDER BY page_no, sale_id
+                 LIMIT 1;""", (mid, int(mesa)))
+    row = c.fetchone()
+    conn.close()
+    return row  # (sale_id, shipment_id, pack_id, page_no) o None
+
 
 def _s2_sale_items(mid:int, sale_id:str):
     conn=get_conn()
@@ -4696,20 +4710,39 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 st.error("No pude leer el ID de envío desde el escaneo.")
                 sfx_emit("ERR")
             else:
-                sale_id = _s2_find_sale_for_scan(mid, int(mesa), sid)
-                if (not sale_id) and sid:
-                    # fallback: si el escaneo corresponde a Pack ID (Colecta)
-                    sale_id = _s2_find_sale_for_pack_scan(mid, int(mesa), sid)
+                # Secuencia obligatoria: solo se puede abrir la PRÓXIMA venta pendiente según manifiesto (página -> venta)
+                nxt = _s2_next_pending_sale_in_sequence(mid, int(mesa))
+                if not nxt:
+                    st.success("No hay más ventas pendientes en esta mesa.")
+                    sfx_emit("OK")
+                    st.session_state["s2_clear_label_scan"] = True
+                    st.rerun()
+                expected_sale_id, expected_ship, expected_pack, expected_page = nxt
+                sale_id = None
+                if sid and expected_ship and str(sid) == str(expected_ship):
+                    sale_id = expected_sale_id
+                elif sid and expected_pack and str(sid) == str(expected_pack):
+                    sale_id = expected_sale_id
                 if not sale_id:
-                    # debug: exists in other mesa?
+                    # Existe en el manifiesto pero NO es la siguiente venta => bloquear por secuencia
                     conn=get_conn(); c=conn.cursor()
-                    c.execute("SELECT mesa, status FROM s2_sales WHERE manifest_id=? AND shipment_id=? LIMIT 5;", (mid, sid))
+                    c.execute("""SELECT mesa, page_no, status, shipment_id, pack_id
+                                 FROM s2_sales
+                                 WHERE manifest_id=? AND (shipment_id=? OR pack_id=?)
+                                 LIMIT 10;""", (mid, sid, sid))
                     info=c.fetchall(); conn.close()
                     if info:
-                        st.warning(f"Etiqueta encontrada pero no pendiente en mesa {mesa}. Coincidencias: {info}")
-                        sfx_emit("ERR")
+                        # ¿Está en esta mesa?
+                        in_same_mesa = [r for r in info if int(r[0] or 0) == int(mesa)]
+                        if in_same_mesa:
+                            exp_id = str(expected_ship or expected_pack or "")
+                            st.error(f"Secuencia obligatoria: la próxima venta de esta mesa es de la página {expected_page}.\n\nDebes escanear la siguiente etiqueta del manifiesto (ID esperado: {exp_id}).")
+                            sfx_emit("ERR")
+                        else:
+                            st.warning(f"Etiqueta encontrada, pero corresponde a otra mesa/página: {[(r[0], r[1], r[2]) for r in info]}")
+                            sfx_emit("ERR")
                     else:
-                        st.error("No encontré esta etiqueta en corridas pendientes.")
+                        st.error("No encontré esta etiqueta en corridas del manifiesto activo.")
                         sfx_emit("ERR")
                 else:
                     st.session_state["s2_sale_open"] = sale_id
