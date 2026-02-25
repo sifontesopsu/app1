@@ -1106,31 +1106,94 @@ def master_raw_title_lookup(path: str, sku: str) -> str:
 
 def upsert_barcodes_to_db(barcode_to_sku: dict):
     """Upsert de EAN/Barcode -> SKU.
-    Soporta DB antiguas donde la columna se llamaba 'sku' en vez de 'sku_ml'.
+
+    Esta función es ultra-robusta para DB antiguas:
+    - Si no existe la tabla, la crea.
+    - Si la tabla existe pero tiene columnas distintas (ej: ean en vez de barcode), la recrea.
+    - Soporta columna de SKU antigua: 'sku' y nueva: 'sku_ml'.
     """
     if not barcode_to_sku:
         return
     conn = get_conn()
     c = conn.cursor()
-    # detectar columnas reales
-    try:
-        cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes)").fetchall()]
-    except Exception:
-        cols = ["barcode", "sku_ml"]
-    sku_col = "sku_ml" if "sku_ml" in cols else ("sku" if "sku" in cols else "sku_ml")
 
-    # si falta sku_ml, intentamos agregarla (migración suave)
-    if sku_col == "sku_ml" and "sku_ml" not in cols:
+    def _table_exists(name: str) -> bool:
+        r = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
+        return bool(r)
+
+    def _get_cols(name: str):
+        try:
+            return [r[1] for r in c.execute(f"PRAGMA table_info({name})").fetchall()]
+        except Exception:
+            return []
+
+    # 1) Asegurar tabla base
+    if not _table_exists("sku_barcodes"):
+        c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes(
+            barcode TEXT PRIMARY KEY,
+            sku_ml TEXT
+        )""")
+        conn.commit()
+
+    cols = _get_cols("sku_barcodes")
+
+    # 2) Asegurar columna barcode (algunas DB viejas podrían tener 'ean' u otro)
+    barcode_col = None
+    for cand in ("barcode", "ean", "codigo", "code"):
+        if cand in cols:
+            barcode_col = cand
+            break
+
+    # Si no hay columna usable para barcode, recreamos (no se pierde nada crítico: se rehidrata desde el maestro)
+    if barcode_col is None:
+        try:
+            c.execute("ALTER TABLE sku_barcodes RENAME TO sku_barcodes_legacy")
+        except Exception:
+            pass
+        c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes(
+            barcode TEXT PRIMARY KEY,
+            sku_ml TEXT
+        )""")
+        conn.commit()
+        cols = _get_cols("sku_barcodes")
+        barcode_col = "barcode"
+
+    # 3) Asegurar columna SKU
+    if "sku_ml" not in cols and "sku" not in cols:
         try:
             c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
+            conn.commit()
+            cols = _get_cols("sku_barcodes")
         except Exception:
             pass
 
+    sku_col = "sku_ml" if "sku_ml" in cols else ("sku" if "sku" in cols else "sku_ml")
+
+    # 4) Upsert con fallback (por si hay constraints raras en DB antigua)
     for bc, sku in barcode_to_sku.items():
         bc = str(bc).strip()
         if not bc:
             continue
-        c.execute(f"INSERT OR REPLACE INTO sku_barcodes (barcode, {sku_col}) VALUES (?, ?)", (bc, str(sku).strip()))
+        sku_val = str(sku).strip() if sku is not None else None
+        try:
+            c.execute(f"INSERT OR REPLACE INTO sku_barcodes ({barcode_col}, {sku_col}) VALUES (?, ?)", (bc, sku_val))
+        except sqlite3.OperationalError:
+            # último recurso: intentar crear columnas faltantes y reintentar
+            cols2 = _get_cols("sku_barcodes")
+            if barcode_col not in cols2:
+                try:
+                    c.execute("ALTER TABLE sku_barcodes ADD COLUMN barcode TEXT")
+                    barcode_col = "barcode"
+                except Exception:
+                    pass
+            if sku_col not in cols2:
+                try:
+                    c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
+                    sku_col = "sku_ml"
+                except Exception:
+                    pass
+            c.execute(f"INSERT OR REPLACE INTO sku_barcodes ({barcode_col}, {sku_col}) VALUES (?, ?)", (bc, sku_val))
+
     conn.commit()
     conn.close()
 
