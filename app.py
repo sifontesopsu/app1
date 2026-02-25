@@ -727,6 +727,18 @@ def init_db():
     );
     """)
 
+    # Migración suave: versiones antiguas tenían columna 'sku' (no 'sku_ml')
+    try:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes)").fetchall()]
+        if "sku_ml" not in cols and "sku" in cols:
+            c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
+            c.execute("UPDATE sku_barcodes SET sku_ml = sku WHERE sku_ml IS NULL OR sku_ml = ''")
+        elif "sku_ml" not in cols:
+            c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
+    except Exception:
+        pass
+
+
 
     # Links / publicaciones (para ver fotos)
     c.execute("""
