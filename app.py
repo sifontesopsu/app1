@@ -1105,12 +1105,32 @@ def master_raw_title_lookup(path: str, sku: str) -> str:
 
 
 def upsert_barcodes_to_db(barcode_to_sku: dict):
+    """Upsert de EAN/Barcode -> SKU.
+    Soporta DB antiguas donde la columna se llamaba 'sku' en vez de 'sku_ml'.
+    """
     if not barcode_to_sku:
         return
     conn = get_conn()
     c = conn.cursor()
+    # detectar columnas reales
+    try:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes)").fetchall()]
+    except Exception:
+        cols = ["barcode", "sku_ml"]
+    sku_col = "sku_ml" if "sku_ml" in cols else ("sku" if "sku" in cols else "sku_ml")
+
+    # si falta sku_ml, intentamos agregarla (migración suave)
+    if sku_col == "sku_ml" and "sku_ml" not in cols:
+        try:
+            c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
+        except Exception:
+            pass
+
     for bc, sku in barcode_to_sku.items():
-        c.execute("INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)", (bc, sku))
+        bc = str(bc).strip()
+        if not bc:
+            continue
+        c.execute(f"INSERT OR REPLACE INTO sku_barcodes (barcode, {sku_col}) VALUES (?, ?)", (bc, str(sku).strip()))
     conn.commit()
     conn.close()
 
@@ -3814,6 +3834,41 @@ def _s2_create_tables():
         closed_at TEXT,
         PRIMARY KEY (manifest_id, sale_id)
     );""")
+
+    # Migración fuerte (solo si DB antigua dejó PK incorrecta en s2_sales)
+    # Algunas versiones tempranas tenían PRIMARY KEY(sale_id) y eso rompe al tener múltiples manifiestos.
+    try:
+        info = c.execute("PRAGMA table_info(s2_sales)").fetchall()
+        pk_cols = [r[1] for r in info if int(r[5] or 0) > 0]  # pk position
+        col_names = [r[1] for r in info]
+        if pk_cols == ["sale_id"] and "manifest_id" in col_names:
+            # crear tabla nueva con PK (manifest_id, sale_id)
+            c.execute("""CREATE TABLE IF NOT EXISTS s2_sales_new (
+                manifest_id INTEGER NOT NULL,
+                sale_id TEXT NOT NULL,
+                shipment_id TEXT,
+                page_no INTEGER NOT NULL,
+                row_no INTEGER NOT NULL DEFAULT 0,
+                mesa INTEGER,
+                status TEXT NOT NULL DEFAULT 'NEW',
+                opened_at TEXT,
+                closed_at TEXT,
+                pack_id TEXT,
+                customer TEXT,
+                destino TEXT,
+                comuna TEXT,
+                ciudad_destino TEXT,
+                PRIMARY KEY (manifest_id, sale_id)
+            );""")
+            # copiar columnas comunes
+            common = [cn for cn in ["manifest_id","sale_id","shipment_id","page_no","row_no","mesa","status","opened_at","closed_at","pack_id","customer","destino","comuna","ciudad_destino"] if cn in col_names]
+            sel = ", ".join(common)
+            c.execute(f"INSERT OR IGNORE INTO s2_sales_new ({sel}) SELECT {sel} FROM s2_sales;")
+            c.execute("DROP TABLE s2_sales;")
+            c.execute("ALTER TABLE s2_sales_new RENAME TO s2_sales;")
+    except Exception:
+        pass
+
     c.execute("""CREATE TABLE IF NOT EXISTS s2_items (
         manifest_id INTEGER NOT NULL,
         sale_id TEXT NOT NULL,
