@@ -5654,8 +5654,18 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
 def page_packing():
     _s2_pack_dispatch_create_tables()
     st.title("Embalador")
-    st.caption("Flujo desde Sorting: solo aparecen ventas **cerradas por Camarero** (DONE) y aún **no embaladas**.")
+    st.caption("Flujo desde Sorting: solo aparecen ventas **cerradas por Camarero** (DONE) y aún **no embaladas**. **Se respeta estrictamente el orden de página del manifiesto.**")
     mid = _s2_get_active_manifest_id()
+
+    # --- UI compacta (PDA) ---
+    st.markdown("""
+    <style>
+      .pack-mini { font-size: 0.92rem; line-height: 1.15; }
+      .pack-row { padding: 2px 0; border-bottom: 1px solid rgba(128,128,128,0.15); }
+      .pack-sku { font-weight: 700; }
+      .pack-desc { opacity: 0.85; }
+    </style>
+    """, unsafe_allow_html=True)
 
     mesas = _s2_list_mesas(mid)
     mesa_opt = ["Todas"] + [f"Mesa {m}" for m in mesas]
@@ -5667,35 +5677,65 @@ def page_packing():
         except Exception:
             mesa = None
 
-    enforce = st.checkbox("Respetar orden del manifiesto (recomendado)", value=True)
-    packer = st.text_input("Nombre/Iniciales embalador (opcional)", value=str(st.session_state.get("packer_name","")))
+    packer = st.text_input("Nombre/Iniciales embalador (opcional)", value=str(st.session_state.get("packer_name", "")))
     st.session_state["packer_name"] = packer
 
-    # Lista pendiente
+    # Lista pendiente (orden manifiesto: page_no, sale_id)
     rows = _s2_list_sales_to_pack(mid, mesa=mesa)
     sale_ids = [str(r[0]) for r in rows]
     stats = _s2_pack_stats_for_sales(mid, sale_ids)
 
-    if rows:
-        next_sale = str(rows[0][0])
-        st.info(f"Siguiente por embalar (orden manifiesto): **{next_sale}**  ·  Total pendientes: **{len(rows)}**")
+    expected_sale = str(rows[0][0]) if rows else None
+    if expected_sale:
+        st.info(f"Siguiente por embalar (orden manifiesto): **{expected_sale}**  ·  Pendientes: **{len(rows)}**")
     else:
         st.success("No hay ventas pendientes de embalaje 🎉")
+
+    # Estado: venta "bloqueada" para confirmar embalaje
+    active_sale = st.session_state.get("pack_active_sale")
 
     # Limpieza segura del campo
     if st.session_state.get("pack_clear_scan"):
         st.session_state["pack_scan_widget"] = ""
         st.session_state["pack_clear_scan"] = False
 
-    st.subheader("Escaneo de etiqueta para marcar EMBALADO")
-    scan = st.text_input("Etiqueta (QR Flex / barra Colecta)", key="pack_scan_widget")
-    if scan:
+    # Cache de thumbnails por SKU (evita repetir requests)
+    thumb_cache = st.session_state.setdefault("pack_thumb_cache", {})
+
+    def _thumb_for_sku(sku: str) -> str:
+        sku = str(sku or "").strip()
+        if not sku:
+            return ""
+        if sku in thumb_cache:
+            return thumb_cache[sku] or ""
+        try:
+            pics, _ = get_picture_urls_for_sku(sku)
+            thumb_cache[sku] = (pics[0] if pics else "")
+        except Exception:
+            thumb_cache[sku] = ""
+        return thumb_cache[sku] or ""
+
+    st.subheader("Escaneo (estricto por orden de página)")
+    if not expected_sale:
+        return
+
+    # Si ya hay una venta activa, bloqueamos el escaneo de otra hasta confirmar/cancelar
+    if active_sale:
+        st.warning(f"Tienes una venta pendiente de confirmar embalaje: **{active_sale}**. Confirma para continuar.")
+    scan = st.text_input(
+        "Etiqueta (QR Flex / barra Colecta)",
+        key="pack_scan_widget",
+        disabled=bool(active_sale),
+        help="Solo se acepta la siguiente venta del manifiesto."
+    )
+
+    if scan and (not active_sale):
         sid = _s2_extract_shipment_id(scan)
         sale_id = None
 
         if sid:
             sale_id = _s2_find_done_sale_for_scan(mid, mesa, sid)
-        if (not sale_id):
+        if not sale_id:
             # fallback pack_id: usamos el escaneo limpio como pack_id
             pack_id = str(scan).strip()
             sale_id = _s2_find_done_sale_for_pack_scan(mid, mesa, pack_id)
@@ -5704,16 +5744,65 @@ def page_packing():
             st.error("No encontré esta etiqueta para embalaje (¿no está cerrada en Sorting o ya fue embalada?).")
             sfx_emit("ERR")
         else:
-            # orden
-            if enforce and rows and str(sale_id) != str(rows[0][0]):
-                st.warning(f"Fuera de orden. Esperado: {rows[0][0]} · Escaneado: {sale_id}")
+            sale_id = str(sale_id)
+            # Orden STRICTO: solo se acepta la primera venta pendiente (page_no asc)
+            if sale_id != expected_sale:
+                st.error(f"Fuera de orden. **Esperado:** {expected_sale} · **Escaneado:** {sale_id}")
                 sfx_emit("ERR")
             else:
-                _s2_mark_packed(mid, str(sale_id), packer=packer)
-                st.success(f"✅ Embalado: {sale_id}")
+                st.session_state["pack_active_sale"] = sale_id
+                st.success(f"✅ Etiqueta correcta: {sale_id}. Revisa el resumen y confirma el embalaje.")
                 sfx_emit("OK")
+
         st.session_state["pack_clear_scan"] = True
         st.rerun()
+
+    # Confirmación: mostrar productos + cantidades (con fotos pequeñas) antes de marcar como embalado
+    active_sale = st.session_state.get("pack_active_sale")
+    if active_sale:
+        st.divider()
+        st.subheader("Confirmación de embalaje")
+
+        # Items de la venta
+        items = _s2_sale_items(mid, str(active_sale))  # (sku, description, qty, picked, status)
+        if not items:
+            st.warning("No pude leer productos para esta venta (items vacíos). Aun así puedes confirmar el embalaje.")
+        else:
+            st.markdown('<div class="pack-mini">', unsafe_allow_html=True)
+            for sku, desc, qty, picked, status in items:
+                sku_s = str(sku)
+                desc_s = str(desc or "")
+                qty_s = int(qty) if str(qty).isdigit() else qty
+                thumb = _thumb_for_sku(sku_s)
+
+                c1, c2, c3 = st.columns([1.2, 6.6, 1.2], gap="small")
+                with c1:
+                    if thumb:
+                        st.image(thumb, width=55)
+                    else:
+                        st.caption(" ")
+                with c2:
+                    st.markdown(
+                        f'<div class="pack-row"><div class="pack-sku">{html.escape(sku_s)}</div>'
+                        f'<div class="pack-desc">{html.escape(desc_s)}</div></div>',
+                        unsafe_allow_html=True
+                    )
+                with c3:
+                    st.markdown(f"**x{qty_s}**")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("✅ Confirmar embalaje y pasar al siguiente", use_container_width=True):
+                _s2_mark_packed(mid, str(active_sale), packer=packer)
+                st.session_state["pack_active_sale"] = None
+                sfx_emit("OK")
+                st.rerun()
+        with colB:
+            if st.button("↩️ Cancelar", use_container_width=True):
+                st.session_state["pack_active_sale"] = None
+                sfx_emit("ERR")
+                st.rerun()
 
     st.divider()
     st.subheader("Pendientes de embalaje")
@@ -5722,7 +5811,7 @@ def page_packing():
 
     data = []
     for sale_id, shipment_id, pack_id, page_no, mesa_db, customer in rows:
-        n_items, units = stats.get(str(sale_id), (0,0))
+        n_items, units = stats.get(str(sale_id), (0, 0))
         data.append({
             "Mesa": mesa_db,
             "Página": page_no,
@@ -5734,8 +5823,6 @@ def page_packing():
             "Unidades": units,
         })
     st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
-
-
 def page_dispatch():
     _s2_pack_dispatch_create_tables()
     st.title("Despacho")
@@ -5752,7 +5839,7 @@ def page_dispatch():
         except Exception:
             mesa = None
 
-    enforce = st.checkbox("Respetar orden del manifiesto (recomendado)", value=True, key="dispatch_enforce")
+    enforce = True  # ORDEN ESTRICTO por manifiesto
     dispatcher = st.text_input("Nombre/Iniciales despacho (opcional)", value=str(st.session_state.get("dispatcher_name","")))
     st.session_state["dispatcher_name"] = dispatcher
 
