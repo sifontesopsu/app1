@@ -727,18 +727,6 @@ def init_db():
     );
     """)
 
-    # Migración suave: versiones antiguas tenían columna 'sku' (no 'sku_ml')
-    try:
-        cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes)").fetchall()]
-        if "sku_ml" not in cols and "sku" in cols:
-            c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
-            c.execute("UPDATE sku_barcodes SET sku_ml = sku WHERE sku_ml IS NULL OR sku_ml = ''")
-        elif "sku_ml" not in cols:
-            c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
-    except Exception:
-        pass
-
-
 
     # Links / publicaciones (para ver fotos)
     c.execute("""
@@ -1105,95 +1093,12 @@ def master_raw_title_lookup(path: str, sku: str) -> str:
 
 
 def upsert_barcodes_to_db(barcode_to_sku: dict):
-    """Upsert de EAN/Barcode -> SKU.
-
-    Esta función es ultra-robusta para DB antiguas:
-    - Si no existe la tabla, la crea.
-    - Si la tabla existe pero tiene columnas distintas (ej: ean en vez de barcode), la recrea.
-    - Soporta columna de SKU antigua: 'sku' y nueva: 'sku_ml'.
-    """
     if not barcode_to_sku:
         return
     conn = get_conn()
     c = conn.cursor()
-
-    def _table_exists(name: str) -> bool:
-        r = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
-        return bool(r)
-
-    def _get_cols(name: str):
-        try:
-            return [r[1] for r in c.execute(f"PRAGMA table_info({name})").fetchall()]
-        except Exception:
-            return []
-
-    # 1) Asegurar tabla base
-    if not _table_exists("sku_barcodes"):
-        c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes(
-            barcode TEXT PRIMARY KEY,
-            sku_ml TEXT
-        )""")
-        conn.commit()
-
-    cols = _get_cols("sku_barcodes")
-
-    # 2) Asegurar columna barcode (algunas DB viejas podrían tener 'ean' u otro)
-    barcode_col = None
-    for cand in ("barcode", "ean", "codigo", "code"):
-        if cand in cols:
-            barcode_col = cand
-            break
-
-    # Si no hay columna usable para barcode, recreamos (no se pierde nada crítico: se rehidrata desde el maestro)
-    if barcode_col is None:
-        try:
-            c.execute("ALTER TABLE sku_barcodes RENAME TO sku_barcodes_legacy")
-        except Exception:
-            pass
-        c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes(
-            barcode TEXT PRIMARY KEY,
-            sku_ml TEXT
-        )""")
-        conn.commit()
-        cols = _get_cols("sku_barcodes")
-        barcode_col = "barcode"
-
-    # 3) Asegurar columna SKU
-    if "sku_ml" not in cols and "sku" not in cols:
-        try:
-            c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
-            conn.commit()
-            cols = _get_cols("sku_barcodes")
-        except Exception:
-            pass
-
-    sku_col = "sku_ml" if "sku_ml" in cols else ("sku" if "sku" in cols else "sku_ml")
-
-    # 4) Upsert con fallback (por si hay constraints raras en DB antigua)
     for bc, sku in barcode_to_sku.items():
-        bc = str(bc).strip()
-        if not bc:
-            continue
-        sku_val = str(sku).strip() if sku is not None else None
-        try:
-            c.execute(f"INSERT OR REPLACE INTO sku_barcodes ({barcode_col}, {sku_col}) VALUES (?, ?)", (bc, sku_val))
-        except sqlite3.OperationalError:
-            # último recurso: intentar crear columnas faltantes y reintentar
-            cols2 = _get_cols("sku_barcodes")
-            if barcode_col not in cols2:
-                try:
-                    c.execute("ALTER TABLE sku_barcodes ADD COLUMN barcode TEXT")
-                    barcode_col = "barcode"
-                except Exception:
-                    pass
-            if sku_col not in cols2:
-                try:
-                    c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT")
-                    sku_col = "sku_ml"
-                except Exception:
-                    pass
-            c.execute(f"INSERT OR REPLACE INTO sku_barcodes ({barcode_col}, {sku_col}) VALUES (?, ?)", (bc, sku_val))
-
+        c.execute("INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)", (bc, sku))
     conn.commit()
     conn.close()
 
@@ -3897,41 +3802,6 @@ def _s2_create_tables():
         closed_at TEXT,
         PRIMARY KEY (manifest_id, sale_id)
     );""")
-
-    # Migración fuerte (solo si DB antigua dejó PK incorrecta en s2_sales)
-    # Algunas versiones tempranas tenían PRIMARY KEY(sale_id) y eso rompe al tener múltiples manifiestos.
-    try:
-        info = c.execute("PRAGMA table_info(s2_sales)").fetchall()
-        pk_cols = [r[1] for r in info if int(r[5] or 0) > 0]  # pk position
-        col_names = [r[1] for r in info]
-        if pk_cols == ["sale_id"] and "manifest_id" in col_names:
-            # crear tabla nueva con PK (manifest_id, sale_id)
-            c.execute("""CREATE TABLE IF NOT EXISTS s2_sales_new (
-                manifest_id INTEGER NOT NULL,
-                sale_id TEXT NOT NULL,
-                shipment_id TEXT,
-                page_no INTEGER NOT NULL,
-                row_no INTEGER NOT NULL DEFAULT 0,
-                mesa INTEGER,
-                status TEXT NOT NULL DEFAULT 'NEW',
-                opened_at TEXT,
-                closed_at TEXT,
-                pack_id TEXT,
-                customer TEXT,
-                destino TEXT,
-                comuna TEXT,
-                ciudad_destino TEXT,
-                PRIMARY KEY (manifest_id, sale_id)
-            );""")
-            # copiar columnas comunes
-            common = [cn for cn in ["manifest_id","sale_id","shipment_id","page_no","row_no","mesa","status","opened_at","closed_at","pack_id","customer","destino","comuna","ciudad_destino"] if cn in col_names]
-            sel = ", ".join(common)
-            c.execute(f"INSERT OR IGNORE INTO s2_sales_new ({sel}) SELECT {sel} FROM s2_sales;")
-            c.execute("DROP TABLE s2_sales;")
-            c.execute("ALTER TABLE s2_sales_new RENAME TO s2_sales;")
-    except Exception:
-        pass
-
     c.execute("""CREATE TABLE IF NOT EXISTS s2_items (
         manifest_id INTEGER NOT NULL,
         sale_id TEXT NOT NULL,
@@ -3999,46 +3869,6 @@ def _s2_get_active_manifest_id():
         mid = int(row[0])
         conn.close()
         return mid
-
-
-def _s2_get_manifest_for_packing() -> int:
-    """Manifiesto a trabajar en Embalaje.
-    Prioriza el manifiesto más antiguo que aún tenga ventas DONE sin embalar.
-    Si no hay cola, usa el manifiesto activo.
-    """
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        """SELECT MIN(s.manifest_id)
-             FROM s2_sales s
-             WHERE s.status='DONE'
-               AND NOT EXISTS (
-                   SELECT 1 FROM s2_packing p
-                   WHERE p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
-               );"""
-    ).fetchone()
-    conn.close()
-    return int(row[0]) if row and row[0] is not None else _s2_get_active_manifest_id()
-
-def _s2_get_manifest_for_dispatch() -> int:
-    """Manifiesto a trabajar en Despacho.
-    Prioriza el manifiesto más antiguo que aún tenga ventas embaladas y no despachadas.
-    Si no hay cola, usa el manifiesto activo.
-    """
-    _s2_create_tables()
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        """SELECT MIN(p.manifest_id)
-             FROM s2_packing p
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM s2_dispatch d
-                 WHERE d.manifest_id=p.manifest_id AND d.sale_id=p.sale_id
-             );"""
-    ).fetchone()
-    conn.close()
-    return int(row[0]) if row and row[0] is not None else _s2_get_active_manifest_id()
     c.execute("INSERT INTO s2_manifests(status, created_at) VALUES('ACTIVE', ?);", (_s2_now_iso(),))
     mid = int(c.lastrowid)
     conn.commit()
@@ -4143,27 +3973,6 @@ def _s2_parse_label_raw_info(raw: str):
         m = re.search(r"^\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9 .,'-]{3,80})\s*\([^\n]{2,40}\)\s*$", s, flags=re.M)
         if m:
             info["destinatario"] = m.group(1).strip()
-
-
-    # ZPL típico (Flex/Colecta): el destinatario suele ser el ^FD inmediatamente anterior a "Domicilio:"/"Direccion:"
-    # (en tus etiquetas aparece como: ^FDNOMBRE ...^FS luego ^FDDomicilio: ...^FS) fileciteturn1file1
-    if "destinatario" not in info:
-        try:
-            fds = re.findall(r"\^FD(.*?)\^FS", s, flags=re.DOTALL)
-            fds = [_s2_zpl_underscore_decode(decode_fh(x.replace("\r"," ").replace("\n"," ").strip())) for x in fds if x and x.strip()]
-            idx_dom = None
-            for i, f in enumerate(fds):
-                lf = f.lower().strip()
-                if lf.startswith("domicilio:") or lf.startswith("direccion:"):
-                    idx_dom = i
-                    break
-            if idx_dom is not None and idx_dom > 0:
-                cand = fds[idx_dom-1].strip()
-                cand = re.sub(r"\s*\([^)]{2,60}\)\s*$", "", cand).strip()
-                if cand and len(cand) <= 120 and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", cand):
-                    info["destinatario"] = cand
-        except Exception:
-            pass
 
     # Dirección / Domicilio (Flex: Direccion, Colecta: Domicilio)
     m = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
@@ -6173,37 +5982,11 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
     return rows
 
 
-
-def _s2_list_sales_dispatched(mid:int, mesa=None):
-    """Lista ventas ya despachadas (para mostrar historial en el módulo Despacho)."""
-    _s2_pack_dispatch_create_tables()
-    conn=get_conn(); c=conn.cursor()
-    if mesa is None:
-        rows = c.execute("""SELECT s.mesa, s.page_no, s.sale_id, s.shipment_id, s.pack_id,
-                                     COALESCE(NULLIF(s.comuna,''), NULLIF(s.ciudad_destino,''), '') as destino_ciudad,
-                                     COALESCE(NULLIF(s.customer,''), '') as customer,
-                                     d.dispatched_at
-                              FROM s2_dispatch d
-                              JOIN s2_sales s ON s.manifest_id=d.manifest_id AND s.sale_id=d.sale_id
-                              WHERE d.manifest_id=?
-                              ORDER BY d.dispatched_at DESC;""", (mid,)).fetchall()
-    else:
-        rows = c.execute("""SELECT s.mesa, s.page_no, s.sale_id, s.shipment_id, s.pack_id,
-                                     COALESCE(NULLIF(s.comuna,''), NULLIF(s.ciudad_destino,''), '') as destino_ciudad,
-                                     COALESCE(NULLIF(s.customer,''), '') as customer,
-                                     d.dispatched_at
-                              FROM s2_dispatch d
-                              JOIN s2_sales s ON s.manifest_id=d.manifest_id AND s.sale_id=d.sale_id
-                              WHERE d.manifest_id=? AND s.mesa=?
-                              ORDER BY d.dispatched_at DESC;""", (mid,int(mesa))).fetchall()
-    conn.close()
-    return rows
-
 def page_packing(inv_map_sku: dict):
     _s2_pack_dispatch_create_tables()
     st.title("Embalador")
     st.caption("Flujo desde Sorting: solo aparecen ventas **cerradas por Camarero** (DONE) y aún **no embaladas**. **Se respeta estrictamente el orden de página del manifiesto.**")
-    mid = _s2_get_manifest_for_packing()
+    mid = _s2_get_active_manifest_id()
 
     # --- UI compacta (PDA) ---
     st.markdown("""
@@ -6418,7 +6201,7 @@ def page_dispatch():
     _s2_pack_dispatch_create_tables()
     st.title("Despacho")
     st.caption("Flujo desde Embalador: solo aparecen ventas **embaladas** y aún **no despachadas**.")
-    mid = _s2_get_manifest_for_dispatch()
+    mid = _s2_get_active_manifest_id()
 
     mesas = _s2_list_mesas(mid)
     mesa_opt = ["Todas"] + [f"Mesa {m}" for m in mesas]
@@ -6433,6 +6216,9 @@ def page_dispatch():
     # En despacho NO obligamos el orden del manifiesto.
     # Solo debe calzar el total de ventas del control con el total despachado.
     enforce = False
+    dispatcher = st.text_input("Nombre/Iniciales despacho (opcional)", value=str(st.session_state.get("dispatcher_name","")))
+    st.session_state["dispatcher_name"] = dispatcher
+
     rows = _s2_list_sales_to_dispatch(mid, mesa=mesa)
     sale_ids = [str(r[0]) for r in rows]
     stats = _s2_pack_stats_for_sales(mid, sale_ids)
@@ -6527,15 +6313,6 @@ def page_dispatch():
             "Embalador": packer or "",
         })
     st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.subheader("Despachadas")
-    rows_done = _s2_list_sales_dispatched(mid, mesa=mesa)
-    if rows_done:
-        df_done = pd.DataFrame(rows_done, columns=["Mesa","Página","Venta","Envío","Pack","Comuna/Ciudad","Cliente","Hora"])
-        st.dataframe(df_done, use_container_width=True, hide_index=True)
-    else:
-        st.info("Aún no hay ventas despachadas.")
 
 
 def main():
