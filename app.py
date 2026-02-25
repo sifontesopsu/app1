@@ -1778,7 +1778,7 @@ def page_app_lobby():
     row1, row2, row3 = st.columns(3)
     with row1:
         st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
-        if st.button("📦 Embalador (desde Sorting)", key="mode_packing"):
+        if st.button("🎁 Embalador (desde Sorting)", key="mode_packing"):
             st.session_state.app_mode = "PACKING"
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
@@ -3802,6 +3802,8 @@ def _s2_create_tables():
             c.execute("ALTER TABLE s2_sales ADD COLUMN pack_id TEXT;")
         if "customer" not in cols:
             c.execute("ALTER TABLE s2_sales ADD COLUMN customer TEXT;")
+        if "destino" not in cols:
+            c.execute("ALTER TABLE s2_sales ADD COLUMN destino TEXT;")
     except Exception:
         pass
 
@@ -3965,7 +3967,8 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
     usando Etiquetas (por Pack ID o por shipment_id cuando venga en el Control).
 
     Returns: list of dicts:
-      {page_no:int, shipment_id:str|None, sale_id:str, pack_id:str|None, customer:str|None,
+      {page_no:int, shipment_id:str|None, sale_id:str, pack_id:str|None,
+       customer:str|None, destino:str|None,
        items:[{sku:str, qty:int}]}
     """
     import io, re, pdfplumber
@@ -3995,12 +3998,39 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
         s = (s or "").strip()
         if not s or len(s) > 70:
             return False
+        # No debe contener dígitos (evita capturar líneas tipo Venta/SKU/IDs)
+        if re.search(r"\d", s):
+            return False
+        # Evitar líneas de atributos
         if re.search(r"\b(color|acabado|modelo|di[aá]metro|voltaje|dise[nñ]o|tipo)\b\s*:", s, flags=re.I):
             return False
+        # Evitar palabras típicas del control
+        if re.search(r"\b(venta|sku|cantidad|pack|env[ií]o|shipment)\b", s, flags=re.I):
+            return False
+        # Debe tener letras
         return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", s))
 
+    def customer_from_line(s: str):
+        # Preferimos SOLO etiquetas explícitas para evitar confundir con descripción de producto.
+        m = re.search(r"\b(Cliente|Comprador|Destinatario)\s*:\s*(.+)$", s or "", flags=re.I)
+        if not m:
+            return None
+        name = (m.group(2) or "").strip()
+        name = re.sub(r"\s{2,}", " ", name)
+        return name[:70] if name else None
+
+    def destino_from_line(s: str):
+        # En el Control suele venir como "Despacha ..." o "Despacha:".
+        m = re.match(r"^Despacha\s*:??\s*(.+)$", (s or "").strip(), flags=re.I)
+        if not m:
+            return None
+        dest = (m.group(1) or "").strip()
+        dest = re.sub(r"\s{2,}", " ", dest)
+        return dest[:80] if dest else None
+
     sales = []
-    cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None, "customer": None, "items": []}
+    cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None,
+           "customer": None, "destino": None, "items": []}
     sku_queue = []
 
     def flush():
@@ -4008,7 +4038,8 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
         if cur.get("sale_id") and cur.get("items"):
             # sale_id + items es suficiente para contar venta
             sales.append(cur)
-        cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None, "customer": None, "items": []}
+        cur = {"page_no": None, "shipment_id": None, "sale_id": None, "pack_id": None,
+               "customer": None, "destino": None, "items": []}
         sku_queue = []
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -4017,7 +4048,18 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
             lines = [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
             for ln in lines:
                 low = ln.lower()
-                if low.startswith("despacha ") or low.startswith("identifi"):
+                # Destino (NO saltar, guardarlo)
+                dest = destino_from_line(ln)
+                if dest and not cur.get("destino"):
+                    cur["destino"] = dest
+
+                # Cliente explícito
+                cust = customer_from_line(ln)
+                if cust and not cur.get("customer"):
+                    cur["customer"] = cust
+
+                # Algunas líneas de cabecera que no aportan
+                if low.startswith("identifi"):
                     continue
 
                 # Flex shipment id en línea
@@ -4059,25 +4101,34 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
                 # Cantidad: asigna a primer SKU pendiente
                 q = qty_from_line(ln)
                 if q is not None:
-                    # cliente a veces viene junto a Cantidad
-                    if cur.get("sale_id") and not cur.get("customer") and ("venta" not in low) and ("pack" not in low):
-                        pre = re.split(r"Cantidad\s*:", ln, flags=re.IGNORECASE)[0].strip()
-                        pre = re.sub(r"\bSKU\s*:\s*[0-9A-Za-z_-]{6,20}\b", "", pre, flags=re.IGNORECASE).strip()
-                        pre = re.sub(r"^\d{8,15}\b", "", pre).strip()
-                        if pre and len(pre) <= 70 and looks_like_name(pre):
-                            cur["customer"] = pre
-
                     if sku_queue:
                         sku = sku_queue.pop(0)
                         cur["items"].append({"sku": sku, "qty": int(q)})
                 else:
-                    # nombre en línea sola después de Venta
-                    if cur.get("sale_id") and not cur.get("customer") and looks_like_name(ln):
+                    # Cliente en línea sola (solo si aún NO hemos visto SKUs/ítems de esta venta)
+                    if (cur.get("sale_id") and not cur.get("customer")
+                            and (not sku_queue) and (not cur.get("items"))
+                            and ("sku" not in low) and ("cantidad" not in low)
+                            and (not low.startswith("despacha"))
+                            and looks_like_name(ln)):
                         cur["customer"] = ln[:70]
 
     flush()
     return sales
 
+
+
+def _s2_clean_person_text(s: str, max_len: int):
+    """Limpieza defensiva para campos de persona/destino extraídos del PDF."""
+    t = (s or "").strip()
+    if not t:
+        return None
+    # Quitar fragmentos típicos que vienen pegados por extracción PDF
+    t = re.sub(r"\b(Venta|SKU|Cantidad|Pack\s*ID|Env[ií]o)\s*:\s*\S+", "", t, flags=re.I)
+    t = re.sub(r"\s{2,}", " ", t).strip(" -•|,;")
+    if not t:
+        return None
+    return t[:max_len]
 def _s2_parse_labels_txt(raw_bytes: bytes):
     """Parsea etiquetas TXT/ZPL de Flex y Colecta.
 
@@ -4188,10 +4239,11 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
         pack_id = s.get("pack_id")
         row_no = int(page_counters.get(page_no, 0) + 1)
         page_counters[page_no] = row_no
-        customer = s.get("customer")
+        customer = _s2_clean_person_text(s.get("customer"), 70)
+        destino = _s2_clean_person_text(s.get("destino"), 80)
 
-        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, row_no, status, pack_id, customer)
-                     VALUES(?,?,?,?,?, 'NEW', ?, ?)
+        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, row_no, status, pack_id, customer, destino)
+                     VALUES(?,?,?,?,?, 'NEW', ?, ?, ?)
                      ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
                         shipment_id=excluded.shipment_id,
                         page_no=excluded.page_no,
@@ -4200,9 +4252,11 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
                         opened_at=NULL,
                         closed_at=NULL,
                         pack_id=excluded.pack_id,
-                        customer=excluded.customer;""",
+                        customer=excluded.customer,
+                        destino=excluded.destino;""",
                   (mid, sale_id, (str(shipment_id) if shipment_id else None), page_no, row_no,
-                   (str(pack_id) if pack_id else None), (str(customer) if customer else None)))
+                   (str(pack_id) if pack_id else None), (str(customer) if customer else None),
+                   (str(destino) if destino else None)))
 
         for it in s.get("items", []):
             try:
@@ -4224,6 +4278,66 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
     conn.close()
     return n_sales
 
+
+
+def _s2_repair_customer_destino(mid: int):
+    """Recalcula customer/destino desde el Control PDF guardado, sin tocar estados/mesas/ítems."""
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute("SELECT control_pdf, control_name FROM s2_files WHERE manifest_id=?", (mid,)).fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return 0
+    pdf_bytes = row[0]
+    parsed = _s2_parse_control_pdf(pdf_bytes)
+
+    # map sale_id -> (customer, destino)
+    fixes = {}
+    for s in parsed:
+        sale_id = str(s.get("sale_id") or "").strip()
+        if not sale_id:
+            continue
+        cust = _s2_clean_person_text(s.get("customer"), 70)
+        dest = _s2_clean_person_text(s.get("destino"), 80)
+        if cust or dest:
+            fixes[sale_id] = (cust, dest)
+
+    def is_bad(val: str) -> bool:
+        t = (val or "").strip()
+        if not t:
+            return True
+        if re.search(r"\b(venta|sku|cantidad|pack\s*id|env[ií]o)\b\s*:", t, flags=re.I):
+            return True
+        if re.search(r"\d{6,}", t):
+            return True
+        return False
+
+    updated = 0
+    # actualizar SOLO si el campo está vacío o corrupto
+    for sale_id, (cust, dest) in fixes.items():
+        cur = c.execute(
+            "SELECT customer, destino FROM s2_sales WHERE manifest_id=? AND sale_id=?",
+            (mid, sale_id),
+        ).fetchone()
+        if not cur:
+            continue
+        cur_cust, cur_dest = cur[0], cur[1]
+        new_cust = cust if cust and is_bad(cur_cust) else None
+        new_dest = dest if dest and is_bad(cur_dest) else None
+        if new_cust is None and new_dest is None:
+            continue
+        c.execute(
+            """UPDATE s2_sales
+               SET customer = COALESCE(?, customer),
+                   destino  = COALESCE(?, destino)
+               WHERE manifest_id=? AND sale_id=?""",
+            (new_cust, new_dest, mid, sale_id),
+        )
+        updated += c.rowcount or 0
+
+    conn.commit()
+    conn.close()
+    return updated
 
 def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
     pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
@@ -4986,6 +5100,16 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     if f:
         control_name, labels_name, updated_at = f
         st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
+
+        colFix1, colFix2 = st.columns([1,3])
+        with colFix1:
+            if st.button("🧼 Reparar Cliente/Destino", use_container_width=True):
+                nfix = _s2_repair_customer_destino(mid)
+                if nfix > 0:
+                    st.success(f"Campos reparados: {nfix}")
+                else:
+                    st.info("No encontré nada que reparar.")
+                st.rerun()
     else:
         st.caption("Aún no se han cargado archivos para este manifiesto.")
 
@@ -5652,13 +5776,13 @@ def _s2_list_sales_to_pack(mid:int, mesa=None):
     _s2_pack_dispatch_create_tables()
     conn=get_conn(); c=conn.cursor()
     if mesa is None:
-        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino
                             FROM s2_sales s
                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                             WHERE s.manifest_id=? AND s.status='DONE' AND p.sale_id IS NULL
                             ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
     else:
-        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino
                             FROM s2_sales s
                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                             WHERE s.manifest_id=? AND s.mesa=? AND s.status='DONE' AND p.sale_id IS NULL
@@ -5671,7 +5795,7 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
     _s2_pack_dispatch_create_tables()
     conn=get_conn(); c=conn.cursor()
     if mesa is None:
-        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer,
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino,
                                    p.packed_at, p.packer
                             FROM s2_sales s
                             JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
@@ -5679,7 +5803,7 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
                             WHERE s.manifest_id=? AND s.status='DONE' AND d.sale_id IS NULL
                             ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
     else:
-        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer,
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino,
                                    p.packed_at, p.packer
                             FROM s2_sales s
                             JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
@@ -5690,7 +5814,7 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
     return rows
 
 
-def page_packing():
+def page_packing(inv_map_sku: dict):
     _s2_pack_dispatch_create_tables()
     st.title("Embalador")
     st.caption("Flujo desde Sorting: solo aparecen ventas **cerradas por Camarero** (DONE) y aún **no embaladas**. **Se respeta estrictamente el orden de página del manifiesto.**")
@@ -5715,9 +5839,6 @@ def page_packing():
             mesa = int(sel.split()[-1])
         except Exception:
             mesa = None
-
-    packer = st.text_input("Nombre/Iniciales embalador (opcional)", value=str(st.session_state.get("packer_name", "")))
-    st.session_state["packer_name"] = packer
 
     # Lista pendiente (orden manifiesto: page_no, sale_id)
     rows = _s2_list_sales_to_pack(mid, mesa=mesa)
@@ -5802,6 +5923,28 @@ def page_packing():
         st.divider()
         st.subheader("Confirmación de embalaje")
 
+        # Meta (etiqueta / cliente / destino)
+        conn = get_conn(); c = conn.cursor()
+        meta = c.execute("""SELECT sale_id, shipment_id, pack_id, page_no, mesa, customer, destino
+                             FROM s2_sales WHERE manifest_id=? AND sale_id=? LIMIT 1;""",
+                         (mid, str(active_sale))).fetchone()
+        conn.close()
+
+        if meta:
+            _sale_id, _ship, _pack, _page, _mesa, _cust, _dest = meta
+            cols = st.columns(2)
+            with cols[0]:
+                st.write(f"**Venta:** {_sale_id}")
+                if _ship:
+                    st.write(f"**Envío:** {_ship}")
+                if _pack:
+                    st.write(f"**Pack:** {_pack}")
+            with cols[1]:
+                if _dest:
+                    st.write(f"**Destino:** {_dest}")
+                if _cust:
+                    st.write(f"**Cliente:** {_cust}")
+
         # Items de la venta
         items = _s2_sale_items(mid, str(active_sale))  # (sku, description, qty, picked, status)
         if not items:
@@ -5810,7 +5953,16 @@ def page_packing():
             st.markdown('<div class="pack-mini">', unsafe_allow_html=True)
             for sku, desc, qty, picked, status in items:
                 sku_s = str(sku)
-                desc_s = str(desc or "")
+                # Preferir título del maestro si existe
+                maestro_title = ""
+                try:
+                    maestro_title = str(inv_map_sku.get(sku_s, "") or "").strip()
+                except Exception:
+                    maestro_title = ""
+
+                desc_s = str(desc or "").strip()
+                if maestro_title:
+                    desc_s = maestro_title
                 qty_s = int(qty) if str(qty).isdigit() else qty
                 thumb = _thumb_for_sku(sku_s)
 
@@ -5833,7 +5985,7 @@ def page_packing():
         colA, colB = st.columns(2)
         with colA:
             if st.button("✅ Confirmar embalaje y pasar al siguiente", use_container_width=True):
-                _s2_mark_packed(mid, str(active_sale), packer=packer)
+                _s2_mark_packed(mid, str(active_sale), packer="")
                 st.session_state["pack_active_sale"] = None
                 sfx_emit("OK")
                 st.rerun()
@@ -5849,15 +6001,20 @@ def page_packing():
         return
 
     data = []
-    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer in rows:
+    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino in rows:
         n_items, units = stats.get(str(sale_id), (0, 0))
+        cust = (customer or "").strip()
+        # Sanitizar valores claramente erróneos (cuando el parser antiguo dejó basura)
+        if re.search(r"\bSKU\s*:\b|\bVenta\s*:\b", cust, flags=re.I):
+            cust = ""
         data.append({
             "Mesa": mesa_db,
             "Página": page_no,
             "Venta": sale_id,
             "Envío": shipment_id or "",
             "Pack": pack_id or "",
-            "Cliente": customer or "",
+            "Destino": destino or "",
+            "Cliente": cust,
             "Productos": n_items,
             "Unidades": units,
         })
@@ -5878,7 +6035,9 @@ def page_dispatch():
         except Exception:
             mesa = None
 
-    enforce = True  # ORDEN ESTRICTO por manifiesto
+    # En despacho NO obligamos el orden del manifiesto.
+    # Solo debe calzar el total de ventas del control con el total despachado.
+    enforce = False
     dispatcher = st.text_input("Nombre/Iniciales despacho (opcional)", value=str(st.session_state.get("dispatcher_name","")))
     st.session_state["dispatcher_name"] = dispatcher
 
@@ -5886,10 +6045,19 @@ def page_dispatch():
     sale_ids = [str(r[0]) for r in rows]
     stats = _s2_pack_stats_for_sales(mid, sale_ids)
 
-    if rows:
-        st.info(f"Siguiente por despachar (orden manifiesto): **{rows[0][0]}**  ·  Total pendientes: **{len(rows)}**")
-    else:
-        st.success("No hay ventas pendientes de despacho 🎉")
+    # Totales según el control
+    conn = get_conn(); c = conn.cursor()
+    total_control = int(c.execute("SELECT COUNT(1) FROM s2_sales WHERE manifest_id=?;", (mid,)).fetchone()[0] or 0)
+    total_despachadas = int(c.execute("SELECT COUNT(1) FROM s2_dispatch WHERE manifest_id=?;", (mid,)).fetchone()[0] or 0)
+    conn.close()
+
+    st.info(f"Control: **{total_control}** ventas · Despachadas: **{total_despachadas}** · Pendientes: **{max(0, total_control-total_despachadas)}**")
+
+    if not rows:
+        if total_control and total_despachadas >= total_control:
+            st.success("Despacho completo ✅")
+        else:
+            st.warning("Aún no hay ventas disponibles para despacho (deben estar embaladas primero).")
 
     if st.session_state.get("dispatch_clear_scan"):
         st.session_state["dispatch_scan_widget"] = ""
@@ -5938,13 +6106,9 @@ def page_dispatch():
             st.error("No encontré esta etiqueta para despacho (¿no está embalada o ya fue despachada?).")
             sfx_emit("ERR")
         else:
-            if enforce and rows and str(sale_id) != str(rows[0][0]):
-                st.warning(f"Fuera de orden. Esperado: {rows[0][0]} · Escaneado: {sale_id}")
-                sfx_emit("ERR")
-            else:
-                _s2_mark_dispatched(mid, str(sale_id), dispatcher=dispatcher)
-                st.success(f"🚚 Despachado: {sale_id}")
-                sfx_emit("OK")
+            _s2_mark_dispatched(mid, str(sale_id), dispatcher=dispatcher)
+            st.success(f"🚚 Despachado: {sale_id}")
+            sfx_emit("OK")
         st.session_state["dispatch_clear_scan"] = True
         st.rerun()
 
@@ -5954,7 +6118,7 @@ def page_dispatch():
         return
 
     data = []
-    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, packed_at, packer in rows:
+    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino, packed_at, packer in rows:
         n_items, units = stats.get(str(sale_id), (0,0))
         data.append({
             "Mesa": mesa_db,
@@ -5962,6 +6126,7 @@ def page_dispatch():
             "Venta": sale_id,
             "Envío": shipment_id or "",
             "Pack": pack_id or "",
+            "Destino": destino or "",
             "Cliente": customer or "",
             "Productos": n_items,
             "Unidades": units,
@@ -6055,7 +6220,7 @@ def main():
             "1) Embalador",
         ]
         _ = st.sidebar.radio("Menú", pages, index=0)
-        page_packing()
+        page_packing(inv_map_sku)
 
     elif mode == "DISPATCH":
         pages = [
