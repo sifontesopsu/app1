@@ -3474,10 +3474,36 @@ def clean_address(text: str) -> str:
     if not text:
         return ""
     t = decode_fh(text)
+
     # remove JSON objects from QR payloads if present
     t = re.sub(r"\{.*?\}", "", t)
+
+    # normalize separators
     t = t.replace("->", " ")
+    t = t.replace("|", " ")
+    t = t.replace(";", " ")
+
+    # hard-cut promotional/UX sentences sometimes embedded in labels
+    low = t.lower()
+    promo_tokens = [
+        "despacha tus productos",
+        "no te relajes",
+        "tu comprador",
+        "está esperando",
+        "esta esperando",
+    ]
+    cut_at = None
+    for tok in promo_tokens:
+        i = low.find(tok)
+        if i != -1:
+            cut_at = i if cut_at is None else min(cut_at, i)
+    if cut_at is not None:
+        if cut_at == 0:
+            return ""
+        t = t[:cut_at]
+
     t = re.sub(r"\s+", " ", t).strip()
+
     # cut off technical tails often present
     t = re.sub(r"\s*\(\s*Liberador.*$", "", t, flags=re.IGNORECASE).strip()
     return t
@@ -3530,7 +3556,7 @@ def parse_zpl_labels(raw: str):
         if m:
             buyer = m.group(1).strip()
         # domicile/address text
-        m = re.search(r"Domicilio:\s*([^\^]+?)(?:Ciudad de destino:|\^FS|$)", dec_b, flags=re.IGNORECASE)
+        m = re.search(r"Domicilio:\s*([^\^]+?)(?:Ciudad de destino:|Despacha tus productos|\^FS|$)", dec_b, flags=re.IGNORECASE)
         if m:
             addr = clean_address(m.group(1))
         else:
@@ -3883,34 +3909,78 @@ def _s2_create_new_manifest() -> int:
     return mid
 
 
+
+def _s2_zpl_underscore_decode(s: str) -> str:
+    """
+    ZPL suele venir con secuencias tipo _C3_A9 para representar bytes UTF-8.
+    Esto las convierte a texto normal (P_C3_A9rez -> Pérez).
+    """
+    if not s:
+        return ""
+    import re
+    out = []
+    buf = bytearray()
+    i = 0
+    while i < len(s):
+        if s[i] == "_" and i + 2 < len(s):
+            m = re.match(r"_([0-9A-Fa-f]{2})", s[i:])
+            if m:
+                buf.append(int(m.group(1), 16))
+                i += 3
+                continue
+        if buf:
+            try:
+                out.append(buf.decode("utf-8", errors="ignore"))
+            except Exception:
+                out.append(buf.decode("latin1", errors="ignore"))
+            buf = bytearray()
+        out.append(s[i])
+        i += 1
+    if buf:
+        try:
+            out.append(buf.decode("utf-8", errors="ignore"))
+        except Exception:
+            out.append(buf.decode("latin1", errors="ignore"))
+    return "".join(out)
+
 def _s2_parse_label_raw_info(raw: str):
-    """Extrae info visible de una etiqueta (nombre, dirección, comuna, etc.) desde el texto raw."""
+    """Extrae info visible de una etiqueta (Flex/Colecta) desde el texto raw/ZPL."""
     import re
     if not raw:
         return {}
     s = str(raw).replace("\r", "\n")
+    s = _s2_zpl_underscore_decode(s)
     info = {}
-    m = re.search(r"Destinatario\s*:\s*(.+)", s, flags=re.IGNORECASE)
+
+    # FLEX: "Destinatario: Nombre (user)"
+    m = re.search(r"Destinatario\s*:\s*([^\n\^]{3,140})", s, flags=re.IGNORECASE)
     if m:
         info["destinatario"] = m.group(1).strip()
-    m = re.search(r"Direccion\s*:\s*(.+)", s, flags=re.IGNORECASE)
-    if m:
-        info["direccion"] = m.group(1).strip()
-    m = re.search(r"Comuna\s*:\s*(.+)", s, flags=re.IGNORECASE)
-    if m:
-        info["comuna"] = m.group(1).strip()
-    m = re.search(r"Ciudad\s*de\s*destino\s*:\s*(.+)", s, flags=re.IGNORECASE)
-    if m:
-        info["ciudad_destino"] = m.group(1).strip()
-    m = re.search(r"Domicilio\s*:\s*(.+)", s, flags=re.IGNORECASE)
-    if m and "direccion" not in info:
-        info["direccion"] = m.group(1).strip()
+
+    # COLECTA: línea tipo "NOMBRE (USER)"
     if "destinatario" not in info:
-        m = re.search(r"^\s*([A-ZÁÉÍÓÚÑ][^\n]{3,60})\s*\(([^\n]{2,30})\)\s*$", s, flags=re.M)
+        m = re.search(r"^\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9 .,'-]{3,80})\s*\([^\n]{2,40}\)\s*$", s, flags=re.M)
         if m:
             info["destinatario"] = m.group(1).strip()
-    return info
 
+    # Dirección / Domicilio (Flex: Direccion, Colecta: Domicilio)
+    m = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
+    if m:
+        info["domicilio"] = m.group(2).strip()
+
+    # Ciudad destino (Colecta)
+    m = re.search(r"Ciudad\s+de\s+destino\s*:\s*([^\n\^]{3,160})", s, flags=re.IGNORECASE)
+    if m:
+        info["ciudad_destino"] = m.group(1).strip()
+
+    # Limpieza: jamás aceptar el mensaje promocional como destino
+    promo_re = re.compile(r"\bDespacha\s+tu[s]?\s+productos\b", re.I)
+    for k in list(info.keys()):
+        v = (info.get(k) or "").strip()
+        if v and promo_re.search(v):
+            info.pop(k, None)
+
+    return info
 def _s2_get_label_raw(mid:int, shipment_id:str):
     conn=get_conn()
     c=conn.cursor()
@@ -4021,7 +4091,7 @@ def _s2_parse_control_pdf(pdf_bytes: bytes):
 
     def destino_from_line(s: str):
         # En el Control suele venir como "Despacha ..." o "Despacha:".
-        m = re.match(r"^Despacha\s*:??\s*(.+)$", (s or "").strip(), flags=re.I)
+        m = re.match(r"^Despacha\s*:\s*(.+)$", (s or "").strip(), flags=re.I)
         if not m:
             return None
         dest = (m.group(1) or "").strip()
@@ -4340,7 +4410,14 @@ def _s2_repair_customer_destino(mid: int):
     return updated
 
 def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
+    # Detectar ship ids y relaciones pack/venta -> ship
     pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
+
+    try:
+        txt = labels_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        txt = str(labels_bytes)
+
     conn = get_conn()
     c = conn.cursor()
     c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
@@ -4382,6 +4459,64 @@ def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
                           (str(ship_id), mid, str(sale_id)))
         except Exception:
             pass
+
+    # Guardar RAW por shipment_id y derivar Cliente/Destino desde la etiqueta (Flex/Colecta)
+    import re
+    blocks = re.split(r"\^XA", txt)
+    for b in blocks:
+        if not b.strip():
+            continue
+        raw_block = "^XA" + b
+
+        ship = None
+        jm = re.search(r"\"id\"\s*:\s*\"(\d{8,15})\"", raw_block)
+        if jm:
+            ship = jm.group(1)
+        if not ship:
+            nums = re.findall(r"\b\d{10,15}\b", raw_block)
+            if nums:
+                nums_sorted = sorted(nums, key=lambda x: (0 if x.startswith("46") else 1, -len(x)))
+                ship = nums_sorted[0]
+        if not ship:
+            continue
+
+        # guardar raw completo
+        c.execute("""UPDATE s2_labels SET raw=? WHERE manifest_id=? AND shipment_id=?;""",
+                  (raw_block, mid, str(ship)))
+
+        info = _s2_parse_label_raw_info(raw_block)
+        if not info:
+            continue
+
+        customer = _s2_clean_person_text(info.get("destinatario"), 70)
+
+        destino_parts = []
+        dom = _s2_clean_person_text(info.get("domicilio"), 120)
+        city = _s2_clean_person_text(info.get("ciudad_destino"), 80)
+        if dom:
+            destino_parts.append(dom)
+        if city:
+            destino_parts.append(city)
+        destino = " - ".join([p for p in destino_parts if p]) if destino_parts else None
+        destino = _s2_clean_person_text(destino, 160) if destino else None
+
+        # actualizar ventas por shipment_id
+        if customer or destino:
+            if customer and destino:
+                c.execute("""UPDATE s2_sales
+                             SET customer=?, destino=?
+                             WHERE manifest_id=? AND shipment_id=?;""",
+                          (customer, destino, mid, str(ship)))
+            elif customer:
+                c.execute("""UPDATE s2_sales
+                             SET customer=?
+                             WHERE manifest_id=? AND shipment_id=?;""",
+                          (customer, mid, str(ship)))
+            elif destino:
+                c.execute("""UPDATE s2_sales
+                             SET destino=?
+                             WHERE manifest_id=? AND shipment_id=?;""",
+                          (destino, mid, str(ship)))
 
     conn.commit()
     conn.close()
@@ -5100,16 +5235,6 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
     if f:
         control_name, labels_name, updated_at = f
         st.caption(f"Control: {control_name or '-'} · Etiquetas: {labels_name or '-'} · Actualizado: {updated_at or '-'}")
-
-        colFix1, colFix2 = st.columns([1,3])
-        with colFix1:
-            if st.button("🧼 Reparar Cliente/Destino", use_container_width=True):
-                nfix = _s2_repair_customer_destino(mid)
-                if nfix > 0:
-                    st.success(f"Campos reparados: {nfix}")
-                else:
-                    st.info("No encontré nada que reparar.")
-                st.rerun()
     else:
         st.caption("Aún no se han cargado archivos para este manifiesto.")
 
