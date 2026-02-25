@@ -3869,6 +3869,46 @@ def _s2_get_active_manifest_id():
         mid = int(row[0])
         conn.close()
         return mid
+
+
+def _s2_get_manifest_for_packing() -> int:
+    """Manifiesto a trabajar en Embalaje.
+    Prioriza el manifiesto más antiguo que aún tenga ventas DONE sin embalar.
+    Si no hay cola, usa el manifiesto activo.
+    """
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute(
+        """SELECT MIN(s.manifest_id)
+             FROM s2_sales s
+             WHERE s.status='DONE'
+               AND NOT EXISTS (
+                   SELECT 1 FROM s2_packing p
+                   WHERE p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+               );"""
+    ).fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else _s2_get_active_manifest_id()
+
+def _s2_get_manifest_for_dispatch() -> int:
+    """Manifiesto a trabajar en Despacho.
+    Prioriza el manifiesto más antiguo que aún tenga ventas embaladas y no despachadas.
+    Si no hay cola, usa el manifiesto activo.
+    """
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute(
+        """SELECT MIN(p.manifest_id)
+             FROM s2_packing p
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM s2_dispatch d
+                 WHERE d.manifest_id=p.manifest_id AND d.sale_id=p.sale_id
+             );"""
+    ).fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else _s2_get_active_manifest_id()
     c.execute("INSERT INTO s2_manifests(status, created_at) VALUES('ACTIVE', ?);", (_s2_now_iso(),))
     mid = int(c.lastrowid)
     conn.commit()
@@ -3973,6 +4013,27 @@ def _s2_parse_label_raw_info(raw: str):
         m = re.search(r"^\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9 .,'-]{3,80})\s*\([^\n]{2,40}\)\s*$", s, flags=re.M)
         if m:
             info["destinatario"] = m.group(1).strip()
+
+
+    # ZPL típico (Flex/Colecta): el destinatario suele ser el ^FD inmediatamente anterior a "Domicilio:"/"Direccion:"
+    # (en tus etiquetas aparece como: ^FDNOMBRE ...^FS luego ^FDDomicilio: ...^FS) fileciteturn1file1
+    if "destinatario" not in info:
+        try:
+            fds = re.findall(r"\^FD(.*?)\^FS", s, flags=re.DOTALL)
+            fds = [_s2_zpl_underscore_decode(decode_fh(x.replace("\r"," ").replace("\n"," ").strip())) for x in fds if x and x.strip()]
+            idx_dom = None
+            for i, f in enumerate(fds):
+                lf = f.lower().strip()
+                if lf.startswith("domicilio:") or lf.startswith("direccion:"):
+                    idx_dom = i
+                    break
+            if idx_dom is not None and idx_dom > 0:
+                cand = fds[idx_dom-1].strip()
+                cand = re.sub(r"\s*\([^)]{2,60}\)\s*$", "", cand).strip()
+                if cand and len(cand) <= 120 and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", cand):
+                    info["destinatario"] = cand
+        except Exception:
+            pass
 
     # Dirección / Domicilio (Flex: Direccion, Colecta: Domicilio)
     m = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
@@ -5982,11 +6043,37 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
     return rows
 
 
+
+def _s2_list_sales_dispatched(mid:int, mesa=None):
+    """Lista ventas ya despachadas (para mostrar historial en el módulo Despacho)."""
+    _s2_pack_dispatch_create_tables()
+    conn=get_conn(); c=conn.cursor()
+    if mesa is None:
+        rows = c.execute("""SELECT s.mesa, s.page_no, s.sale_id, s.shipment_id, s.pack_id,
+                                     COALESCE(NULLIF(s.comuna,''), NULLIF(s.ciudad_destino,''), '') as destino_ciudad,
+                                     COALESCE(NULLIF(s.customer,''), '') as customer,
+                                     d.dispatched_at
+                              FROM s2_dispatch d
+                              JOIN s2_sales s ON s.manifest_id=d.manifest_id AND s.sale_id=d.sale_id
+                              WHERE d.manifest_id=?
+                              ORDER BY d.dispatched_at DESC;""", (mid,)).fetchall()
+    else:
+        rows = c.execute("""SELECT s.mesa, s.page_no, s.sale_id, s.shipment_id, s.pack_id,
+                                     COALESCE(NULLIF(s.comuna,''), NULLIF(s.ciudad_destino,''), '') as destino_ciudad,
+                                     COALESCE(NULLIF(s.customer,''), '') as customer,
+                                     d.dispatched_at
+                              FROM s2_dispatch d
+                              JOIN s2_sales s ON s.manifest_id=d.manifest_id AND s.sale_id=d.sale_id
+                              WHERE d.manifest_id=? AND s.mesa=?
+                              ORDER BY d.dispatched_at DESC;""", (mid,int(mesa))).fetchall()
+    conn.close()
+    return rows
+
 def page_packing(inv_map_sku: dict):
     _s2_pack_dispatch_create_tables()
     st.title("Embalador")
     st.caption("Flujo desde Sorting: solo aparecen ventas **cerradas por Camarero** (DONE) y aún **no embaladas**. **Se respeta estrictamente el orden de página del manifiesto.**")
-    mid = _s2_get_active_manifest_id()
+    mid = _s2_get_manifest_for_packing()
 
     # --- UI compacta (PDA) ---
     st.markdown("""
@@ -6201,7 +6288,7 @@ def page_dispatch():
     _s2_pack_dispatch_create_tables()
     st.title("Despacho")
     st.caption("Flujo desde Embalador: solo aparecen ventas **embaladas** y aún **no despachadas**.")
-    mid = _s2_get_active_manifest_id()
+    mid = _s2_get_manifest_for_dispatch()
 
     mesas = _s2_list_mesas(mid)
     mesa_opt = ["Todas"] + [f"Mesa {m}" for m in mesas]
@@ -6216,9 +6303,6 @@ def page_dispatch():
     # En despacho NO obligamos el orden del manifiesto.
     # Solo debe calzar el total de ventas del control con el total despachado.
     enforce = False
-    dispatcher = st.text_input("Nombre/Iniciales despacho (opcional)", value=str(st.session_state.get("dispatcher_name","")))
-    st.session_state["dispatcher_name"] = dispatcher
-
     rows = _s2_list_sales_to_dispatch(mid, mesa=mesa)
     sale_ids = [str(r[0]) for r in rows]
     stats = _s2_pack_stats_for_sales(mid, sale_ids)
@@ -6313,6 +6397,15 @@ def page_dispatch():
             "Embalador": packer or "",
         })
     st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Despachadas")
+    rows_done = _s2_list_sales_dispatched(mid, mesa=mesa)
+    if rows_done:
+        df_done = pd.DataFrame(rows_done, columns=["Mesa","Página","Venta","Envío","Pack","Comuna/Ciudad","Cliente","Hora"])
+        st.dataframe(df_done, use_container_width=True, hide_index=True)
+    else:
+        st.info("Aún no hay ventas despachadas.")
 
 
 def main():
