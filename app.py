@@ -43,6 +43,14 @@ SORTING_TABLES = [
     "s2_manifests","s2_files","s2_page_assign","s2_sales","s2_items","s2_labels","s2_pack_ship"
 ]
 
+
+PACKING_TABLES = [
+    "s2_packing"
+]
+DISPATCH_TABLES = [
+    "s2_dispatch"
+]
+
 # Maestro SKU/EAN en la misma carpeta que app.py
 MASTER_FILE = "maestro_sku_ean.xlsx"
 
@@ -1763,6 +1771,27 @@ def page_app_lobby():
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
         st.caption("Control de acopio Full (escaneo + chequeo vs Excel).")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Segunda fila (Sorting -> Embalador -> Despacho)
+    row1, row2, row3 = st.columns(3)
+    with row1:
+        st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
+        if st.button("📦 Embalador (desde Sorting)", key="mode_packing"):
+            st.session_state.app_mode = "PACKING"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.caption("Marca ventas embaladas escaneando etiqueta en orden del manifiesto.")
+    with row2:
+        st.markdown('<div class="lobbybtn">', unsafe_allow_html=True)
+        if st.button("🚚 Despacho (desde Embalador)", key="mode_dispatch"):
+            st.session_state.app_mode = "DISPATCH"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.caption("Marca ventas despachadas (requiere embalaje previo).")
+    with row3:
+        st.caption("")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -5446,6 +5475,376 @@ def page_pkg_counter():
         st.rerun()
 
 
+
+# =========================
+# PACKING (Embalador) + DESPACHO (flujo desde Sorting v2)
+# =========================
+
+def _s2_pack_dispatch_create_tables():
+    """Tablas auxiliares para Embalador y Despacho (no toca lógica Sorting)."""
+    _s2_create_tables()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_packing (
+        manifest_id INTEGER NOT NULL,
+        sale_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PACKED',
+        packed_at TEXT,
+        packer TEXT,
+        note TEXT,
+        PRIMARY KEY (manifest_id, sale_id)
+    );""")
+    c.execute("""CREATE TABLE IF NOT EXISTS s2_dispatch (
+        manifest_id INTEGER NOT NULL,
+        sale_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'DISPATCHED',
+        dispatched_at TEXT,
+        dispatcher TEXT,
+        note TEXT,
+        PRIMARY KEY (manifest_id, sale_id)
+    );""")
+    conn.commit()
+    conn.close()
+
+
+def _s2_list_mesas(mid:int):
+    conn=get_conn(); c=conn.cursor()
+    rows=c.execute("""SELECT DISTINCT mesa FROM s2_sales
+                        WHERE manifest_id=? AND mesa IS NOT NULL
+                        ORDER BY mesa;""", (mid,)).fetchall()
+    conn.close()
+    return [int(r[0]) for r in rows if r and r[0] is not None]
+
+
+def _s2_pack_stats_for_sales(mid:int, sale_ids:list):
+    """Devuelve dict sale_id -> (n_items, units_total)"""
+    if not sale_ids:
+        return {}
+    conn=get_conn(); c=conn.cursor()
+    # SQLite: IN (...) seguro usando placeholders
+    ph = ",".join(["?"]*len(sale_ids))
+    q = f"""SELECT sale_id,
+                    COUNT(*) as n_items,
+                    SUM(COALESCE(qty,0)) as units
+             FROM s2_items
+             WHERE manifest_id=? AND sale_id IN ({ph})
+             GROUP BY sale_id;"""
+    rows = c.execute(q, [mid, *sale_ids]).fetchall()
+    conn.close()
+    out={}
+    for sid, n_items, units in rows:
+        out[str(sid)] = (int(n_items or 0), int(units or 0))
+    return out
+
+
+def _s2_find_done_sale_for_scan(mid:int, mesa, shipment_id:str):
+    """Encuentra venta DONE (cerrada por Camarero) aún NO embalada."""
+    _s2_pack_dispatch_create_tables()
+    conn=get_conn(); c=conn.cursor()
+    if mesa is None:
+        row = c.execute("""SELECT s.sale_id
+                             FROM s2_sales s
+                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                             WHERE s.manifest_id=? AND s.shipment_id=? AND s.status='DONE'
+                               AND p.sale_id IS NULL
+                             ORDER BY s.page_no, s.sale_id
+                             LIMIT 1;""", (mid, str(shipment_id))).fetchone()
+    else:
+        row = c.execute("""SELECT s.sale_id
+                             FROM s2_sales s
+                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                             WHERE s.manifest_id=? AND s.mesa=? AND s.shipment_id=? AND s.status='DONE'
+                               AND p.sale_id IS NULL
+                             ORDER BY s.page_no, s.sale_id
+                             LIMIT 1;""", (mid, int(mesa), str(shipment_id))).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def _s2_find_done_sale_for_pack_scan(mid:int, mesa, pack_id:str):
+    """Fallback para Colecta: escaneo devuelve Pack ID."""
+    _s2_pack_dispatch_create_tables()
+    conn=get_conn(); c=conn.cursor()
+    if mesa is None:
+        row = c.execute("""SELECT s.sale_id
+                             FROM s2_sales s
+                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                             WHERE s.manifest_id=? AND s.pack_id=? AND s.status='DONE'
+                               AND p.sale_id IS NULL
+                             ORDER BY s.page_no, s.sale_id
+                             LIMIT 1;""", (mid, str(pack_id))).fetchone()
+    else:
+        row = c.execute("""SELECT s.sale_id
+                             FROM s2_sales s
+                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                             WHERE s.manifest_id=? AND s.mesa=? AND s.pack_id=? AND s.status='DONE'
+                               AND p.sale_id IS NULL
+                             ORDER BY s.page_no, s.sale_id
+                             LIMIT 1;""", (mid, int(mesa), str(pack_id))).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def _s2_mark_packed(mid:int, sale_id:str, packer:str=""):
+    _s2_pack_dispatch_create_tables()
+    conn=get_conn(); c=conn.cursor()
+    c.execute("""INSERT INTO s2_packing(manifest_id, sale_id, status, packed_at, packer)
+                 VALUES(?,?,?,?,?)
+                 ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
+                    status=excluded.status,
+                    packed_at=excluded.packed_at,
+                    packer=excluded.packer;""", (mid, str(sale_id), "PACKED", _s2_now_iso(), (packer or "")))
+    conn.commit(); conn.close()
+
+
+def _s2_mark_dispatched(mid:int, sale_id:str, dispatcher:str=""):
+    _s2_pack_dispatch_create_tables()
+    conn=get_conn(); c=conn.cursor()
+    c.execute("""INSERT INTO s2_dispatch(manifest_id, sale_id, status, dispatched_at, dispatcher)
+                 VALUES(?,?,?,?,?)
+                 ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
+                    status=excluded.status,
+                    dispatched_at=excluded.dispatched_at,
+                    dispatcher=excluded.dispatcher;""", (mid, str(sale_id), "DISPATCHED", _s2_now_iso(), (dispatcher or "")))
+    conn.commit(); conn.close()
+
+
+def _s2_list_sales_to_pack(mid:int, mesa=None):
+    _s2_pack_dispatch_create_tables()
+    conn=get_conn(); c=conn.cursor()
+    if mesa is None:
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer
+                            FROM s2_sales s
+                            LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                            WHERE s.manifest_id=? AND s.status='DONE' AND p.sale_id IS NULL
+                            ORDER BY s.page_no, s.sale_id;""", (mid,)).fetchall()
+    else:
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer
+                            FROM s2_sales s
+                            LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                            WHERE s.manifest_id=? AND s.mesa=? AND s.status='DONE' AND p.sale_id IS NULL
+                            ORDER BY s.page_no, s.sale_id;""", (mid, int(mesa))).fetchall()
+    conn.close()
+    return rows
+
+
+def _s2_list_sales_to_dispatch(mid:int, mesa=None):
+    _s2_pack_dispatch_create_tables()
+    conn=get_conn(); c=conn.cursor()
+    if mesa is None:
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer,
+                                   p.packed_at, p.packer
+                            FROM s2_sales s
+                            JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                            LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                            WHERE s.manifest_id=? AND s.status='DONE' AND d.sale_id IS NULL
+                            ORDER BY s.page_no, s.sale_id;""", (mid,)).fetchall()
+    else:
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer,
+                                   p.packed_at, p.packer
+                            FROM s2_sales s
+                            JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                            LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                            WHERE s.manifest_id=? AND s.mesa=? AND s.status='DONE' AND d.sale_id IS NULL
+                            ORDER BY s.page_no, s.sale_id;""", (mid, int(mesa))).fetchall()
+    conn.close()
+    return rows
+
+
+def page_packing():
+    _s2_pack_dispatch_create_tables()
+    st.title("Embalador")
+    st.caption("Flujo desde Sorting: solo aparecen ventas **cerradas por Camarero** (DONE) y aún **no embaladas**.")
+    mid = _s2_get_active_manifest_id()
+
+    mesas = _s2_list_mesas(mid)
+    mesa_opt = ["Todas"] + [f"Mesa {m}" for m in mesas]
+    sel = st.selectbox("Filtrar por mesa", mesa_opt, index=0)
+    mesa = None
+    if sel != "Todas":
+        try:
+            mesa = int(sel.split()[-1])
+        except Exception:
+            mesa = None
+
+    enforce = st.checkbox("Respetar orden del manifiesto (recomendado)", value=True)
+    packer = st.text_input("Nombre/Iniciales embalador (opcional)", value=str(st.session_state.get("packer_name","")))
+    st.session_state["packer_name"] = packer
+
+    # Lista pendiente
+    rows = _s2_list_sales_to_pack(mid, mesa=mesa)
+    sale_ids = [str(r[0]) for r in rows]
+    stats = _s2_pack_stats_for_sales(mid, sale_ids)
+
+    if rows:
+        next_sale = str(rows[0][0])
+        st.info(f"Siguiente por embalar (orden manifiesto): **{next_sale}**  ·  Total pendientes: **{len(rows)}**")
+    else:
+        st.success("No hay ventas pendientes de embalaje 🎉")
+
+    # Limpieza segura del campo
+    if st.session_state.get("pack_clear_scan"):
+        st.session_state["pack_scan_widget"] = ""
+        st.session_state["pack_clear_scan"] = False
+
+    st.subheader("Escaneo de etiqueta para marcar EMBALADO")
+    scan = st.text_input("Etiqueta (QR Flex / barra Colecta)", key="pack_scan_widget")
+    if scan:
+        sid = _s2_extract_shipment_id(scan)
+        sale_id = None
+
+        if sid:
+            sale_id = _s2_find_done_sale_for_scan(mid, mesa, sid)
+        if (not sale_id):
+            # fallback pack_id: usamos el escaneo limpio como pack_id
+            pack_id = str(scan).strip()
+            sale_id = _s2_find_done_sale_for_pack_scan(mid, mesa, pack_id)
+
+        if not sale_id:
+            st.error("No encontré esta etiqueta para embalaje (¿no está cerrada en Sorting o ya fue embalada?).")
+            sfx_emit("ERR")
+        else:
+            # orden
+            if enforce and rows and str(sale_id) != str(rows[0][0]):
+                st.warning(f"Fuera de orden. Esperado: {rows[0][0]} · Escaneado: {sale_id}")
+                sfx_emit("ERR")
+            else:
+                _s2_mark_packed(mid, str(sale_id), packer=packer)
+                st.success(f"✅ Embalado: {sale_id}")
+                sfx_emit("OK")
+        st.session_state["pack_clear_scan"] = True
+        st.rerun()
+
+    st.divider()
+    st.subheader("Pendientes de embalaje")
+    if not rows:
+        return
+
+    data = []
+    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer in rows:
+        n_items, units = stats.get(str(sale_id), (0,0))
+        data.append({
+            "Mesa": mesa_db,
+            "Página": page_no,
+            "Venta": sale_id,
+            "Envío": shipment_id or "",
+            "Pack": pack_id or "",
+            "Cliente": customer or "",
+            "Productos": n_items,
+            "Unidades": units,
+        })
+    st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+
+
+def page_dispatch():
+    _s2_pack_dispatch_create_tables()
+    st.title("Despacho")
+    st.caption("Flujo desde Embalador: solo aparecen ventas **embaladas** y aún **no despachadas**.")
+    mid = _s2_get_active_manifest_id()
+
+    mesas = _s2_list_mesas(mid)
+    mesa_opt = ["Todas"] + [f"Mesa {m}" for m in mesas]
+    sel = st.selectbox("Filtrar por mesa", mesa_opt, index=0, key="dispatch_mesa_filter")
+    mesa = None
+    if sel != "Todas":
+        try:
+            mesa = int(sel.split()[-1])
+        except Exception:
+            mesa = None
+
+    enforce = st.checkbox("Respetar orden del manifiesto (recomendado)", value=True, key="dispatch_enforce")
+    dispatcher = st.text_input("Nombre/Iniciales despacho (opcional)", value=str(st.session_state.get("dispatcher_name","")))
+    st.session_state["dispatcher_name"] = dispatcher
+
+    rows = _s2_list_sales_to_dispatch(mid, mesa=mesa)
+    sale_ids = [str(r[0]) for r in rows]
+    stats = _s2_pack_stats_for_sales(mid, sale_ids)
+
+    if rows:
+        st.info(f"Siguiente por despachar (orden manifiesto): **{rows[0][0]}**  ·  Total pendientes: **{len(rows)}**")
+    else:
+        st.success("No hay ventas pendientes de despacho 🎉")
+
+    if st.session_state.get("dispatch_clear_scan"):
+        st.session_state["dispatch_scan_widget"] = ""
+        st.session_state["dispatch_clear_scan"] = False
+
+    st.subheader("Escaneo de etiqueta para marcar DESPACHADO")
+    scan = st.text_input("Etiqueta (QR Flex / barra Colecta)", key="dispatch_scan_widget")
+    if scan:
+        sid = _s2_extract_shipment_id(scan)
+        sale_id = None
+        conn=get_conn(); c=conn.cursor()
+        if sid:
+            if mesa is None:
+                row = c.execute("""SELECT s.sale_id FROM s2_sales s
+                                     JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                                     LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                                     WHERE s.manifest_id=? AND s.shipment_id=? AND s.status='DONE' AND d.sale_id IS NULL
+                                     ORDER BY s.page_no, s.sale_id LIMIT 1;""", (mid, str(sid))).fetchone()
+            else:
+                row = c.execute("""SELECT s.sale_id FROM s2_sales s
+                                     JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                                     LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                                     WHERE s.manifest_id=? AND s.mesa=? AND s.shipment_id=? AND s.status='DONE' AND d.sale_id IS NULL
+                                     ORDER BY s.page_no, s.sale_id LIMIT 1;""", (mid, int(mesa), str(sid))).fetchone()
+            sale_id = row[0] if row else None
+
+        if not sale_id:
+            # fallback pack_id
+            pack_id = str(scan).strip()
+            if mesa is None:
+                row = c.execute("""SELECT s.sale_id FROM s2_sales s
+                                     JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                                     LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                                     WHERE s.manifest_id=? AND s.pack_id=? AND s.status='DONE' AND d.sale_id IS NULL
+                                     ORDER BY s.page_no, s.sale_id LIMIT 1;""", (mid, str(pack_id))).fetchone()
+            else:
+                row = c.execute("""SELECT s.sale_id FROM s2_sales s
+                                     JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                                     LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                                     WHERE s.manifest_id=? AND s.mesa=? AND s.pack_id=? AND s.status='DONE' AND d.sale_id IS NULL
+                                     ORDER BY s.page_no, s.sale_id LIMIT 1;""", (mid, int(mesa), str(pack_id))).fetchone()
+            sale_id = row[0] if row else None
+        conn.close()
+
+        if not sale_id:
+            st.error("No encontré esta etiqueta para despacho (¿no está embalada o ya fue despachada?).")
+            sfx_emit("ERR")
+        else:
+            if enforce and rows and str(sale_id) != str(rows[0][0]):
+                st.warning(f"Fuera de orden. Esperado: {rows[0][0]} · Escaneado: {sale_id}")
+                sfx_emit("ERR")
+            else:
+                _s2_mark_dispatched(mid, str(sale_id), dispatcher=dispatcher)
+                st.success(f"🚚 Despachado: {sale_id}")
+                sfx_emit("OK")
+        st.session_state["dispatch_clear_scan"] = True
+        st.rerun()
+
+    st.divider()
+    st.subheader("Pendientes de despacho")
+    if not rows:
+        return
+
+    data = []
+    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, packed_at, packer in rows:
+        n_items, units = stats.get(str(sale_id), (0,0))
+        data.append({
+            "Mesa": mesa_db,
+            "Página": page_no,
+            "Venta": sale_id,
+            "Envío": shipment_id or "",
+            "Pack": pack_id or "",
+            "Cliente": customer or "",
+            "Productos": n_items,
+            "Unidades": units,
+            "Embalado": packed_at or "",
+            "Embalador": packer or "",
+        })
+    st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+
+
 def main():
 
     st.set_page_config(page_title="Aurora ML – WMS", layout="wide")
@@ -5524,6 +5923,20 @@ def main():
             page_sorting_upload(inv_map_sku, barcode_to_sku)
         else:
             page_sorting_admin(inv_map_sku, barcode_to_sku)
+
+    elif mode == "PACKING":
+        pages = [
+            "1) Embalador",
+        ]
+        _ = st.sidebar.radio("Menú", pages, index=0)
+        page_packing()
+
+    elif mode == "DISPATCH":
+        pages = [
+            "1) Despacho",
+        ]
+        _ = st.sidebar.radio("Menú", pages, index=0)
+        page_dispatch()
 
     # ==========
     # MODO FULL (nuevo módulo completo)
