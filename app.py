@@ -3830,6 +3830,10 @@ def _s2_create_tables():
             c.execute("ALTER TABLE s2_sales ADD COLUMN customer TEXT;")
         if "destino" not in cols:
             c.execute("ALTER TABLE s2_sales ADD COLUMN destino TEXT;")
+        if "comuna" not in cols:
+            c.execute("ALTER TABLE s2_sales ADD COLUMN comuna TEXT;")
+        if "ciudad_destino" not in cols:
+            c.execute("ALTER TABLE s2_sales ADD COLUMN ciudad_destino TEXT;")
     except Exception:
         pass
 
@@ -3944,7 +3948,14 @@ def _s2_zpl_underscore_decode(s: str) -> str:
     return "".join(out)
 
 def _s2_parse_label_raw_info(raw: str):
-    """Extrae info visible de una etiqueta (Flex/Colecta) desde el texto raw/ZPL."""
+    """Extrae info visible de una etiqueta (Flex/Colecta) desde el texto raw/ZPL.
+
+    Campos:
+      - destinatario
+      - domicilio (alias: direccion)
+      - comuna (FLEX)
+      - ciudad_destino (COLECTA y a veces FLEX)
+    """
     import re
     if not raw:
         return {}
@@ -3967,11 +3978,26 @@ def _s2_parse_label_raw_info(raw: str):
     m = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
     if m:
         info["domicilio"] = m.group(2).strip()
+        # alias por compatibilidad (hay pantallas que buscan 'direccion')
+        info["direccion"] = info["domicilio"]
 
-    # Ciudad destino (Colecta)
+    # Ciudad de destino (Colecta y a veces Flex)
     m = re.search(r"Ciudad\s+de\s+destino\s*:\s*([^\n\^]{3,160})", s, flags=re.IGNORECASE)
     if m:
         info["ciudad_destino"] = m.group(1).strip()
+
+    # FLEX: comuna (a veces viene implícita en Domicilio "... , Comuna")
+    m = re.search(r"\bComuna\b\s*:\s*([^\n\^]{2,80})", s, flags=re.IGNORECASE)
+    if m:
+        info["comuna"] = m.group(1).strip()
+    elif info.get("domicilio"):
+        # Heurística: tomar la última sección después de coma
+        dom = info.get("domicilio", "")
+        if "," in dom:
+            comuna = dom.split(",")[-1].strip()
+            # evita capturar basura
+            if comuna and len(comuna) <= 60 and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", comuna):
+                info["comuna"] = comuna
 
     # Limpieza: jamás aceptar el mensaje promocional como destino
     promo_re = re.compile(r"\bDespacha\s+tu[s]?\s+productos\b", re.I)
@@ -4501,23 +4527,29 @@ def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
         destino = _s2_clean_person_text(destino, 160) if destino else None
 
         # actualizar ventas por shipment_id
-        if customer or destino:
-            if customer and destino:
-                c.execute("""UPDATE s2_sales
-                             SET customer=?, destino=?
-                             WHERE manifest_id=? AND shipment_id=?;""",
-                          (customer, destino, mid, str(ship)))
-            elif customer:
-                c.execute("""UPDATE s2_sales
-                             SET customer=?
-                             WHERE manifest_id=? AND shipment_id=?;""",
-                          (customer, mid, str(ship)))
-            elif destino:
-                c.execute("""UPDATE s2_sales
-                             SET destino=?
-                             WHERE manifest_id=? AND shipment_id=?;""",
-                          (destino, mid, str(ship)))
+        comuna = _s2_clean_person_text(info.get("comuna"), 60)
+        ciudad_dest = _s2_clean_person_text(info.get("ciudad_destino"), 80)
 
+        fields = []
+        params = []
+        if customer:
+            fields.append("customer=?")
+            params.append(customer)
+        if destino:
+            fields.append("destino=?")
+            params.append(destino)
+        if comuna:
+            fields.append("comuna=?")
+            params.append(comuna)
+        if ciudad_dest:
+            fields.append("ciudad_destino=?")
+            params.append(ciudad_dest)
+
+        if fields:
+            params.extend([mid, str(ship)])
+            c.execute(f"""UPDATE s2_sales
+                             SET {', '.join(fields)}
+                             WHERE manifest_id=? AND shipment_id=?;""", tuple(params))
     conn.commit()
     conn.close()
     return len(shipment_ids)
@@ -5012,13 +5044,16 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
 
     # Información de la etiqueta / envío
     conn=get_conn(); c=conn.cursor()
-    sale_row = c.execute("SELECT shipment_id, pack_id, customer, page_no, mesa, status FROM s2_sales WHERE manifest_id=? AND sale_id=?;", (mid, sale_id)).fetchone()
+    sale_row = c.execute("SELECT shipment_id, pack_id, customer, destino, comuna, ciudad_destino, page_no, mesa, status FROM s2_sales WHERE manifest_id=? AND sale_id=?;", (mid, sale_id)).fetchone()
     conn.close()
     shipment_id = sale_row[0] if sale_row else ""
     pack_id = sale_row[1] if sale_row else ""
     customer = sale_row[2] if sale_row else ""
-    page_no = sale_row[3] if sale_row else ""
-    mesa_db = sale_row[4] if sale_row else ""
+    destino_db = sale_row[3] if sale_row else ""
+    comuna_db = sale_row[4] if sale_row else ""
+    ciudad_dest_db = sale_row[5] if sale_row else ""
+    page_no = sale_row[6] if sale_row else ""
+    mesa_db = sale_row[7] if sale_row else ""
 
     raw_label = _s2_get_label_raw(mid, shipment_id) if shipment_id else ""
     info = _s2_parse_label_raw_info(raw_label)
@@ -5029,13 +5064,21 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
     b.metric("Pack ID", str(pack_id) if pack_id else "-")
     cx.metric("Mesa / Página", f"{mesa_db}/{page_no}" if page_no else str(mesa_db))
 
-    name = info.get("destinatario") or customer or "-"
-    addr = info.get("direccion") or "-"
-    comuna = info.get("comuna") or info.get("ciudad_destino") or "-"
-    
-    
-    
+    # Datos de destino / cliente (desde etiqueta si existe; fallback a DB)
+    name = (info.get("destinatario") or customer or "-").strip() if isinstance(info, dict) else (customer or "-")
+    dom = (info.get("domicilio") or info.get("direccion") or destino_db or "-").strip() if isinstance(info, dict) else (destino_db or "-")
+    comuna = (info.get("comuna") or comuna_db or "-").strip() if isinstance(info, dict) else (comuna_db or "-")
+    ciudad_dest = (info.get("ciudad_destino") or ciudad_dest_db or "-").strip() if isinstance(info, dict) else (ciudad_dest_db or "-")
 
+    # Presentación compacta
+    st.write(f"**Cliente:** {name}")
+    if dom and dom != "-":
+        st.write(f"**Domicilio:** {dom}")
+    # FLEX: mostrar Comuna + Ciudad/Región (si vienen). COLECTA: ciudad_destino suele venir siempre.
+    if comuna and comuna != "-":
+        st.write(f"**Comuna:** {comuna}")
+    if ciudad_dest and ciudad_dest != "-":
+        st.write(f"**Ciudad destino:** {ciudad_dest}")
     items = _s2_sale_items(mid, sale_id)
 
     st.markdown("### Productos de la venta")
@@ -5901,13 +5944,13 @@ def _s2_list_sales_to_pack(mid:int, mesa=None):
     _s2_pack_dispatch_create_tables()
     conn=get_conn(); c=conn.cursor()
     if mesa is None:
-        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino, s.comuna, s.ciudad_destino
                             FROM s2_sales s
                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                             WHERE s.manifest_id=? AND s.status='DONE' AND p.sale_id IS NULL
                             ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
     else:
-        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino, s.comuna, s.ciudad_destino
                             FROM s2_sales s
                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                             WHERE s.manifest_id=? AND s.mesa=? AND s.status='DONE' AND p.sale_id IS NULL
@@ -5920,7 +5963,7 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
     _s2_pack_dispatch_create_tables()
     conn=get_conn(); c=conn.cursor()
     if mesa is None:
-        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino,
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino, s.comuna, s.ciudad_destino,
                                    p.packed_at, p.packer
                             FROM s2_sales s
                             JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
@@ -5928,7 +5971,7 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
                             WHERE s.manifest_id=? AND s.status='DONE' AND d.sale_id IS NULL
                             ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
     else:
-        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino,
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino, s.comuna, s.ciudad_destino,
                                    p.packed_at, p.packer
                             FROM s2_sales s
                             JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
@@ -6050,13 +6093,13 @@ def page_packing(inv_map_sku: dict):
 
         # Meta (etiqueta / cliente / destino)
         conn = get_conn(); c = conn.cursor()
-        meta = c.execute("""SELECT sale_id, shipment_id, pack_id, page_no, mesa, customer, destino
+        meta = c.execute("""SELECT sale_id, shipment_id, pack_id, page_no, mesa, customer, destino, comuna, ciudad_destino
                              FROM s2_sales WHERE manifest_id=? AND sale_id=? LIMIT 1;""",
                          (mid, str(active_sale))).fetchone()
         conn.close()
 
         if meta:
-            _sale_id, _ship, _pack, _page, _mesa, _cust, _dest = meta
+            _sale_id, _ship, _pack, _page, _mesa, _cust, _dest, _comuna, _ciudad = meta
             cols = st.columns(2)
             with cols[0]:
                 st.write(f"**Venta:** {_sale_id}")
@@ -6067,6 +6110,10 @@ def page_packing(inv_map_sku: dict):
             with cols[1]:
                 if _dest:
                     st.write(f"**Destino:** {_dest}")
+                if _comuna:
+                    st.write(f"**Comuna:** {_comuna}")
+                if _ciudad:
+                    st.write(f"**Ciudad destino:** {_ciudad}")
                 if _cust:
                     st.write(f"**Cliente:** {_cust}")
 
@@ -6098,9 +6145,14 @@ def page_packing(inv_map_sku: dict):
                     else:
                         st.caption(" ")
                 with c2:
+                    # Resaltar incidencias en rojo (cuando Camarero marcó el SKU como INCIDENCE)
+                    is_incid = (str(status).upper() == "INCIDENCE")
+                    badge = ' <span style="color:#b00020;font-weight:800;">⚠ INCIDENCIA</span>' if is_incid else ""
+                    desc_style = ' style="color:#b00020;font-weight:800;"' if is_incid else ""
+
                     st.markdown(
                         f'<div class="pack-row"><div class="pack-sku">{html.escape(sku_s)}</div>'
-                        f'<div class="pack-desc">{html.escape(desc_s)}</div></div>',
+                        f'<div class="pack-desc"{desc_style}>{html.escape(desc_s)}{badge}</div></div>',
                         unsafe_allow_html=True
                     )
                 with c3:
@@ -6126,7 +6178,7 @@ def page_packing(inv_map_sku: dict):
         return
 
     data = []
-    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino in rows:
+    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino, comuna, ciudad_destino in rows:
         n_items, units = stats.get(str(sale_id), (0, 0))
         cust = (customer or "").strip()
         # Sanitizar valores claramente erróneos (cuando el parser antiguo dejó basura)
@@ -6139,6 +6191,7 @@ def page_packing(inv_map_sku: dict):
             "Envío": shipment_id or "",
             "Pack": pack_id or "",
             "Destino": destino or "",
+            "Comuna/Ciudad": (", ".join([x for x in [(comuna or "").strip(), (ciudad_destino or "").strip()] if x])) ,
             "Cliente": cust,
             "Productos": n_items,
             "Unidades": units,
@@ -6243,7 +6296,7 @@ def page_dispatch():
         return
 
     data = []
-    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino, packed_at, packer in rows:
+    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino, comuna, ciudad_destino, packed_at, packer in rows:
         n_items, units = stats.get(str(sale_id), (0,0))
         data.append({
             "Mesa": mesa_db,
@@ -6252,6 +6305,7 @@ def page_dispatch():
             "Envío": shipment_id or "",
             "Pack": pack_id or "",
             "Destino": destino or "",
+            "Comuna/Ciudad": (", ".join([x for x in [(comuna or "").strip(), (ciudad_destino or "").strip()] if x])) ,
             "Cliente": customer or "",
             "Productos": n_items,
             "Unidades": units,
