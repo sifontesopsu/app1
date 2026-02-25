@@ -3769,6 +3769,7 @@ def _s2_create_tables():
         sale_id TEXT NOT NULL,
         shipment_id TEXT,
         page_no INTEGER NOT NULL,
+        row_no INTEGER NOT NULL DEFAULT 0,
         mesa INTEGER,
         status TEXT NOT NULL DEFAULT 'NEW',
         opened_at TEXT,
@@ -3795,6 +3796,8 @@ def _s2_create_tables():
     # --- Migraciones suaves (SQLite) ---
     try:
         cols = [r[1] for r in c.execute("PRAGMA table_info(s2_sales);").fetchall()]
+        if "row_no" not in cols:
+            c.execute("ALTER TABLE s2_sales ADD COLUMN row_no INTEGER NOT NULL DEFAULT 0;")
         if "pack_id" not in cols:
             c.execute("ALTER TABLE s2_sales ADD COLUMN pack_id TEXT;")
         if "customer" not in cols:
@@ -4174,6 +4177,7 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
     c.execute("DELETE FROM s2_sales WHERE manifest_id=?;", (mid,))
 
     n_sales = 0
+    page_counters = {}
     for s in pages_sales:
         sale_id = str(s.get("sale_id") or "")
         if not sale_id:
@@ -4182,10 +4186,12 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
         shipment_id = s.get("shipment_id")
         page_no = int(s.get("page_no") or 1)
         pack_id = s.get("pack_id")
+        row_no = int(page_counters.get(page_no, 0) + 1)
+        page_counters[page_no] = row_no
         customer = s.get("customer")
 
-        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, status, pack_id, customer)
-                     VALUES(?,?,?,?, 'NEW', ?, ?)
+        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, row_no, status, pack_id, customer)
+                     VALUES(?,?,?,?,?, 'NEW', ?, ?)
                      ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
                         shipment_id=excluded.shipment_id,
                         page_no=excluded.page_no,
@@ -4195,7 +4201,7 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
                         closed_at=NULL,
                         pack_id=excluded.pack_id,
                         customer=excluded.customer;""",
-                  (mid, sale_id, (str(shipment_id) if shipment_id else None), page_no,
+                  (mid, sale_id, (str(shipment_id) if shipment_id else None), page_no, row_no,
                    (str(pack_id) if pack_id else None), (str(customer) if customer else None)))
 
         for it in s.get("items", []):
@@ -4495,7 +4501,7 @@ def _s2_find_sale_for_scan(mid:int, mesa:int, shipment_id:str):
     c=conn.cursor()
     c.execute("""SELECT sale_id FROM s2_sales
                  WHERE manifest_id=? AND mesa=? AND shipment_id=? AND status='PENDING'
-                 ORDER BY page_no, sale_id
+                 ORDER BY page_no, row_no, sale_id
                  LIMIT 1;""", (mid, int(mesa), str(shipment_id)))
     row=c.fetchone()
     conn.close()
@@ -4507,7 +4513,7 @@ def _s2_find_sale_for_pack_scan(mid:int, mesa:int, pack_id:str):
     c=conn.cursor()
     c.execute("""SELECT sale_id FROM s2_sales
                  WHERE manifest_id=? AND mesa=? AND pack_id=? AND status='PENDING'
-                 ORDER BY page_no, sale_id
+                 ORDER BY page_no, row_no, sale_id
                  LIMIT 1;""", (mid, int(mesa), str(pack_id)))
     row=c.fetchone()
     conn.close()
@@ -4521,7 +4527,7 @@ def _s2_next_pending_sale_in_sequence(mid:int, mesa:int):
     c.execute("""SELECT sale_id, shipment_id, pack_id, page_no
                  FROM s2_sales
                  WHERE manifest_id=? AND mesa=? AND status='PENDING'
-                 ORDER BY page_no, sale_id
+                 ORDER BY page_no, row_no, sale_id
                  LIMIT 1;""", (mid, int(mesa)))
     row = c.fetchone()
     conn.close()
@@ -5023,7 +5029,7 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
                ON s.manifest_id=i.manifest_id AND s.sale_id=i.sale_id
             WHERE i.manifest_id=?
               AND (i.status='INCIDENCE' OR i.confirm_mode='MANUAL_NO_EAN')
-            ORDER BY s.mesa, s.sale_id, i.sku;""",
+            ORDER BY s.mesa, s.page_no, s.row_no, s.sale_id, i.sku;""",
         (mid,),
     ).fetchall()
 
@@ -5074,7 +5080,7 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
 
     pend = c.execute(
         "SELECT sale_id, mesa, shipment_id, status FROM s2_sales "
-        "WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, sale_id LIMIT 200;",
+        "WHERE manifest_id=? AND status!='DONE' ORDER BY mesa, row_no, sale_id LIMIT 200;",
         (mid,),
     ).fetchall()
 
@@ -5114,7 +5120,7 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         missing = c.execute(
             "SELECT sale_id, page_no, pack_id FROM s2_sales "
             "WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') "
-            "ORDER BY page_no, sale_id LIMIT 20",
+            "ORDER BY page_no, row_no, sale_id LIMIT 20",
             (mid,),
         ).fetchall()
         if missing:
@@ -5580,7 +5586,7 @@ def _s2_find_done_sale_for_scan(mid:int, mesa, shipment_id:str):
                              LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                              WHERE s.manifest_id=? AND s.shipment_id=? AND s.status='DONE'
                                AND p.sale_id IS NULL
-                             ORDER BY s.page_no, s.sale_id
+                             ORDER BY s.page_no, s.row_no, s.sale_id
                              LIMIT 1;""", (mid, str(shipment_id))).fetchone()
     else:
         row = c.execute("""SELECT s.sale_id
@@ -5588,7 +5594,7 @@ def _s2_find_done_sale_for_scan(mid:int, mesa, shipment_id:str):
                              LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                              WHERE s.manifest_id=? AND s.mesa=? AND s.shipment_id=? AND s.status='DONE'
                                AND p.sale_id IS NULL
-                             ORDER BY s.page_no, s.sale_id
+                             ORDER BY s.page_no, s.row_no, s.sale_id
                              LIMIT 1;""", (mid, int(mesa), str(shipment_id))).fetchone()
     conn.close()
     return row[0] if row else None
@@ -5604,7 +5610,7 @@ def _s2_find_done_sale_for_pack_scan(mid:int, mesa, pack_id:str):
                              LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                              WHERE s.manifest_id=? AND s.pack_id=? AND s.status='DONE'
                                AND p.sale_id IS NULL
-                             ORDER BY s.page_no, s.sale_id
+                             ORDER BY s.page_no, s.row_no, s.sale_id
                              LIMIT 1;""", (mid, str(pack_id))).fetchone()
     else:
         row = c.execute("""SELECT s.sale_id
@@ -5612,7 +5618,7 @@ def _s2_find_done_sale_for_pack_scan(mid:int, mesa, pack_id:str):
                              LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                              WHERE s.manifest_id=? AND s.mesa=? AND s.pack_id=? AND s.status='DONE'
                                AND p.sale_id IS NULL
-                             ORDER BY s.page_no, s.sale_id
+                             ORDER BY s.page_no, s.row_no, s.sale_id
                              LIMIT 1;""", (mid, int(mesa), str(pack_id))).fetchone()
     conn.close()
     return row[0] if row else None
@@ -5650,13 +5656,13 @@ def _s2_list_sales_to_pack(mid:int, mesa=None):
                             FROM s2_sales s
                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                             WHERE s.manifest_id=? AND s.status='DONE' AND p.sale_id IS NULL
-                            ORDER BY s.page_no, s.sale_id;""", (mid,)).fetchall()
+                            ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
     else:
         rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer
                             FROM s2_sales s
                             LEFT JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                             WHERE s.manifest_id=? AND s.mesa=? AND s.status='DONE' AND p.sale_id IS NULL
-                            ORDER BY s.page_no, s.sale_id;""", (mid, int(mesa))).fetchall()
+                            ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid, int(mesa))).fetchall()
     conn.close()
     return rows
 
@@ -5671,7 +5677,7 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
                             JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                             LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
                             WHERE s.manifest_id=? AND s.status='DONE' AND d.sale_id IS NULL
-                            ORDER BY s.page_no, s.sale_id;""", (mid,)).fetchall()
+                            ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
     else:
         rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer,
                                    p.packed_at, p.packer
@@ -5679,7 +5685,7 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
                             JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                             LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
                             WHERE s.manifest_id=? AND s.mesa=? AND s.status='DONE' AND d.sale_id IS NULL
-                            ORDER BY s.page_no, s.sale_id;""", (mid, int(mesa))).fetchall()
+                            ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid, int(mesa))).fetchall()
     conn.close()
     return rows
 
@@ -5901,13 +5907,13 @@ def page_dispatch():
                                      JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                                      LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
                                      WHERE s.manifest_id=? AND s.shipment_id=? AND s.status='DONE' AND d.sale_id IS NULL
-                                     ORDER BY s.page_no, s.sale_id LIMIT 1;""", (mid, str(sid))).fetchone()
+                                     ORDER BY s.page_no, s.row_no, s.sale_id LIMIT 1;""", (mid, str(sid))).fetchone()
             else:
                 row = c.execute("""SELECT s.sale_id FROM s2_sales s
                                      JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                                      LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
                                      WHERE s.manifest_id=? AND s.mesa=? AND s.shipment_id=? AND s.status='DONE' AND d.sale_id IS NULL
-                                     ORDER BY s.page_no, s.sale_id LIMIT 1;""", (mid, int(mesa), str(sid))).fetchone()
+                                     ORDER BY s.page_no, s.row_no, s.sale_id LIMIT 1;""", (mid, int(mesa), str(sid))).fetchone()
             sale_id = row[0] if row else None
 
         if not sale_id:
@@ -5918,13 +5924,13 @@ def page_dispatch():
                                      JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                                      LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
                                      WHERE s.manifest_id=? AND s.pack_id=? AND s.status='DONE' AND d.sale_id IS NULL
-                                     ORDER BY s.page_no, s.sale_id LIMIT 1;""", (mid, str(pack_id))).fetchone()
+                                     ORDER BY s.page_no, s.row_no, s.sale_id LIMIT 1;""", (mid, str(pack_id))).fetchone()
             else:
                 row = c.execute("""SELECT s.sale_id FROM s2_sales s
                                      JOIN s2_packing p ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
                                      LEFT JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
                                      WHERE s.manifest_id=? AND s.mesa=? AND s.pack_id=? AND s.status='DONE' AND d.sale_id IS NULL
-                                     ORDER BY s.page_no, s.sale_id LIMIT 1;""", (mid, int(mesa), str(pack_id))).fetchone()
+                                     ORDER BY s.page_no, s.row_no, s.sale_id LIMIT 1;""", (mid, int(mesa), str(pack_id))).fetchone()
             sale_id = row[0] if row else None
         conn.close()
 
