@@ -725,6 +725,45 @@ def init_db():
         barcode TEXT PRIMARY KEY,
         sku_ml TEXT
     );
+
+    # --- Reparación robusta de schema para sku_barcodes (BD antiguas en Streamlit Cloud) ---
+    # Esta tabla se puede reconstruir desde el maestro, así que es seguro "normalizarla".
+    try:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes);").fetchall()]
+        cols_set = set(cols or [])
+        if "barcode" not in cols_set:
+            # Algunos DB viejos tenían 'ean' u otro nombre
+            c.execute("ALTER TABLE sku_barcodes RENAME TO sku_barcodes_old;")
+            c.execute("CREATE TABLE IF NOT EXISTS sku_barcodes (barcode TEXT PRIMARY KEY, sku_ml TEXT);")
+        else:
+            # Asegurar sku_ml
+            if "sku_ml" not in cols_set and "sku" in cols_set:
+                try:
+                    c.execute("ALTER TABLE sku_barcodes ADD COLUMN sku_ml TEXT;")
+                    c.execute("UPDATE sku_barcodes SET sku_ml=sku WHERE (sku_ml IS NULL OR sku_ml='');")
+                except Exception:
+                    pass
+            if "sku_ml" not in set([r[1] for r in c.execute("PRAGMA table_info(sku_barcodes);").fetchall()]):
+                # no se pudo agregar -> recrear limpia
+                c.execute("ALTER TABLE sku_barcodes RENAME TO sku_barcodes_old;")
+                c.execute("CREATE TABLE IF NOT EXISTS sku_barcodes (barcode TEXT PRIMARY KEY, sku_ml TEXT);")
+            # Si quedó una tabla old, intentar copiar lo que se pueda
+            if _db_table_exists(conn, "sku_barcodes_old"):
+                old_cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes_old);").fetchall()]
+                if "barcode" in old_cols:
+                    src_sku = "sku_ml" if "sku_ml" in old_cols else ("sku" if "sku" in old_cols else None)
+                    if src_sku:
+                        try:
+                            c.execute(f"INSERT OR IGNORE INTO sku_barcodes(barcode, sku_ml) SELECT barcode, {src_sku} FROM sku_barcodes_old;")
+                        except Exception:
+                            pass
+                try:
+                    c.execute("DROP TABLE IF EXISTS sku_barcodes_old;")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     """)
 
 
@@ -1093,14 +1132,57 @@ def master_raw_title_lookup(path: str, sku: str) -> str:
 
 
 def upsert_barcodes_to_db(barcode_to_sku: dict):
+    """Guarda el mapa EAN->SKU en SQLite.
+
+    Importante: en Streamlit Cloud la DB puede quedar con esquemas antiguos. Esta función es defensiva:
+    - verifica que exista la tabla y columnas esperadas (barcode, sku_ml)
+    - si no calza, intenta recrearla (es seguro: se reconstruye desde el maestro)
+    """
     if not barcode_to_sku:
         return
     conn = get_conn()
     c = conn.cursor()
-    for bc, sku in barcode_to_sku.items():
-        c.execute("INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)", (bc, sku))
-    conn.commit()
-    conn.close()
+    try:
+        # asegurar tabla/columnas
+        c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes (
+            barcode TEXT PRIMARY KEY,
+            sku_ml TEXT
+        );""")
+        cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes);").fetchall()]
+        if "barcode" not in cols or ("sku_ml" not in cols):
+            try:
+                c.execute("ALTER TABLE sku_barcodes RENAME TO sku_barcodes_old;")
+            except Exception:
+                pass
+            c.execute("DROP TABLE IF EXISTS sku_barcodes;")
+            c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes (
+                barcode TEXT PRIMARY KEY,
+                sku_ml TEXT
+            );""")
+    except Exception:
+        # si no podemos asegurar schema, no bloqueamos la app
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+
+    try:
+        c.execute("BEGIN;")
+        for bc, sku in barcode_to_sku.items():
+            bc = only_digits(bc)
+            if not bc:
+                continue
+            c.execute("INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)", (bc, str(sku).strip()))
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
 
 
 def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
@@ -3970,9 +4052,31 @@ def _s2_parse_label_raw_info(raw: str):
 
     # COLECTA: línea tipo "NOMBRE (USER)"
     if "destinatario" not in info:
-        m = re.search(r"^\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9 .,'-]{3,80})\s*\([^\n]{2,40}\)\s*$", s, flags=re.M)
+        m = re.search(r"^\s*([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9 .,'-]{3,120})\s*\([^\n]{2,80}\)\s*$", s, flags=re.M)
         if m:
             info["destinatario"] = m.group(1).strip()
+
+    # Heurística extra (FLEX/COLECTA): el destinatario suele ser la línea inmediatamente anterior a Domicilio/Direccion
+    if "destinatario" not in info:
+        m_dom = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
+        if m_dom:
+            # tomar la línea no vacía inmediatamente anterior
+            before = s[:m_dom.start()].splitlines()
+            prev = ""
+            for ln in reversed(before[-8:]):  # mirar hacia atrás pocas líneas
+                ln = (ln or "").strip()
+                if not ln:
+                    continue
+                low = ln.lower()
+                if any(k in low for k in ["pack id", "venta", "envio", "shipment", "codigo", "código", "rut", "telefono", "teléfono", "receiver zone"]):
+                    continue
+                prev = ln
+                break
+            if prev:
+                # si viene "NOMBRE (USER)" -> recortar paréntesis
+                prev = re.sub(r"\s*\([^\)]{2,120}\)\s*$", "", prev).strip()
+                if len(prev) >= 3:
+                    info["destinatario"] = prev
 
     # Dirección / Domicilio (Flex: Direccion, Colecta: Domicilio)
     m = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
@@ -5837,6 +5941,46 @@ def _s2_pack_dispatch_create_tables():
     conn.commit()
     conn.close()
 
+def _s2_pick_manifest_for_packing() -> int:
+    """Devuelve el manifest_id más antiguo que aún tenga cola de embalaje.
+    Si no hay cola, cae al manifiesto activo.
+    """
+    _s2_pack_dispatch_create_tables()
+    conn = get_conn(); c = conn.cursor()
+    row = c.execute("""SELECT s.manifest_id
+                         FROM s2_sales s
+                         LEFT JOIN s2_packing p
+                           ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                         WHERE s.status='DONE' AND p.sale_id IS NULL
+                         GROUP BY s.manifest_id
+                         ORDER BY s.manifest_id ASC
+                         LIMIT 1;""").fetchone()
+    conn.close()
+    if row:
+        return int(row[0])
+    return _s2_get_active_manifest_id()
+
+def _s2_pick_manifest_for_dispatch() -> int:
+    """Devuelve el manifest_id más antiguo que aún tenga cola de despacho.
+    (embaladas pero no despachadas). Si no hay cola, cae al manifiesto activo.
+    """
+    _s2_pack_dispatch_create_tables()
+    conn = get_conn(); c = conn.cursor()
+    row = c.execute("""SELECT s.manifest_id
+                         FROM s2_sales s
+                         JOIN s2_packing p
+                           ON p.manifest_id=s.manifest_id AND p.sale_id=s.sale_id
+                         LEFT JOIN s2_dispatch d
+                           ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                         WHERE s.status='DONE' AND d.sale_id IS NULL
+                         GROUP BY s.manifest_id
+                         ORDER BY s.manifest_id ASC
+                         LIMIT 1;""").fetchone()
+    conn.close()
+    if row:
+        return int(row[0])
+    return _s2_get_active_manifest_id()
+
 
 def _s2_list_mesas(mid:int):
     conn=get_conn(); c=conn.cursor()
@@ -5986,7 +6130,7 @@ def page_packing(inv_map_sku: dict):
     _s2_pack_dispatch_create_tables()
     st.title("Embalador")
     st.caption("Flujo desde Sorting: solo aparecen ventas **cerradas por Camarero** (DONE) y aún **no embaladas**. **Se respeta estrictamente el orden de página del manifiesto.**")
-    mid = _s2_get_active_manifest_id()
+    mid = _s2_pick_manifest_for_packing()
 
     # --- UI compacta (PDA) ---
     st.markdown("""
@@ -6201,7 +6345,7 @@ def page_dispatch():
     _s2_pack_dispatch_create_tables()
     st.title("Despacho")
     st.caption("Flujo desde Embalador: solo aparecen ventas **embaladas** y aún **no despachadas**.")
-    mid = _s2_get_active_manifest_id()
+    mid = _s2_pick_manifest_for_dispatch()
 
     mesas = _s2_list_mesas(mid)
     mesa_opt = ["Todas"] + [f"Mesa {m}" for m in mesas]
@@ -6216,9 +6360,7 @@ def page_dispatch():
     # En despacho NO obligamos el orden del manifiesto.
     # Solo debe calzar el total de ventas del control con el total despachado.
     enforce = False
-    dispatcher = st.text_input("Nombre/Iniciales despacho (opcional)", value=str(st.session_state.get("dispatcher_name","")))
-    st.session_state["dispatcher_name"] = dispatcher
-
+    
     rows = _s2_list_sales_to_dispatch(mid, mesa=mesa)
     sale_ids = [str(r[0]) for r in rows]
     stats = _s2_pack_stats_for_sales(mid, sale_ids)
@@ -6230,6 +6372,20 @@ def page_dispatch():
     conn.close()
 
     st.info(f"Control: **{total_control}** ventas · Despachadas: **{total_despachadas}** · Pendientes: **{max(0, total_control-total_despachadas)}**")
+
+    # Lista de despachadas (historial)
+    conn = get_conn(); c = conn.cursor()
+    disp_rows = c.execute("""SELECT s.sale_id, s.page_no, s.row_no, s.mesa, s.shipment_id, s.customer, s.destino, d.dispatched_at
+                            FROM s2_dispatch d
+                            JOIN s2_sales s ON s.manifest_id=d.manifest_id AND s.sale_id=d.sale_id
+                            WHERE d.manifest_id=? 
+                            ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
+    conn.close()
+    if disp_rows:
+        st.subheader("Despachadas")
+        df_disp = pd.DataFrame(disp_rows, columns=["Venta", "Página", "Fila", "Mesa", "Shipment", "Cliente", "Destino", "Hora"])
+        st.dataframe(df_disp, use_container_width=True, hide_index=True)
+
 
     if not rows:
         if total_control and total_despachadas >= total_control:
@@ -6284,7 +6440,7 @@ def page_dispatch():
             st.error("No encontré esta etiqueta para despacho (¿no está embalada o ya fue despachada?).")
             sfx_emit("ERR")
         else:
-            _s2_mark_dispatched(mid, str(sale_id), dispatcher=dispatcher)
+            _s2_mark_dispatched(mid, str(sale_id), dispatcher=None)
             st.success(f"🚚 Despachado: {sale_id}")
             sfx_emit("OK")
         st.session_state["dispatch_clear_scan"] = True
