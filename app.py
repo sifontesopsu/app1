@@ -916,6 +916,8 @@ def init_db():
         # picking_tasks (nuevas columnas para reordenar por "Surtido en venta")
     _ensure_col("picking_tasks", "defer_rank", "INTEGER DEFAULT 0")
     _ensure_col("picking_tasks", "defer_at", "TEXT")
+    _ensure_col("picking_tasks", "family", "TEXT")
+    _ensure_col("picking_ots", "model", "TEXT")
     _ensure_col("picking_incidences", "note", "TEXT")
 
 # sorting_manifests
@@ -980,13 +982,88 @@ def init_db():
 # =========================
 # MAESTRO SKU/EAN (AUTO)
 # =========================
-def load_master_from_path(path: str) -> tuple[dict, dict, list]:
-    inv_map_sku = {}
-    barcode_to_sku = {}
-    conflicts = []
+def load_master_from_path(path: str) -> tuple[dict, dict, dict, list]:
+    inv_map_sku: dict[str, str] = {}
+    familia_map_sku: dict[str, str] = {}
+    barcode_to_sku: dict[str, str] = {}
+    conflicts: list = []
 
     if not path or not os.path.exists(path):
-        return inv_map_sku, barcode_to_sku, conflicts
+        return inv_map_sku, familia_map_sku, barcode_to_sku, conflicts
+
+    df = pd.read_excel(path, dtype=str)
+    cols = df.columns.tolist()
+    lower = [str(c).strip().lower() for c in cols]
+
+    sku_col = None
+    if "sku" in lower:
+        sku_col = cols[lower.index("sku")]
+
+    tech_col = None
+    for cand in ["artículo", "articulo", "descripcion", "descripción", "nombre", "producto", "detalle"]:
+        if cand in lower:
+            tech_col = cols[lower.index(cand)]
+            break
+
+    fam_col = None
+    # columna nueva: "Familia"
+    for cand in ["familia", "family"]:
+        if cand in lower:
+            fam_col = cols[lower.index(cand)]
+            break
+
+    barcode_col = None
+    for cand in ["codigo de barras", "código de barras", "barcode", "ean", "eans"]:
+        if cand in lower:
+            barcode_col = cols[lower.index(cand)]
+            break
+
+    # Fallback por si el archivo no trae headers claros
+    if sku_col is None or tech_col is None:
+        df0 = pd.read_excel(path, header=None, dtype=str)
+        if df0.shape[1] >= 2:
+            a, b = df0.columns[0], df0.columns[1]
+            sample = df0.head(200)
+
+            def score(series):
+                s = 0
+                for v in series:
+                    if re.fullmatch(r"\d{4,}", normalize_sku(v)):
+                        s += 1
+                return s
+
+            sa, sb = score(sample[a]), score(sample[b])
+            if sb >= sa:
+                sku_col, tech_col = b, a
+            else:
+                sku_col, tech_col = a, b
+            df = df0
+            barcode_col = None
+            fam_col = None
+
+    for _, r in df.iterrows():
+        sku = normalize_sku(r.get(sku_col, ""))
+        if not sku:
+            continue
+
+        tech = str(r.get(tech_col, "")).strip() if tech_col is not None else ""
+        if tech and tech.lower() != "nan":
+            inv_map_sku[sku] = tech
+
+        if fam_col is not None:
+            fam = str(r.get(fam_col, "")).strip()
+            if fam and fam.lower() != "nan":
+                familia_map_sku[sku] = fam
+
+        if barcode_col is not None:
+            codes = split_barcodes(r.get(barcode_col, ""))
+            for code in codes:
+                if code in barcode_to_sku and barcode_to_sku[code] != sku:
+                    conflicts.append((code, barcode_to_sku[code], sku))
+                    continue
+                barcode_to_sku[code] = sku
+
+    return inv_map_sku, familia_map_sku, barcode_to_sku, conflicts
 
     df = pd.read_excel(path, dtype=str)
     cols = df.columns.tolist()
@@ -1238,14 +1315,14 @@ def with_location(title_display: str, title_tec: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def get_master_cached(master_path: str) -> tuple[dict, dict, list]:
+def get_master_cached(master_path: str) -> tuple[dict, dict, dict, list]:
     return load_master_from_path(master_path)
 
 
 def master_bootstrap(master_path: str):
-    inv_map_sku, barcode_to_sku, conflicts = get_master_cached(master_path)
+    inv_map_sku, familia_map_sku, barcode_to_sku, conflicts = get_master_cached(master_path)
     upsert_barcodes_to_db(barcode_to_sku)
-    return inv_map_sku, barcode_to_sku, conflicts
+    return inv_map_sku, familia_map_sku, barcode_to_sku, conflicts
 
 
 
@@ -1695,10 +1772,30 @@ def import_sales_excel(file) -> pd.DataFrame:
 
     out = pd.DataFrame(records, columns=["ml_order_id", "buyer", "sku_ml", "title_ml", "qty"])
     return out
-def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pickers: int):
+def save_orders_and_build_ots(
+    sales_df: pd.DataFrame,
+    inv_map_sku: dict,
+    num_pickers: int,
+    model: str = "VENTAS",
+    familia_map_sku: dict | None = None,
+):
+    """
+    Genera la tanda de picking.
+
+    model:
+      - "VENTAS" (actual): reparte ventas por OT y crea tareas por SKU dentro de esas ventas.
+      - "SKU" (nuevo): agrupa SKUs por Familia (desde maestro) y asigna familias a OTs (batch picking).
+        Nota: para evitar conflictos con pantallas antiguas, igual se mantiene la asignación de ventas->OT
+        en ot_orders/sorting_status, pero las tareas de picking se construyen por familia/SKU.
+    """
+    model = (model or "VENTAS").upper().strip()
+    if model not in ("VENTAS", "SKU"):
+        model = "VENTAS"
+
+    familia_map_sku = familia_map_sku or {}
+
     conn = get_conn()
     c = conn.cursor()
-
 
     # SKUs que se van a CORTES (no aparecen en picking)
     cortes_set = load_cortes_set()
@@ -1742,23 +1839,26 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
                 (order_id, sku, title_eff, title_tec, qty)
             )
 
+    # pickers
     picker_ids = []
     for i in range(int(num_pickers)):
         name = f"P{i+1}"
         c.execute("INSERT INTO pickers (name) VALUES (?)", (name,))
         picker_ids.append(c.lastrowid)
 
+    # ots
     ot_ids = []
     for pid in picker_ids:
         c.execute(
-            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at) VALUES (?,?,?,?,?)",
-            ("", pid, "OPEN", now_iso(), None)
+            "INSERT INTO picking_ots (ot_code, picker_id, status, created_at, closed_at, model) VALUES (?,?,?,?,?,?)",
+            ("", pid, "OPEN", now_iso(), None, model)
         )
         ot_id = c.lastrowid
         ot_code = f"OT{ot_id:06d}"
         c.execute("UPDATE picking_ots SET ot_code=? WHERE id=?", (ot_code, ot_id))
         ot_ids.append(ot_id)
 
+    # Mantener asignación de ventas -> OT (para compatibilidad con módulos existentes)
     unique_orders = sales_df[["ml_order_id"]].drop_duplicates().reset_index(drop=True)
     assignments = {}
     for idx, row in unique_orders.iterrows():
@@ -1774,30 +1874,112 @@ def save_orders_and_build_ots(sales_df: pd.DataFrame, inv_map_sku: dict, num_pic
             VALUES (?,?,?,?,?,?)
         """, (ot_id, order_id, "PENDING", None, mesa, None))
 
+    if model == "VENTAS":
+        # === Modelo actual (sin cambios) ===
+        for ot_id in ot_ids:
+            c.execute("""
+                SELECT oi.sku_ml,
+                       COALESCE(NULLIF(oi.title_tec,''), oi.title_ml) AS title,
+                       MAX(COALESCE(oi.title_tec,'')) AS title_tec_any,
+                       SUM(oi.qty) as total
+                FROM ot_orders oo
+                JOIN order_items oi ON oi.order_id = oo.order_id
+                WHERE oo.ot_id = ?
+                GROUP BY oi.sku_ml, title
+                ORDER BY CAST(oi.sku_ml AS INTEGER), oi.sku_ml
+            """, (ot_id,))
+            rows = c.fetchall()
+            for sku, title, title_tec_any, total in rows:
+                if sku in cortes_set:
+                    c.execute(
+                        "INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, created_at) VALUES (?,?,?,?,?,?)",
+                        (ot_id, sku, title, title_tec_any, int(total), now_iso())
+                    )
+                else:
+                    c.execute("""
+                    INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode, family)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None, None, None))
+
+        conn.commit()
+        conn.close()
+        return
+
+    # === Modelo nuevo: por SKU + Familia ===
+    # 1) Preparar totales por SKU y familia
+    dfw = sales_df.copy()
+    dfw["sku_ml"] = dfw["sku_ml"].map(normalize_sku)
+    dfw = dfw[dfw["sku_ml"].ne("")].copy()
+
+    # título ML preferido por SKU (si no hay título técnico)
+    title_ml_by_sku = {}
+    if "title_ml" in dfw.columns:
+        for sku, g in dfw.groupby("sku_ml"):
+            t = ""
+            for v in g["title_ml"].tolist():
+                v = str(v or "").strip()
+                if v and v.lower() != "nan":
+                    t = v
+                    break
+            title_ml_by_sku[sku] = t
+
+    def _fam_for_sku(sku: str) -> str:
+        f = str(familia_map_sku.get(sku, "") or "").strip()
+        if not f or f.lower() == "nan":
+            return "Sin Familia"
+        return f
+
+    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
+
+    # totales por familia+sku
+    grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
+    grp["qty"] = grp["qty"].astype(int)
+
+    # 2) asignar familias a OTs (greedy balance por unidades)
+    fam_weights = grp.groupby("family")["qty"].sum().to_dict()
+    fam_list = sorted(fam_weights.items(), key=lambda x: x[1], reverse=True)
+
+    ot_load = {ot_id: 0 for ot_id in ot_ids}
+    ot_fams = {ot_id: [] for ot_id in ot_ids}
+
+    for fam, w in fam_list:
+        # ot menos cargada
+        target_ot = min(ot_load.items(), key=lambda kv: kv[1])[0]
+        ot_fams[target_ot].append(fam)
+        ot_load[target_ot] += int(w or 0)
+
+    # 3) Insertar tareas por OT
     for ot_id in ot_ids:
-        c.execute("""
-            SELECT oi.sku_ml,
-                   COALESCE(NULLIF(oi.title_tec,''), oi.title_ml) AS title,
-                   MAX(COALESCE(oi.title_tec,'')) AS title_tec_any,
-                   SUM(oi.qty) as total
-            FROM ot_orders oo
-            JOIN order_items oi ON oi.order_id = oo.order_id
-            WHERE oo.ot_id = ?
-            GROUP BY oi.sku_ml, title
-            ORDER BY CAST(oi.sku_ml AS INTEGER), oi.sku_ml
-        """, (ot_id,))
-        rows = c.fetchall()
-        for sku, title, title_tec_any, total in rows:
+        fams = ot_fams.get(ot_id, [])
+        if not fams:
+            continue
+        sub = grp[grp["family"].isin(fams)].copy()
+        # orden: familia, sku
+        try:
+            sub["sku_int"] = sub["sku_ml"].map(lambda x: int(x) if str(x).isdigit() else 10**18)
+            sub = sub.sort_values(["family", "sku_int", "sku_ml"], ascending=[True, True, True])
+        except Exception:
+            sub = sub.sort_values(["family", "sku_ml"], ascending=[True, True])
+
+        for _, r in sub.iterrows():
+            fam = str(r["family"])
+            sku = str(r["sku_ml"])
+            total = int(r["qty"] or 0)
+            title_tec = inv_map_sku.get(sku, "") or ""
+            title_ml = title_ml_by_sku.get(sku, "") or ""
+            title_eff = title_tec.strip() if title_tec.strip() else title_ml.strip()
+
             if sku in cortes_set:
                 c.execute(
                     "INSERT INTO cortes_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, created_at) VALUES (?,?,?,?,?,?)",
-                    (ot_id, sku, title, title_tec_any, int(total), now_iso())
+                    (ot_id, sku, title_eff, title_tec, total, now_iso())
                 )
             else:
                 c.execute("""
-                INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode)
-                VALUES (?,?,?,?,?,?,?,?,?)
-                """, (ot_id, sku, title, title_tec_any, int(total), 0, "PENDING", None, None))
+                    INSERT INTO picking_tasks (ot_id, sku_ml, title_ml, title_tec, qty_total, qty_picked, status, decided_at, confirm_mode, family)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                """, (ot_id, sku, title_eff, title_tec, total, 0, "PENDING", None, None, fam))
+
     conn.commit()
     conn.close()
 
@@ -1882,7 +2064,7 @@ def page_app_lobby():
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
     st.caption("Escanea etiquetas y cuenta paquetes; evita duplicados.")
-def page_import(inv_map_sku: dict):
+def page_import(inv_map_sku: dict, familia_map_sku: dict):
     st.header("Importar ventas")
     # Bloqueo duro: no permitir cargar otra tanda si hay una en curso
     conn = get_conn()
@@ -1902,6 +2084,7 @@ def page_import(inv_map_sku: dict):
 
     origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
     num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
+    model_pick = st.radio("Elegir modelo", ["Por ventas (actual)", "Por SKU (Familia)"], horizontal=True)
 
     if origen == "Excel Mercado Libre":
         file = st.file_uploader("Ventas ML (xlsx)", type=["xlsx"], key="ml_excel")
@@ -1920,7 +2103,8 @@ def page_import(inv_map_sku: dict):
     st.dataframe(sales_df.head(30))
 
     if st.button("Cargar y generar OTs"):
-        save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers))
+        model = "VENTAS" if model_pick.startswith("Por ventas") else "SKU"
+        save_orders_and_build_ots(sales_df, inv_map_sku, int(num_pickers), model=model, familia_map_sku=familia_map_sku)
         st.success("OTs creadas. Anda a Picking y selecciona P1, P2, ...")
 
 
@@ -6522,7 +6706,7 @@ def main():
     init_db()
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
-    inv_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
+    inv_map_sku, familia_map_sku, barcode_to_sku, conflicts = master_bootstrap(MASTER_FILE)
 
     # Auto-carga links de publicaciones (fotos por SKU) desde repo
     _ = publications_bootstrap(PUBLICATIONS_FILE)
@@ -6568,7 +6752,7 @@ def main():
         if page.startswith("1"):
             page_picking()
         elif page.startswith("2"):
-            page_import(inv_map_sku)
+            page_import(inv_map_sku, familia_map_sku)
         elif page.startswith("3"):
             page_cortes_pdf_batch()
         else:
