@@ -720,11 +720,13 @@ def init_db():
     """)
 
     # Maestro EAN/SKU (común)
+    # Maestro EAN/SKU (común)
     c.execute("""
     CREATE TABLE IF NOT EXISTS sku_barcodes (
         barcode TEXT PRIMARY KEY,
         sku_ml TEXT
     );
+    """)
 
     # --- Reparación robusta de schema para sku_barcodes (BD antiguas en Streamlit Cloud) ---
     # Esta tabla se puede reconstruir desde el maestro, así que es seguro "normalizarla".
@@ -732,7 +734,7 @@ def init_db():
         cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes);").fetchall()]
         cols_set = set(cols or [])
         if "barcode" not in cols_set:
-            # Algunos DB viejos tenían 'ean' u otro nombre
+            # Algunos DB viejos tenían 'ean' u otro nombre: recrear
             c.execute("ALTER TABLE sku_barcodes RENAME TO sku_barcodes_old;")
             c.execute("CREATE TABLE IF NOT EXISTS sku_barcodes (barcode TEXT PRIMARY KEY, sku_ml TEXT);")
         else:
@@ -743,28 +745,25 @@ def init_db():
                     c.execute("UPDATE sku_barcodes SET sku_ml=sku WHERE (sku_ml IS NULL OR sku_ml='');")
                 except Exception:
                     pass
-            if "sku_ml" not in set([r[1] for r in c.execute("PRAGMA table_info(sku_barcodes);").fetchall()]):
+            cols_now = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes);").fetchall()]
+            if "sku_ml" not in set(cols_now):
                 # no se pudo agregar -> recrear limpia
                 c.execute("ALTER TABLE sku_barcodes RENAME TO sku_barcodes_old;")
                 c.execute("CREATE TABLE IF NOT EXISTS sku_barcodes (barcode TEXT PRIMARY KEY, sku_ml TEXT);")
-            # Si quedó una tabla old, intentar copiar lo que se pueda
-            if _db_table_exists(conn, "sku_barcodes_old"):
-                old_cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes_old);").fetchall()]
-                if "barcode" in old_cols:
-                    src_sku = "sku_ml" if "sku_ml" in old_cols else ("sku" if "sku" in old_cols else None)
-                    if src_sku:
-                        try:
-                            c.execute(f"INSERT OR IGNORE INTO sku_barcodes(barcode, sku_ml) SELECT barcode, {src_sku} FROM sku_barcodes_old;")
-                        except Exception:
-                            pass
-                try:
-                    c.execute("DROP TABLE IF EXISTS sku_barcodes_old;")
-                except Exception:
-                    pass
+        # Si quedó una tabla old, intentar copiar lo que se pueda
+        if _db_table_exists(conn, "sku_barcodes_old"):
+            old_cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes_old);").fetchall()]
+            if "barcode" in old_cols:
+                src_sku = "sku_ml" if "sku_ml" in old_cols else ("sku" if "sku" in old_cols else None)
+                if src_sku:
+                    try:
+                        c.execute(f"INSERT OR IGNORE INTO sku_barcodes(barcode, sku_ml) SELECT barcode, {src_sku} FROM sku_barcodes_old;")
+                    except Exception:
+                        pass
+            # no borramos old automáticamente; si quieres limpiar, se puede en un mantenimiento futuro
     except Exception:
+        # Si algo falla aquí, no botamos la app; solo dejamos la tabla como esté.
         pass
-
-    """)
 
 
     # Links / publicaciones (para ver fotos)
