@@ -4060,25 +4060,34 @@ def _s2_parse_label_raw_info(raw: str):
     if "destinatario" not in info:
         m_dom = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
         if m_dom:
-            # tomar la línea no vacía inmediatamente anterior
             before = s[:m_dom.start()].splitlines()
+
+            def _fd_content(line: str) -> str:
+                mm = re.search(r"\^FD(.*?)(?:\^FS|$)", line)
+                return (mm.group(1) if mm else line).strip()
+
             prev = ""
-            for ln in reversed(before[-8:]):  # mirar hacia atrás pocas líneas
+            for ln in reversed(before[-12:]):  # mirar hacia atrás pocas líneas
                 ln = (ln or "").strip()
                 if not ln:
                     continue
-                low = ln.lower()
-                if any(k in low for k in ["pack id", "venta", "envio", "shipment", "codigo", "código", "rut", "telefono", "teléfono", "receiver zone"]):
+                cand = _fd_content(ln)
+                cand = re.sub(r"\s*\([^\)]{2,120}\)\s*$", "", cand).strip()  # recortar (USER)
+                low = cand.lower()
+                if any(k in low for k in ["pack id", "venta", "envio", "envío", "shipment", "codigo", "código", "rut", "telefono", "teléfono", "receiver zone", "domicilio", "direccion"]):
                     continue
-                prev = ln
+                # requiere letras y largo razonable
+                if len(cand) < 3 or len(cand) > 140:
+                    continue
+                if not re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", cand):
+                    continue
+                prev = cand
                 break
-            if prev:
-                # si viene "NOMBRE (USER)" -> recortar paréntesis
-                prev = re.sub(r"\s*\([^\)]{2,120}\)\s*$", "", prev).strip()
-                if len(prev) >= 3:
-                    info["destinatario"] = prev
 
-    # Dirección / Domicilio (Flex: Direccion, Colecta: Domicilio)
+            if prev:
+                info["destinatario"] = prev
+
+# Dirección / Domicilio (Flex: Direccion, Colecta: Domicilio)
     m = re.search(r"(Domicilio|Direccion)\s*:\s*([^\n\^]{3,200})", s, flags=re.IGNORECASE)
     if m:
         info["domicilio"] = m.group(2).strip()
@@ -6125,6 +6134,28 @@ def _s2_list_sales_to_dispatch(mid:int, mesa=None):
     conn.close()
     return rows
 
+def _s2_list_sales_dispatched(mid:int, mesa=None):
+    """Lista ventas ya despachadas (historial) para un manifiesto/mesa."""
+    _s2_pack_dispatch_create_tables()
+    conn=get_conn(); c=conn.cursor()
+    if mesa is None:
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino, s.comuna, s.ciudad_destino,
+                                       d.dispatched_at
+                                FROM s2_sales s
+                                JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                                WHERE s.manifest_id=?
+                                ORDER BY d.dispatched_at DESC, s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
+    else:
+        rows = c.execute("""SELECT s.sale_id, s.shipment_id, s.pack_id, s.page_no, s.mesa, s.customer, s.destino, s.comuna, s.ciudad_destino,
+                                       d.dispatched_at
+                                FROM s2_sales s
+                                JOIN s2_dispatch d ON d.manifest_id=s.manifest_id AND d.sale_id=s.sale_id
+                                WHERE s.manifest_id=? AND s.mesa=?
+                                ORDER BY d.dispatched_at DESC, s.page_no, s.row_no, s.sale_id;""", (mid, int(mesa))).fetchall()
+    conn.close()
+    return rows
+
+
 
 def page_packing(inv_map_sku: dict):
     _s2_pack_dispatch_create_tables()
@@ -6448,27 +6479,49 @@ def page_dispatch():
 
     st.divider()
     st.subheader("Pendientes de despacho")
-    if not rows:
-        return
+    if rows:
+        data = []
+        for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino, comuna, ciudad_destino, packed_at, packer in rows:
+            n_items, units = stats.get(str(sale_id), (0,0))
+            data.append({
+                "Mesa": mesa_db,
+                "Página": page_no,
+                "Venta": sale_id,
+                "Envío": shipment_id or "",
+                "Pack": pack_id or "",
+                "Destino": destino or "",
+                "Comuna/Ciudad": (", ".join([x for x in [(comuna or "").strip(), (ciudad_destino or "").strip()] if x])),
+                "Cliente": customer or "",
+                "Productos": n_items,
+                "Unidades": units,
+                "Embalado": packed_at or "",
+                "Embalador": packer or "",
+            })
+        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay pendientes de despacho para este filtro.")
 
-    data = []
-    for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino, comuna, ciudad_destino, packed_at, packer in rows:
-        n_items, units = stats.get(str(sale_id), (0,0))
-        data.append({
-            "Mesa": mesa_db,
-            "Página": page_no,
-            "Venta": sale_id,
-            "Envío": shipment_id or "",
-            "Pack": pack_id or "",
-            "Destino": destino or "",
-            "Comuna/Ciudad": (", ".join([x for x in [(comuna or "").strip(), (ciudad_destino or "").strip()] if x])) ,
-            "Cliente": customer or "",
-            "Productos": n_items,
-            "Unidades": units,
-            "Embalado": packed_at or "",
-            "Embalador": packer or "",
-        })
-    st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+    st.divider()
+    st.subheader("Despachadas")
+    done_rows = _s2_list_sales_dispatched(mid, mesa=mesa)
+    if not done_rows:
+        st.info("Aún no hay ventas despachadas.")
+    else:
+        out = []
+        for sale_id, shipment_id, pack_id, page_no, mesa_db, customer, destino, comuna, ciudad_destino, dispatched_at in done_rows:
+            out.append({
+                "Mesa": mesa_db,
+                "Página": page_no,
+                "Venta": sale_id,
+                "Envío": shipment_id or "",
+                "Pack": pack_id or "",
+                "Destino": destino or "",
+                "Comuna/Ciudad": (", ".join([x for x in [(comuna or "").strip(), (ciudad_destino or "").strip()] if x])),
+                "Cliente": customer or "",
+                "Despachado": dispatched_at or "",
+            })
+        st.dataframe(pd.DataFrame(out), use_container_width=True, hide_index=True)
+
 
 
 def main():
