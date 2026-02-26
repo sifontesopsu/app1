@@ -2084,7 +2084,7 @@ def page_import(inv_map_sku: dict, familia_map_sku: dict):
 
     origen = st.radio("Origen", ["Excel Mercado Libre", "Manifiesto PDF (etiquetas)"], horizontal=True)
     num_pickers = st.number_input("Cantidad de pickeadores", min_value=1, max_value=20, value=5, step=1)
-    model_pick = st.radio("Elegir modelo", ["Por ventas (actual)", "Por SKU (Familia)"], horizontal=True)
+    model_pick = st.radio("Elegir modelo", ["Por ventas", "Por sku"], horizontal=True)
 
     if origen == "Excel Mercado Libre":
         file = st.file_uploader("Ventas ML (xlsx)", type=["xlsx"], key="ml_excel")
