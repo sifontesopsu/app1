@@ -6403,19 +6403,6 @@ def page_dispatch():
 
     st.info(f"Control: **{total_control}** ventas · Despachadas: **{total_despachadas}** · Pendientes: **{max(0, total_control-total_despachadas)}**")
 
-    # Lista de despachadas (historial)
-    conn = get_conn(); c = conn.cursor()
-    disp_rows = c.execute("""SELECT s.sale_id, s.page_no, s.row_no, s.mesa, s.shipment_id, s.customer, s.destino, d.dispatched_at
-                            FROM s2_dispatch d
-                            JOIN s2_sales s ON s.manifest_id=d.manifest_id AND s.sale_id=d.sale_id
-                            WHERE d.manifest_id=? 
-                            ORDER BY s.page_no, s.row_no, s.sale_id;""", (mid,)).fetchall()
-    conn.close()
-    if disp_rows:
-        st.subheader("Despachadas")
-        df_disp = pd.DataFrame(disp_rows, columns=["Venta", "Página", "Fila", "Mesa", "Shipment", "Cliente", "Destino", "Hora"])
-        st.dataframe(df_disp, use_container_width=True, hide_index=True)
-
 
     if not rows:
         if total_control and total_despachadas >= total_control:
