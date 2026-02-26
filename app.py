@@ -1783,8 +1783,8 @@ def save_orders_and_build_ots(
     Genera la tanda de picking.
 
     model:
-      - "VENTAS": reparte ventas por OT y crea tareas por SKU dentro de esas ventas.
-      - "SKU": agrupa SKUs por Familia (desde maestro) y asigna familias a OTs (batch picking).
+      - "VENTAS" (actual): reparte ventas por OT y crea tareas por SKU dentro de esas ventas.
+      - "SKU" (nuevo): agrupa SKUs por Familia (desde maestro) y asigna familias a OTs (batch picking).
         Nota: para evitar conflictos con pantallas antiguas, igual se mantiene la asignación de ventas->OT
         en ot_orders/sorting_status, pero las tareas de picking se construyen por familia/SKU.
     """
