@@ -1923,11 +1923,34 @@ def save_orders_and_build_ots(
                     break
             title_ml_by_sku[sku] = t
 
+        # Prefijos (SKU base -> Familia) para inferir packs sin Familia (prefijo más largo)
+        _fam_bases = []
+        try:
+            _fam_bases = [
+                (normalize_sku(k), str(v).strip())
+                for k, v in (familia_map_sku or {}).items()
+                if str(v or "").strip() and str(v).strip().lower() != "nan"
+            ]
+            # Evitar prefijos demasiado cortos que podrían mezclar familias
+            _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
+            _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
+        except Exception:
+            _fam_bases = []
     def _fam_for_sku(sku: str) -> str:
-        f = str(familia_map_sku.get(sku, "") or "").strip()
-        if not f or f.lower() == "nan":
+            # 1) Familia directa en maestro
+            f = str(familia_map_sku.get(sku, "") or "").strip()
+            if f and f.lower() != "nan":
+                return f
+
+            # 2) Fallback: inferir por "prefijo más largo" (packs)
+            # Busca un SKU base del maestro (con familia) que sea prefijo del SKU actual.
+            ssku = normalize_sku(sku)
+            if not ssku:
+                return "Sin Familia"
+            for base_sku, base_fam in _fam_bases:
+                if ssku != base_sku and ssku.startswith(base_sku):
+                    return base_fam
             return "Sin Familia"
-        return f
 
     dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
 
