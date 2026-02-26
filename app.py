@@ -1934,6 +1934,52 @@ def save_orders_and_build_ots(
             # Evitar prefijos demasiado cortos que podrían mezclar familias
             _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
             _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
+
+            # Índice por prefijos para inferir familia endef _fam_for_sku(sku: str) -> str:
+    """Familia efectiva:
+    1) Familia directa del maestro
+    2) Inferencia por prefijo dominante (packs / variantes)
+    3) Fallback por SKU base más largo (si aplica)
+    """
+    # 1) directa
+    ssku = normalize_sku(sku)
+    f = str(familia_map_sku.get(ssku, "") or "").strip()
+    if f and f.lower() != "nan":
+        return f
+
+    if not ssku:
+        return "Sin Familia"
+
+    # 2) prefijo dominante: construimos índice una vez por carga
+    # _fam_pref_index: prefix -> (best_fam, share, n)
+    try:
+        pref_index = locals().get("_fam_pref_index", None)
+    except Exception:
+        pref_index = None
+
+    # Si existe índice, probamos desde prefijos largos a cortos
+    if pref_index:
+        maxL = min(len(ssku), 10)
+        for L in range(maxL, 3, -1):
+            p = ssku[:L]
+            if p in pref_index:
+                fam, share, n = pref_index[p]
+                # umbrales de seguridad: suficiente evidencia y dominancia
+                if n >= 2 and share >= 0.70:
+                    return fam
+
+    # 3) fallback: SKU base más largo que sea prefijo completo
+    for base_sku, base_fam in _fam_bases:
+        if ssku != base_sku and ssku.startswith(base_sku):
+            return base_fam
+
+    return "Sin Familia"
+
+dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)      continue
+                _best_fam = max(_cnts.items(), key=lambda kv: kv[1])[0]
+                _best_n = _cnts[_best_fam]
+                _share = _best_n / _total
+                _fam_pref_index[_p] = (_best_fam, _share, _total)
         except Exception:
             _fam_bases = []
     def _fam_for_sku(sku: str) -> str:
@@ -1959,16 +2005,24 @@ def save_orders_and_build_ots(
     grp["qty"] = grp["qty"].astype(int)
 
     # 2) asignar familias a OTs (greedy balance por unidades)
-    fam_weights = grp.groupby("family")["qty"].sum().to_dict()
-    fam_list = sorted(fam_weights.items(), key=lambda x: x[1], reverse=True)
+    # 2) asignar grupos a OTs (greedy balance por unidades)
+    #    - Familias normales se asignan completas
+    #    - "Sin Familia" se divide en subgrupos por prefijo para no cargar todo a un solo picker
+    grp = grp.copy()
+    grp["assign_group"] = grp.apply(
+        lambda r: ("SF:" + str(r["sku_ml"])[:4]) if str(r["family"]) == "Sin Familia" else str(r["family"]),
+        axis=1
+    )
+    group_weights = grp.groupby("assign_group")["qty"].sum().to_dict()
+    group_list = sorted(group_weights.items(), key=lambda x: x[1], reverse=True)
 
     ot_load = {ot_id: 0 for ot_id in ot_ids}
     ot_fams = {ot_id: [] for ot_id in ot_ids}
 
-    for fam, w in fam_list:
+    for grp_key, w in group_list:
         # ot menos cargada
         target_ot = min(ot_load.items(), key=lambda kv: kv[1])[0]
-        ot_fams[target_ot].append(fam)
+        ot_fams[target_ot].append(grp_key)
         ot_load[target_ot] += int(w or 0)
 
     # 3) Insertar tareas por OT
@@ -1976,7 +2030,7 @@ def save_orders_and_build_ots(
         fams = ot_fams.get(ot_id, [])
         if not fams:
             continue
-        sub = grp[grp["family"].isin(fams)].copy()
+        sub = grp[grp["assign_group"].isin(fams)].copy()
         # orden: familia, sku
         try:
             sub["sku_int"] = sub["sku_ml"].map(lambda x: int(x) if str(x).isdigit() else 10**18)
