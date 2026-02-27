@@ -1251,53 +1251,48 @@ def get_publication_row(sku: str) -> dict:
         return {}
     return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
 
+OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+    re.IGNORECASE
+)
+
 @st.cache_data(show_spinner=False, ttl=24*3600)
-def ml_item_pictures_cached(ml_item_id: str) -> list[str]:
-    """Obtiene URLs de fotos desde API pública de Mercado Libre."""
-    item = (ml_item_id or "").strip().upper().replace("-", "")
-    if not item:
-        return []
+def publication_main_image_from_html(link: str) -> str:
+    """Devuelve 1 URL de imagen principal leyendo og:image desde el HTML de la publicación.
+
+    Sin API: solo usa el link público de Mercado Libre.
+    """
+    url = (link or "").strip()
+    if not url:
+        return ""
     try:
-        url = f"https://api.mercadolibre.com/items/{item}"
-        r = requests.get(url, timeout=6)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+        }
+        r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
         if r.status_code != 200:
-            return []
-        data = r.json()
-        pics = data.get("pictures") or []
-        out = []
-        for p in pics:
-            u = p.get("secure_url") or p.get("url") or ""
-            if u:
-                out.append(u)
-        # fallback: thumbnail
-        if not out:
-            thumb = data.get("thumbnail") or ""
-            if thumb:
-                out = [thumb]
-        # dedupe
-        seen=set(); uniq=[]
-        for u in out:
-            if u not in seen:
-                seen.add(u); uniq.append(u)
-        return uniq
+            return ""
+        html_text = r.text or ""
+        m = OG_IMAGE_RE.search(html_text)
+        return m.group(1).strip() if m else ""
     except Exception:
-        return []
+        return ""
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
-    """Retorna (urls, link_publicacion)."""
+    """Retorna (urls, link_publicacion).
+
+    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
+    """
     row = get_publication_row(sku)
     if not row:
         return [], ""
-    item_id = row.get("ml_item_id") or ""
-    link = row.get("link") or ""
-    urls = ml_item_pictures_cached(item_id) if item_id else []
-    return urls, link
-
-
-
-
-
-# =========================
+    link = (row.get("link") or "").strip()
+    if not link:
+        return [], ""
+    img = publication_main_image_from_html(link)
+    urls = [img] if img else []
+    return urls, link# =========================
 # CORTES (lista de SKUs)
 # =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
@@ -2092,11 +2087,6 @@ def page_picking():
         if len(pics) > 1:
             with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
                 st.image(pics, use_container_width=True)
-    if pub_link:
-        try:
-            st.link_button("Abrir publicación", pub_link, use_container_width=True)
-        except Exception:
-            st.write(f"Publicación: {pub_link}")
 
     st.markdown(f"### Solicitado: {qty_total}")
 
@@ -4713,6 +4703,24 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
         row1[0].markdown(f"### {title}  \nSKU: `{sku}`")
         row1[1].markdown(f"## {int(qty)}")
         row1[2].metric("Hecho", int(picked))
+
+        # Imagen (solo bajo demanda para no ocupar espacio)
+        _img_state_key = f"s2_showimg_{sale_id}_{sku}"
+        if _img_state_key not in st.session_state:
+            st.session_state[_img_state_key] = False
+
+        if st.button("🖼️ Ver imagen", key=f"s2_btnimg_{sale_id}_{sku}"):
+            st.session_state[_img_state_key] = not bool(st.session_state.get(_img_state_key, False))
+
+        if st.session_state.get(_img_state_key, False):
+            try:
+                pics, _pub_link = get_picture_urls_for_sku(str(sku))
+            except Exception:
+                pics, _pub_link = [], ""
+            if pics:
+                st.image(pics[0], use_container_width=True)
+            else:
+                st.caption("Sin imagen disponible")
 
         if status != "DONE" and remaining > 0:
             bcols = st.columns([1,1,6])
