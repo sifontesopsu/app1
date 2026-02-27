@@ -1220,27 +1220,27 @@ def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
     noid = 0
     with db_conn(commit=True) as conn:
         c = conn.cursor()
-    for _, r in df_pub.iterrows():
-        sku = normalize_sku(r.get("sku_ml", ""))
-        if not sku:
-            continue
-        item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
-        title = str(r.get("title", "") or "").strip()
-        link = str(r.get("link", "") or "").strip()
-        if not item_id:
-            noid += 1
-        c.execute(
-            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
-               VALUES (?,?,?,?,?)
-               ON CONFLICT(sku_ml) DO UPDATE SET
-                 ml_item_id=excluded.ml_item_id,
-                 title=excluded.title,
-                 link=excluded.link,
-                 updated_at=excluded.updated_at
-            """,
-            (sku, item_id, title, link, now_iso())
-        )
-        ok += 1
+        for _, r in df_pub.iterrows():
+            sku = normalize_sku(r.get("sku_ml", ""))
+            if not sku:
+                continue
+            item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
+            title = str(r.get("title", "") or "").strip()
+            link = str(r.get("link", "") or "").strip()
+            if not item_id:
+                noid += 1
+            c.execute(
+                """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(sku_ml) DO UPDATE SET
+                     ml_item_id=excluded.ml_item_id,
+                     title=excluded.title,
+                     link=excluded.link,
+                     updated_at=excluded.updated_at
+                """,
+                (sku, item_id, title, link, now_iso())
+            )
+            ok += 1
     return ok, noid
 
 def get_publication_row(sku: str) -> dict:
@@ -1280,78 +1280,19 @@ def publication_main_image_from_html(link: str) -> str:
     except Exception:
         return ""
 
-
-@st.cache_data(show_spinner=False, ttl=24*3600)
-def publication_images_from_item_api(ml_item_id: str) -> list[str]:
-    """Trae URLs de imágenes usando el endpoint público de ML (sin token).
-    Mucho más estable que scrapear HTML (og:image), que a veces devuelve 403/anti-bot.
-    """
-    item_id = (ml_item_id or "").strip().upper().replace(" ", "").replace("-", "")
-    if not item_id:
-        return []
-    # Aceptar formatos tipo MLC123..., o links que traigan /MLC123...
-    item_id = extract_ml_item_id(item_id) or item_id
-    if not item_id:
-        return []
-    try:
-        url = f"https://api.mercadolibre.com/items/{item_id}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-        }
-        r = requests.get(url, headers=headers, timeout=8)
-        if r.status_code != 200:
-            return []
-        data = r.json() if r.content else {}
-        pics = data.get("pictures") or []
-        out: list[str] = []
-        for p in pics:
-            if not isinstance(p, dict):
-                continue
-            u = (p.get("secure_url") or p.get("url") or "").strip()
-            if u:
-                out.append(u)
-        # fallback (a veces viene thumbnail)
-        if not out:
-            thumb = (data.get("secure_thumbnail") or data.get("thumbnail") or "").strip()
-            if thumb:
-                out.append(thumb)
-        # quitar duplicados manteniendo orden
-        seen = set()
-        uniq = []
-        for u in out:
-            if u in seen:
-                continue
-            seen.add(u)
-            uniq.append(u)
-        return uniq
-    except Exception:
-        return []
-
-
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
     """Retorna (urls, link_publicacion).
 
-    Orden de preferencia:
-    1) API pública /items/{id} si existe ml_item_id (más estable).
-    2) Fallback: og:image desde HTML del link (si API no responde o no hay id).
+    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
     """
     row = get_publication_row(sku)
     if not row:
         return [], ""
-
     link = (row.get("link") or "").strip()
-    item_id = (row.get("ml_item_id") or "").strip()
-
-    urls: list[str] = []
-    if item_id:
-        urls = publication_images_from_item_api(item_id)
-
-    if (not urls) and link:
-        img = publication_main_image_from_html(link)
-        if img:
-            urls = [img]
-
+    if not link:
+        return [], ""
+    img = publication_main_image_from_html(link)
+    urls = [img] if img else []
     return urls, link# =========================
 # CORTES (lista de SKUs)
 # =========================
