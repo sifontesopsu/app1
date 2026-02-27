@@ -1429,10 +1429,143 @@ _ATTR_RE = re.compile(r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(\".*?\"|\'.*?\'|[^\s
 _MLSTATIC_IMG_RE = re.compile(r"https?://[^\"\']*mlstatic\.com[^\"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^\"\']*)?", re.IGNORECASE)
 
 def _extract_main_image_from_html(html_text: str) -> tuple[str, str]:
-    """Retorna (url, metodo). metodo vacío si no encontró."""
+    """Retorna (url, metodo). metodo vacío si no encontró.
+
+    Heurística:
+    - MercadoLibre a veces devuelve og:image con el logo (o cambia plantilla).
+    - Recolectamos candidatos (meta, JSON-LD, JSON embebido, fallback) y elegimos el mejor.
+    """
     html_text = html_text or ""
     if not html_text:
         return "", ""
+
+    candidates: list[tuple[str, str]] = []  # (url, source)
+
+    def _norm(u: str) -> str:
+        u = (u or "").strip()
+        if not u:
+            return ""
+        # HTML entities / escapes comunes
+        u = html.unescape(u)
+        u = u.replace("\\/", "/")
+        if u.startswith("//"):
+            u = "https:" + u
+        return u.strip()
+
+    def _add(u: str, src: str):
+        u = _norm(u)
+        if not u:
+            return
+        candidates.append((u, src))
+
+    # 1) Meta tags (og/twitter) — recolectar todas
+    wanted = {"og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"}
+    for tag in _META_TAG_RE.findall(html_text):
+        attrs = {}
+        for k, v in _ATTR_RE.findall(tag):
+            key = (k or "").strip().lower()
+            val = (v or "").strip()
+            if len(val) >= 2 and ((val[0] == val[-1]) and val[0] in ("\"", "'")):
+                val = val[1:-1]
+            attrs[key] = val
+        prop = (attrs.get("property") or attrs.get("name") or "").strip().lower()
+        if prop in wanted:
+            _add(attrs.get("content") or "", f"meta:{prop}")
+
+    # 2) JSON-LD (application/ld+json) con clave 'image'
+    for m in re.finditer(
+        r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>",
+        html_text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        raw = (m.group(1) or "").strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        def _pick_images(obj):
+            out = []
+            if isinstance(obj, dict):
+                img = obj.get("image")
+                if isinstance(img, str):
+                    out.append(img)
+                elif isinstance(img, list):
+                    out.extend([it for it in img if isinstance(it, str)])
+                g = obj.get("@graph")
+                if isinstance(g, list):
+                    for node in g:
+                        out.extend(_pick_images(node))
+            elif isinstance(obj, list):
+                for it in obj:
+                    out.extend(_pick_images(it))
+            return out
+
+        for u in _pick_images(data):
+            _add(u, "jsonld:image")
+
+    # 3) JSON embebido (muy común en ML): buscar urls mlstatic dentro de scripts
+    #    Capturamos tanto en JSON como texto plano.
+    for m in re.finditer(r"https?://(?:http2\.)?mlstatic\.com/[^\s\"'>]+", html_text, re.IGNORECASE):
+        _add(m.group(0), "scan:mlstatic")
+
+    # Algunos HTML vienen con comillas escapadas o campos tipo "url":"https:\/\/http2.mlstatic.com\/..."
+    for m in re.finditer(r"\"url\"\s*:\s*\"(https?:\\\\/\\\\/(?:http2\\\\.)?mlstatic\\\\.com\\\\/[^\\\"]+)\"", html_text, re.IGNORECASE):
+        _add(m.group(1), "json:url")
+
+    for m in re.finditer(r"\"thumbnail\"\s*:\s*\"(https?:\\\\/\\\\/(?:http2\\\\.)?mlstatic\\\\.com\\\\/[^\\\"]+)\"", html_text, re.IGNORECASE):
+        _add(m.group(1), "json:thumbnail")
+
+    # 4) Si no hay nada, intentar el regex viejo como último recurso
+    m = _MLSTATIC_IMG_RE.search(html_text)
+    if m:
+        _add(m.group(0), "fallback:mlstatic_re")
+
+    # Elegir mejor candidato (evitar logo ML y assets de marca)
+    def _score(u: str) -> int:
+        lu = u.lower()
+        s = 0
+        # Preferir imágenes de producto típicas de ML
+        if "d_nq_np_" in lu:
+            s += 80
+        if "/d_nq_np_" in lu:
+            s += 40
+        if "mlstatic.com" in lu:
+            s += 20
+        if lu.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            s += 10
+        # Penalizar logos / íconos
+        if "logo" in lu:
+            s -= 120
+        if "mercadolibre" in lu and ("logo" in lu or "brand" in lu or "iso" in lu):
+            s -= 120
+        if lu.endswith(".svg"):
+            s -= 80
+        # Penalizar assets UI comunes
+        if any(x in lu for x in ["favicon", "apple-touch-icon", "icons/", "/icons", "sprite", "ui/"]):
+            s -= 60
+        return s
+
+    # Deduplicar preservando mejor score
+    best = ("", "")
+    best_score = -10**9
+    seen = set()
+    for u, src in candidates:
+        if u in seen:
+            continue
+        seen.add(u)
+        sc = _score(u)
+        if sc > best_score:
+            best_score = sc
+            best = (u, src)
+
+    if best[0] and best_score > -50:
+        return best[0], best[1]
+
+    return "", ""
+
 
     # 1) Meta tags (og:image / secure_url / twitter:image)
     wanted = {
