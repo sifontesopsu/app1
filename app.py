@@ -1923,69 +1923,68 @@ def save_orders_and_build_ots(
                     break
             title_ml_by_sku[sku] = t
 
-                # Prefijos (SKU base -> Familia) para inferir packs/variantes sin Familia
-        _fam_bases = [
-            (normalize_sku(k), str(v).strip())
-            for k, v in (familia_map_sku or {}).items()
-            if str(v or "").strip() and str(v).strip().lower() != "nan"
-        ]
-        # Evitar prefijos demasiado cortos que podrían mezclar familias
-        _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
-        _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
+    # Prefijos (SKU base -> Familia) para inferir packs/variantes sin Familia
+    _fam_bases = [
+        (normalize_sku(k), str(v).strip())
+        for k, v in (familia_map_sku or {}).items()
+        if str(v or "").strip() and str(v).strip().lower() != "nan"
+    ]
+    # Evitar prefijos demasiado cortos que podrían mezclar familias
+    _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
+    _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
 
-        # Índice por prefijo dominante: prefix -> (best_fam, share, n)
-        _pref_counts = {}
-        for _sku_base, _fam_base in _fam_bases:
-            _maxL = min(len(_sku_base), 10)
-            for _L in range(4, _maxL + 1):
-                _p = _sku_base[:_L]
-                if _p not in _pref_counts:
-                    _pref_counts[_p] = {}
-                _pref_counts[_p][_fam_base] = _pref_counts[_p].get(_fam_base, 0) + 1
+    # Índice por prefijo dominante: prefix -> (best_fam, share, n)
+    _pref_counts = {}
+    for _sku_base, _fam_base in _fam_bases:
+        _maxL = min(len(_sku_base), 10)
+        for _L in range(4, _maxL + 1):
+            _p = _sku_base[:_L]
+            if _p not in _pref_counts:
+                _pref_counts[_p] = {}
+            _pref_counts[_p][_fam_base] = _pref_counts[_p].get(_fam_base, 0) + 1
 
-        _fam_pref_index = {}
-        for _p, _cnts in _pref_counts.items():
-            _total = sum(_cnts.values())
-            if _total <= 0:
-                continue
-            _best_fam = max(_cnts.items(), key=lambda kv: kv[1])[0]
-            _best_n = _cnts[_best_fam]
-            _share = _best_n / _total
-            _fam_pref_index[_p] = (_best_fam, _share, _total)
+    _fam_pref_index = {}
+    for _p, _cnts in _pref_counts.items():
+        _total = sum(_cnts.values())
+        if _total <= 0:
+            continue
+        _best_fam = max(_cnts.items(), key=lambda kv: kv[1])[0]
+        _best_n = _cnts[_best_fam]
+        _share = _best_n / _total
+        _fam_pref_index[_p] = (_best_fam, _share, _total)
 
-        def _fam_for_sku(sku: str) -> str:
-            """Familia efectiva:
-            1) Familia directa del maestro
-            2) Inferencia por prefijo dominante (packs/variantes)
-            3) Fallback: SKU base con familia más largo que sea prefijo
-            """
-            ssku = normalize_sku(sku)
+    def _fam_for_sku(sku: str) -> str:
+        """Familia efectiva:
+        1) Familia directa del maestro
+        2) Inferencia por prefijo dominante (packs/variantes)
+        3) Fallback: SKU base con familia más largo que sea prefijo
+        """
+        ssku = normalize_sku(sku)
 
-            # 1) directa
-            f = str(familia_map_sku.get(ssku, "") or "").strip()
-            if f and f.lower() != "nan":
-                return f
-            if not ssku:
-                return "Sin Familia"
-
-            # 2) prefijo dominante (probamos de largo a corto)
-            _maxL = min(len(ssku), 10)
-            for _L in range(_maxL, 3, -1):
-                _p = ssku[:_L]
-                if _p in _fam_pref_index:
-                    fam, share, n = _fam_pref_index[_p]
-                    if n >= 2 and share >= 0.70:
-                        return fam
-
-            # 3) fallback: SKU base más largo prefijo completo
-            for base_sku, base_fam in _fam_bases:
-                if ssku != base_sku and ssku.startswith(base_sku):
-                    return base_fam
-
+        # 1) directa
+        f = str(familia_map_sku.get(ssku, "") or "").strip()
+        if f and f.lower() != "nan":
+            return f
+        if not ssku:
             return "Sin Familia"
 
-        dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
+        # 2) prefijo dominante (probamos de largo a corto)
+        _maxL = min(len(ssku), 10)
+        for _L in range(_maxL, 3, -1):
+            _p = ssku[:_L]
+            if _p in _fam_pref_index:
+                fam, share, n = _fam_pref_index[_p]
+                if n >= 2 and share >= 0.70:
+                    return fam
 
+        # 3) fallback: SKU base más largo prefijo completo
+        for base_sku, base_fam in _fam_bases:
+            if ssku != base_sku and ssku.startswith(base_sku):
+                return base_fam
+
+        return "Sin Familia"
+
+    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
 
     grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
     grp["qty"] = grp["qty"].astype(int)
@@ -1996,7 +1995,7 @@ def save_orders_and_build_ots(
     #    - "Sin Familia" se divide en subgrupos por prefijo para no cargar todo a un solo picker
     grp = grp.copy()
     grp["assign_group"] = grp.apply(
-        lambda r: ("SF:" + str(r["sku_ml"])[:4]) if str(r["family"]) == "Sin Familia" else str(r["family"]),
+        lambda r: ("SF:" + str(r["sku_ml"])[:6]) if str(r["family"]) == "Sin Familia" else str(r["family"]),
         axis=1
     )
     group_weights = grp.groupby("assign_group")["qty"].sum().to_dict()
