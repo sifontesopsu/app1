@@ -1525,39 +1525,44 @@ def _extract_main_image_from_html(html_text: str) -> tuple[str, str]:
 
     # Elegir mejor candidato (evitar logo ML y assets de marca)
     def _prefer_jpg(u: str) -> str:
-        """Si la URL es .webp, intenta devolver una variante .jpg.
+        """No cambia la URL.
 
-        Motivo: en Streamlit Community Cloud a veces PIL/Streamlit no renderiza WEBP desde URL
-        y se ve como imagen rota. ML suele servir la misma ruta en .jpg.
+        Nota: preferimos mostrar .webp tal cual usando HTML (<img>) del lado del navegador,
+        porque el navegador sí soporta WEBP aunque Streamlit/PIL a veces no lo haga en server.
         """
-        if not u:
-            return u
-        # Reemplazo simple de extensión
-        u2 = re.sub(r"\.webp(\?.*)?$", r".jpg\1", u, flags=re.IGNORECASE)
-        return u2 or u
+        return (u or "").strip()
 
     def _score(u: str) -> int:
-        lu = u.lower()
+        lu = (u or "").lower()
         s = 0
-        # Preferir imágenes de producto típicas de ML
+
+        # Reglas fuertes: imagen de producto en CDN de ML suele verse así:
+        # https://http2.mlstatic.com/D_NQ_NP_...-MLA...-F.webp  (o MLC)
+        is_mlstatic = "mlstatic.com/" in lu
+        is_productish = ("/d_" in lu) and ("_np_" in lu) and ("-ml" in lu) and is_mlstatic
+        if is_productish:
+            s += 200
+        # Preferir variantes de alta calidad
+        if "_2x_" in lu:
+            s += 60
         if "d_nq_np_" in lu:
-            s += 80
-        if "/d_nq_np_" in lu:
-            s += 40
-        if "mlstatic.com" in lu:
+            s += 60
+        if "d_q_np_" in lu:
+            s += 35
+        # Preferir archivos de imagen comunes (incluye WEBP)
+        if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", lu):
             s += 20
-        if lu.endswith((".jpg", ".jpeg", ".png", ".webp")):
-            s += 10
-        # Penalizar logos / íconos
-        if "logo" in lu:
+
+        # Penalizaciones: logos / íconos / sprites / UI
+        if any(x in lu for x in ["logo", "favicon", "sprite", "apple-touch-icon", "icons/", "/icons", ".svg"]):
+            s -= 300
+        if "mercadolibre" in lu and not is_productish:
+            s -= 200
+
+        # Si no parece imagen de producto, bajarle mucho para evitar que gane el logo
+        if not is_productish:
             s -= 120
-        if "mercadolibre" in lu and ("logo" in lu or "brand" in lu or "iso" in lu):
-            s -= 120
-        if lu.endswith(".svg"):
-            s -= 80
-        # Penalizar assets UI comunes
-        if any(x in lu for x in ["favicon", "apple-touch-icon", "icons/", "/icons", "sprite", "ui/"]):
-            s -= 60
+
         return s
 
     # Deduplicar preservando mejor score
@@ -1759,7 +1764,32 @@ def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
         return [], ""
     img = publication_main_image_from_html(link)
     urls = [img] if img else []
-    return urls, link# =========================
+    return urls, link
+
+
+def _st_show_image_url(url: str, *, width: int | None = None, use_container_width: bool = False):
+    """Muestra imágenes por HTML (<img>) para que el navegador renderice WEBP.
+
+    Importante: en Streamlit Community Cloud, st.image(url) puede fallar con WEBP porque
+    intenta decodificar del lado del servidor. Con <img>, el render es del lado del cliente.
+    """
+    u = (url or "").strip()
+    if not u:
+        return
+    style = []
+    if use_container_width:
+        style.append("max-width:100%")
+        style.append("height:auto")
+    if width is not None:
+        style.append(f"width:{int(width)}px")
+        style.append("height:auto")
+    style_attr = (";".join(style)) if style else "max-width:100%;height:auto"
+    st.markdown(
+        f"<img src='{html.escape(u, quote=True)}' style='{style_attr}' loading='lazy' referrerpolicy='no-referrer' />",
+        unsafe_allow_html=True
+    )
+
+# =========================
 # CORTES (lista de SKUs)
 # =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
@@ -2779,7 +2809,7 @@ def page_picking():
     except Exception:
         pics, pub_link = [], ""
     if pics:
-        st.image(pics[0], use_container_width=True)
+        _st_show_image_url(pics[0], use_container_width=True)
     else:
         st.caption("Sin imagen disponible")
         if _images_debug_enabled() and pub_link:
@@ -2788,7 +2818,10 @@ def page_picking():
                 st.caption(f"🧪 Debug imágenes — status: {err.get('status')} — {err.get('note')}")
         if len(pics) > 1:
             with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
-                st.image(pics, use_container_width=True)
+                
+                for _u in pics:
+                    _st_show_image_url(_u, use_container_width=True)
+
 
     st.markdown(f"### Solicitado: {qty_total}")
 
@@ -5780,7 +5813,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             except Exception:
                 pics, _pub_link = [], ""
             if pics:
-                st.image(pics[0], use_container_width=True)
+                _st_show_image_url(pics[0], use_container_width=True)
             else:
                 st.caption("Sin imagen disponible")
                 if _images_debug_enabled() and _pub_link:
@@ -6868,7 +6901,7 @@ def page_packing(inv_map_sku: dict):
                 c1, c2, c3 = st.columns([1.2, 6.6, 1.2], gap="small")
                 with c1:
                     if thumb:
-                        st.image(thumb, width=55)
+                        _st_show_image_url(thumb, width=55)
                     else:
                         st.caption(" ")
                 with c2:
