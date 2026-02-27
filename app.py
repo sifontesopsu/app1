@@ -1524,6 +1524,18 @@ def _extract_main_image_from_html(html_text: str) -> tuple[str, str]:
         _add(m.group(0), "fallback:mlstatic_re")
 
     # Elegir mejor candidato (evitar logo ML y assets de marca)
+    def _prefer_jpg(u: str) -> str:
+        """Si la URL es .webp, intenta devolver una variante .jpg.
+
+        Motivo: en Streamlit Community Cloud a veces PIL/Streamlit no renderiza WEBP desde URL
+        y se ve como imagen rota. ML suele servir la misma ruta en .jpg.
+        """
+        if not u:
+            return u
+        # Reemplazo simple de extensión
+        u2 = re.sub(r"\.webp(\?.*)?$", r".jpg\1", u, flags=re.IGNORECASE)
+        return u2 or u
+
     def _score(u: str) -> int:
         lu = u.lower()
         s = 0
@@ -1562,7 +1574,7 @@ def _extract_main_image_from_html(html_text: str) -> tuple[str, str]:
             best = (u, src)
 
     if best[0] and best_score > -50:
-        return best[0], best[1]
+        return _prefer_jpg(best[0]), best[1]
 
     return "", ""
 
