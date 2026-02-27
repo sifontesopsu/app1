@@ -953,20 +953,10 @@ def load_master_from_path(path: str) -> tuple[dict, dict, list]:
             break
 
     barcode_col = None
-    # Detectar columna de códigos de barras (tolerante a variaciones: "codigos de barras", "códigos de barras", "EAN", etc.)
-    for i, cname in enumerate(lower):
-        cn = str(cname or "").strip().lower()
-        if not cn:
-            continue
-        if ("barra" in cn) and (("codigo" in cn) or ("código" in cn) or ("codigos" in cn) or ("códigos" in cn) or ("ean" in cn) or ("barcode" in cn)):
-            barcode_col = cols[i]
+    for cand in ["codigo de barras", "código de barras", "barcode", "ean", "eans"]:
+        if cand in lower:
+            barcode_col = cols[lower.index(cand)]
             break
-    # Fallbacks directos por nombre exacto
-    if barcode_col is None:
-        for cand in ["codigo de barras", "código de barras", "codigos de barras", "códigos de barras", "barcode", "ean", "eans"]:
-            if cand in lower:
-                barcode_col = cols[lower.index(cand)]
-                break
 
     # Fallback por si el archivo no trae headers claros
     if sku_col is None or tech_col is None:
@@ -1101,45 +1091,11 @@ def upsert_barcodes_to_db(barcode_to_sku: dict):
     conn.close()
 
 
-def _db_lookup_sku_by_barcode(digits: str) -> str:
-    """Fallback: busca en SQLite (tabla sku_barcodes) por si el dict en memoria está vacío/desactualizado."""
-    d = only_digits(digits)
-    if not d:
-        return ""
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        row = c.execute("SELECT sku_ml FROM sku_barcodes WHERE barcode=?;", (d,)).fetchone()
-        conn.close()
-        return normalize_sku(row[0]) if row and row[0] else ""
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return ""
-
-
 def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
-    """Convierte un scan (EAN o SKU) a SKU.
-
-    - Si el scan es EAN (solo dígitos) intenta:
-        1) dict barcode_to_sku (en memoria, cargado del maestro)
-        2) fallback a SQLite sku_barcodes (por robustez en Streamlit Cloud)
-    - Si no matchea, devuelve el SKU normalizado del texto.
-    """
     raw = str(scan).strip()
     digits = only_digits(raw)
-
-    if digits:
-        # 1) Memoria
-        if isinstance(barcode_to_sku, dict) and digits in barcode_to_sku:
-            return normalize_sku(barcode_to_sku[digits])
-        # 2) BD
-        sku_db = _db_lookup_sku_by_barcode(digits)
-        if sku_db:
-            return sku_db
-
+    if digits and digits in barcode_to_sku:
+        return barcode_to_sku[digits]
     return normalize_sku(raw)
 
 
@@ -1250,45 +1206,36 @@ def import_publication_links_excel(file) -> pd.DataFrame:
     return out[["sku_ml", "ml_item_id", "title", "link"]]
 
 def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
-    """Guarda/actualiza publicaciones en DB. Retorna (ok, sin_id).
-
-    FIX CRÍTICO (fotos):
-    En el archivo actual el `for` quedó fuera del `with db_conn(...)`,
-    por lo que el cursor se usaba con la conexión cerrada y NO se insertaba nada.
-    """
+    """Guarda/actualiza publicaciones en DB. Retorna (ok, sin_id)."""
     if df_pub is None or df_pub.empty:
         return 0, 0
-
     ok = 0
     noid = 0
-
-    with db_conn(commit=True) as conn:
-        c = conn.cursor()
-        for _, r in df_pub.iterrows():
-            sku = normalize_sku(r.get("sku_ml", ""))
-            if not sku:
-                continue
-
-            item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
-            title = str(r.get("title", "") or "").strip()
-            link = str(r.get("link", "") or "").strip()
-
-            if not item_id:
-                noid += 1
-
-            c.execute(
-                """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
-                   VALUES (?,?,?,?,?)
-                   ON CONFLICT(sku_ml) DO UPDATE SET
-                     ml_item_id=excluded.ml_item_id,
-                     title=excluded.title,
-                     link=excluded.link,
-                     updated_at=excluded.updated_at
-                """,
-                (sku, item_id, title, link, now_iso())
-            )
-            ok += 1
-
+    conn = get_conn()
+    c = conn.cursor()
+    for _, r in df_pub.iterrows():
+        sku = normalize_sku(r.get("sku_ml", ""))
+        if not sku:
+            continue
+        item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
+        title = str(r.get("title", "") or "").strip()
+        link = str(r.get("link", "") or "").strip()
+        if not item_id:
+            noid += 1
+        c.execute(
+            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(sku_ml) DO UPDATE SET
+                 ml_item_id=excluded.ml_item_id,
+                 title=excluded.title,
+                 link=excluded.link,
+                 updated_at=excluded.updated_at
+            """,
+            (sku, item_id, title, link, now_iso())
+        )
+        ok += 1
+    conn.commit()
+    conn.close()
     return ok, noid
 
 def get_publication_row(sku: str) -> dict:
