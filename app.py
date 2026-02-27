@@ -1422,11 +1422,89 @@ def get_publication_row(sku: str) -> dict:
         return {}
     return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
 
-OG_IMAGE_RE = re.compile(
-    r"""<meta[^>]+(?:property|name)=['\"]og:image(?::secure_url)?['\"][^>]*content=['\"]([^'\"]+)['\"]|
-        <meta[^>]+content=['\"]([^'\"]+)['\"][^>]+(?:property|name)=['\"]og:image(?::secure_url)?['\"]""",
-    re.IGNORECASE | re.VERBOSE
-)
+# --- Extracción de imágenes (sin API) ---
+# ML puede cambiar orden de atributos o usar tags alternativos; por eso no dependemos de un solo regex.
+_META_TAG_RE = re.compile(r"<meta\s+[^>]*>", re.IGNORECASE)
+_ATTR_RE = re.compile(r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(\".*?\"|\'.*?\'|[^\s>]+)", re.IGNORECASE | re.DOTALL)
+_MLSTATIC_IMG_RE = re.compile(r"https?://[^\"\']*mlstatic\.com[^\"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^\"\']*)?", re.IGNORECASE)
+
+def _extract_main_image_from_html(html_text: str) -> tuple[str, str]:
+    """Retorna (url, metodo). metodo vacío si no encontró."""
+    html_text = html_text or ""
+    if not html_text:
+        return "", ""
+
+    # 1) Meta tags (og:image / secure_url / twitter:image)
+    wanted = {
+        "og:image",
+        "og:image:secure_url",
+        "twitter:image",
+        "twitter:image:src",
+    }
+    for tag in _META_TAG_RE.findall(html_text):
+        attrs = {}
+        for k, v in _ATTR_RE.findall(tag):
+            key = (k or "").strip().lower()
+            val = (v or "").strip()
+            if len(val) >= 2 and ((val[0] == val[-1]) and val[0] in ("\"", "'")):
+                val = val[1:-1]
+            attrs[key] = val
+        prop = (attrs.get("property") or attrs.get("name") or "").strip().lower()
+        if prop in wanted:
+            img = (attrs.get("content") or "").strip()
+            if img:
+                if img.startswith("//"):
+                    img = "https:" + img
+                return img, f"meta:{prop}"
+
+    # 2) JSON-LD (application/ld+json) con clave 'image'
+    # Buscamos de forma tolerante: puede venir como string o lista.
+    for m in re.finditer(r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>", html_text, re.IGNORECASE | re.DOTALL):
+        raw = (m.group(1) or "").strip()
+        if not raw:
+            continue
+        # A veces viene con múltiples JSONs; intentamos parsear el primero válido.
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        def _pick_image(obj):
+            if isinstance(obj, dict):
+                img = obj.get("image")
+                if isinstance(img, str):
+                    return img
+                if isinstance(img, list) and img:
+                    for it in img:
+                        if isinstance(it, str) and it:
+                            return it
+                # A veces anida en @graph
+                g = obj.get("@graph")
+                if isinstance(g, list):
+                    for node in g:
+                        got = _pick_image(node)
+                        if got:
+                            return got
+            if isinstance(obj, list):
+                for it in obj:
+                    got = _pick_image(it)
+                    if got:
+                        return got
+            return ""
+
+        img = _pick_image(data)
+        if isinstance(img, str) and img.strip():
+            img = img.strip()
+            if img.startswith("//"):
+                img = "https:" + img
+            return img, "jsonld:image"
+
+    # 3) Fallback: primer URL a mlstatic en el HTML
+    m = _MLSTATIC_IMG_RE.search(html_text)
+    if m:
+        return m.group(0).strip(), "fallback:mlstatic"
+
+    return "", ""
 
 def _images_debug_enabled() -> bool:
     """Bandera de diagnóstico para imágenes OG (sin API)."""
@@ -1467,12 +1545,11 @@ def _images_cache_set(link: str, img: str) -> None:
     ss["_images_ok_cache"][link] = {"ts": time.time(), "img": img}
 
 def publication_main_image_from_html(link: str) -> str:
-    """Devuelve 1 URL de imagen principal leyendo og:image desde el HTML de la publicación.
+    """Devuelve 1 URL de imagen principal leyendo el HTML público de la publicación (sin API).
 
-    IMPORTANTE:
-    - Sin API (solo HTML).
-    - Cachea SOLO resultados exitosos (para evitar 24h de vacío si ML bloquea temporalmente).
-    - Guarda diagnóstico del último error cuando debug_images está activo.
+    Notas:
+    - Cachea SOLO resultados exitosos (para evitar 24h de vacío).
+    - En modo debug, guarda el status y una nota corta en session_state.
     """
     url = (link or "").strip()
     if not url:
@@ -1500,39 +1577,28 @@ def publication_main_image_from_html(link: str) -> str:
             return ""
 
         html_text = r.text or ""
-        m = OG_IMAGE_RE.search(html_text)
-        img = ""
-        if m:
-            img = (m.group(1) or m.group(2) or "").strip()
+        img, method = _extract_main_image_from_html(html_text)
 
         if img.startswith("//"):
             img = "https:" + img
 
         if img:
             _images_cache_set(url, img)
+            if _images_debug_enabled():
+                _images_set_last_error(url, status=200, note=f"OK ({method})")
             return img
 
         if _images_debug_enabled():
-            _images_set_last_error(url, status=200, note="No se encontró og:image en el HTML (posible cambio de plantilla / bloqueo parcial).")
+            _images_set_last_error(
+                url,
+                status=200,
+                note="No se encontró imagen en HTML (meta og/twitter, JSON-LD o fallback mlstatic)."
+            )
         return ""
 
     except Exception as e:
         if _images_debug_enabled():
             _images_set_last_error(url, status=None, note=f"Exception: {type(e).__name__}: {str(e)[:180]}")
-        return ""
-
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-        }
-        r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
-        if r.status_code != 200:
-            return ""
-        html_text = r.text or ""
-        m = OG_IMAGE_RE.search(html_text)
-        return m.group(1).strip() if m else ""
-    except Exception:
         return ""
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
