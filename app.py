@@ -31,16 +31,13 @@ PICKING_TABLES = [
     "picking_incidences",
     "cortes_tasks",
     "ot_orders",
-    "sorting_status",
 ]
 FULL_TABLES = [
     "full_batches","full_batch_items","full_incidences"
 ]
 SORTING_TABLES = [
-    # Sorting v1
-    "sorting_manifests","sorting_runs","sorting_run_items","sorting_labels",
-    # Sorting v2 (control + etiquetas + corridas)
-    "s2_manifests","s2_files","s2_page_assign","s2_sales","s2_items","s2_labels","s2_pack_ship"
+    # Sorting v2 (único)
+    "s2_manifests","s2_files","s2_sales","s2_items","s2_page_assign","s2_labels","s2_packing","s2_pack_ship","s2_dispatch",
 ]
 
 
@@ -706,19 +703,6 @@ def init_db():
         order_id INTEGER
     );
     """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_status (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ot_id INTEGER,
-        order_id INTEGER,
-        status TEXT,
-        marked_at TEXT,
-        mesa INTEGER,
-        printed_at TEXT
-    );
-    """)
-
     # Maestro EAN/SKU (común)
     # Maestro EAN/SKU (común)
     c.execute("""
@@ -841,60 +825,6 @@ def init_db():
         created_at TEXT
     );
     """)
-
-    # --- SORTING (Camarero) ---
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_manifests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        created_at TEXT,
-        status TEXT  -- ACTIVE / DONE
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        manifest_id INTEGER,
-        page_no INTEGER,
-        mesa INTEGER,
-        status TEXT, -- PENDING / IN_PROGRESS / DONE
-        created_at TEXT,
-        closed_at TEXT,
-        UNIQUE(manifest_id, page_no)
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_run_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id INTEGER,
-        seq INTEGER,
-        ml_order_id TEXT,
-        pack_id TEXT,
-        sku TEXT,
-        title_ml TEXT,
-        title_tec TEXT,
-        qty INTEGER,
-        buyer TEXT,
-        address TEXT,
-        shipment_id TEXT,
-        status TEXT, -- PENDING / DONE / INCIDENCE
-        done_at TEXT,
-        incidence_note TEXT
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_labels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        manifest_id INTEGER,
-        pack_id TEXT,
-        shipment_id TEXT,
-        buyer TEXT,
-        address TEXT,
-        raw TEXT,
-        UNIQUE(manifest_id, pack_id)
-    );
-    """)
-
     # --- MIGRACIONES SUAVES (para BD antiguas) ---
     def _cols(table: str) -> set:
         try:
@@ -920,43 +850,6 @@ def init_db():
     _ensure_col("picking_ots", "model", "TEXT")
     _ensure_col("picking_incidences", "note", "TEXT")
 
-# sorting_manifests
-    _ensure_col("sorting_manifests", "name", "TEXT")
-    _ensure_col("sorting_manifests", "created_at", "TEXT")
-    _ensure_col("sorting_manifests", "status", "TEXT")
-
-    # sorting_runs
-    _ensure_col("sorting_runs", "manifest_id", "INTEGER")
-    _ensure_col("sorting_runs", "page_no", "INTEGER")
-    _ensure_col("sorting_runs", "mesa", "INTEGER")
-    _ensure_col("sorting_runs", "status", "TEXT")
-    _ensure_col("sorting_runs", "created_at", "TEXT")
-    _ensure_col("sorting_runs", "closed_at", "TEXT")
-
-    # sorting_run_items
-    _ensure_col("sorting_run_items", "run_id", "INTEGER")
-    _ensure_col("sorting_run_items", "seq", "INTEGER")
-    _ensure_col("sorting_run_items", "ml_order_id", "TEXT")
-    _ensure_col("sorting_run_items", "pack_id", "TEXT")
-    _ensure_col("sorting_run_items", "sku", "TEXT")
-    _ensure_col("sorting_run_items", "title_ml", "TEXT")
-    _ensure_col("sorting_run_items", "title_tec", "TEXT")
-    _ensure_col("sorting_run_items", "qty", "INTEGER")
-    _ensure_col("sorting_run_items", "buyer", "TEXT")
-    _ensure_col("sorting_run_items", "address", "TEXT")
-    _ensure_col("sorting_run_items", "shipment_id", "TEXT")
-    _ensure_col("sorting_run_items", "status", "TEXT")
-    _ensure_col("sorting_run_items", "done_at", "TEXT")
-    _ensure_col("sorting_run_items", "incidence_note", "TEXT")
-
-    # sorting_labels
-    _ensure_col("sorting_labels", "manifest_id", "INTEGER")
-    _ensure_col("sorting_labels", "pack_id", "TEXT")
-    _ensure_col("sorting_labels", "shipment_id", "TEXT")
-    _ensure_col("sorting_labels", "buyer", "TEXT")
-    _ensure_col("sorting_labels", "address", "TEXT")
-    _ensure_col("sorting_labels", "raw", "TEXT")
-
 
     # sku_publications
     _ensure_col("sku_publications", "sku_ml", "TEXT")
@@ -965,19 +858,9 @@ def init_db():
     _ensure_col("sku_publications", "link", "TEXT")
     _ensure_col("sku_publications", "updated_at", "TEXT")
 
-    # Asegurar índices/constraints para UPSERT (BD antiguas)
-    try:
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sorting_labels_manifest_pack ON sorting_labels(manifest_id, pack_id);")
-    except Exception:
-        pass
-    try:
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sorting_runs_manifest_page ON sorting_runs(manifest_id, page_no);")
-    except Exception:
-        pass
 
     conn.commit()
     conn.close()
-
 
 # =========================
 # MAESTRO SKU/EAN (AUTO)
@@ -1804,7 +1687,7 @@ def save_orders_and_build_ots(
       - "VENTAS" (actual): reparte ventas por OT y crea tareas por SKU dentro de esas ventas.
       - "SKU" (nuevo): agrupa SKUs por Familia (desde maestro) y asigna familias a OTs (batch picking).
         Nota: para evitar conflictos con pantallas antiguas, igual se mantiene la asignación de ventas->OT
-        en ot_orders/sorting_status, pero las tareas de picking se construyen por familia/SKU.
+        en ot_orders (registro de ventas por OT), pero las tareas de picking se construyen por familia/SKU.
     """
     model = (model or "VENTAS").upper().strip()
     if model not in ("VENTAS", "SKU"):
@@ -1823,7 +1706,6 @@ def save_orders_and_build_ots(
     c.execute("DELETE FROM picking_incidences;")
     c.execute("DELETE FROM cortes_tasks;")
     c.execute("DELETE FROM ot_orders;")
-    c.execute("DELETE FROM sorting_status;")
     c.execute("DELETE FROM picking_ots;")
     c.execute("DELETE FROM pickers;")
 
@@ -1887,10 +1769,6 @@ def save_orders_and_build_ots(
         order_id = order_id_by_ml[ml_order_id]
         mesa = (idx % NUM_MESAS) + 1
         c.execute("INSERT INTO ot_orders (ot_id, order_id) VALUES (?,?)", (ot_id, order_id))
-        c.execute("""
-            INSERT INTO sorting_status (ot_id, order_id, status, marked_at, mesa, printed_at)
-            VALUES (?,?,?,?,?,?)
-        """, (ot_id, order_id, "PENDING", None, mesa, None))
 
     if model == "VENTAS":
         # === Modelo actual (sin cambios) ===
@@ -3717,7 +3595,6 @@ def page_admin():
             if st.button("✅ Sí, borrar todo y reiniciar"):
                 c.execute("DELETE FROM picking_tasks;")
                 c.execute("DELETE FROM picking_incidences;")
-                c.execute("DELETE FROM sorting_status;")
                 c.execute("DELETE FROM ot_orders;")
                 c.execute("DELETE FROM picking_ots;")
                 c.execute("DELETE FROM pickers;")
@@ -3735,338 +3612,6 @@ def page_admin():
                 st.rerun()
 
     conn.close()
-
-# =========================
-# SORTING (CAMARERO)
-# =========================
-
-
-def get_active_sorting_manifest():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT id, name, created_at, status FROM sorting_manifests WHERE status='ACTIVE' ORDER BY id DESC LIMIT 1;")
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"id": row[0], "name": row[1], "created_at": row[2], "status": row[3]}
-
-def create_sorting_manifest(name: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO sorting_manifests (name, created_at, status) VALUES (?,?, 'ACTIVE');", (name, now_iso()))
-    mid = c.lastrowid
-    conn.commit()
-    conn.close()
-    return mid
-
-def mark_manifest_done(manifest_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE sorting_manifests SET status='DONE' WHERE id=?;", (manifest_id,))
-    conn.commit()
-    conn.close()
-
-def decode_fh(text: str) -> str:
-    # ZPL ^FH uses _HH hex escapes
-    def repl(m):
-        try:
-            return bytes([int(m.group(1), 16)]).decode("latin-1")
-        except Exception:
-            return m.group(0)
-    return re.sub(r"_(..)", repl, text)
-
-def clean_address(text: str) -> str:
-    if not text:
-        return ""
-    t = decode_fh(text)
-
-    # remove JSON objects from QR payloads if present
-    t = re.sub(r"\{.*?\}", "", t)
-
-    # normalize separators
-    t = t.replace("->", " ")
-    t = t.replace("|", " ")
-    t = t.replace(";", " ")
-
-    # hard-cut promotional/UX sentences sometimes embedded in labels
-    low = t.lower()
-    promo_tokens = [
-        "despacha tus productos",
-        "no te relajes",
-        "tu comprador",
-        "está esperando",
-        "esta esperando",
-    ]
-    cut_at = None
-    for tok in promo_tokens:
-        i = low.find(tok)
-        if i != -1:
-            cut_at = i if cut_at is None else min(cut_at, i)
-    if cut_at is not None:
-        if cut_at == 0:
-            return ""
-        t = t[:cut_at]
-
-    t = re.sub(r"\s+", " ", t).strip()
-
-    # cut off technical tails often present
-    t = re.sub(r"\s*\(\s*Liberador.*$", "", t, flags=re.IGNORECASE).strip()
-    return t
-
-def parse_zpl_labels(raw: str):
-    # Returns dict pack_id -> {shipment_id,buyer,address,raw}
-    # and dict shipment_id -> same (for FLEX QR)
-    pack_map = {}
-    ship_map = {}
-
-    # collect ^FD...^FS fields and decode ^FH content
-    fd = re.findall(r"\^FD(.*?)\^FS", raw, flags=re.DOTALL)
-    fd = [decode_fh(x.replace("\n"," ").replace("\r"," ").strip()) for x in fd if x]
-    joined = " ".join(fd)
-
-    # Split by ^XA/^XZ blocks
-    blocks = re.split(r"\^XA", raw)
-    for b in blocks:
-        if "^XZ" not in b:
-            continue
-        # shipment id from barcode
-        ship = None
-        m = re.search(r"\^FD>:\s*(\d{6,20})", b)
-        if m:
-            ship = m.group(1)
-        # shipment id from QR JSON
-        if not ship:
-            m = re.search(r'"id"\s*:\s*"(\d{6,20})"', b)
-            if m:
-                ship = m.group(1)
-
-        # pack id (may be split across fields)
-        pack = None
-        # try "Pack ID:" with digits/spaces following
-        dec_b = decode_fh(b.replace("\n"," ").replace("\r"," "))
-        m = re.search(r"Pack ID:\s*([0-9 ]{6,30})", dec_b)
-        if m:
-            pack = re.sub(r"\s+", "", m.group(1))
-        # fallback: if we see a 17-18 digit starting with 20000
-        if not pack:
-            m = re.search(r"\b(20000\d{7,20})\b", dec_b)
-            if m:
-                pack = m.group(1)
-
-        # buyer and address heuristics
-        buyer = None
-        addr = None
-        # buyer often appears after ' - ' near end
-        m = re.search(r"\b([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)?)\s*\(", dec_b)
-        if m:
-            buyer = m.group(1).strip()
-        # domicile/address text
-        m = re.search(r"Domicilio:\s*([^\^]+?)(?:Ciudad de destino:|Despacha tus productos|\^FS|$)", dec_b, flags=re.IGNORECASE)
-        if m:
-            addr = clean_address(m.group(1))
-        else:
-            # try line that contains comuna / ciudad
-            m = re.search(r"(?:\bComuna\b|\bCiudad\b|\bRM\b).{10,200}", dec_b)
-            if m:
-                addr = clean_address(m.group(0))
-
-        rec = {"pack_id": pack, "shipment_id": ship, "buyer": buyer, "address": addr, "raw": b}
-        if pack:
-            pack_map[pack] = rec
-        if ship:
-            ship_map[ship] = rec
-
-    return pack_map, ship_map
-
-def parse_control_pdf_by_page(pdf_file):
-    """Parsea Control.pdf (Flex/Colecta) por página.
-
-    Soporta 2 formatos principales:
-    - **Colecta / Identificación Productos**: bloques con Pack ID / Venta / (Comprador) / SKU / Cantidad (puede traer múltiples SKU por venta)
-    - **Flex (y a veces Colecta)**: líneas con envío (shipment id) y luego Venta/Pack/SKU/Cantidad.
-
-    Devuelve:
-      [{"page_no": int, "items": [ {shipment_id, ml_order_id, pack_id, sku, qty, title_ml, buyer} ... ]}]
-    """
-    if not HAS_PDF_LIB:
-        st.error("Falta pdfplumber en el entorno.")
-        return None
-
-    def looks_like_name(s: str) -> bool:
-        s = (s or "").strip()
-        if not s:
-            return False
-        if len(s) > 60:
-            return False
-        # Evitar líneas tipo "Color: Blanco", etc.
-        if re.search(r"\b(color|acabado|modelo|di[aá]metro|voltaje|dise[nñ]o|tipo)\b\s*:", s, flags=re.I):
-            return False
-        # Debe tener letras
-        return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", s))
-
-    pages = []
-    with pdfplumber.open(pdf_file) as pdf:
-        for pno, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            lines = [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
-
-            items = []
-
-            # Contexto (se mantiene mientras cambian SKU/Cantidad)
-            ctx = {
-                "shipment_id": "",
-                "ml_order_id": None,
-                "pack_id": None,
-                "buyer": "",
-                "title_ml": "",
-            }
-
-            current_sku = None
-            current_title = ""
-
-            def push_item(sku, qty):
-                if not ctx.get("ml_order_id") or not sku or not qty:
-                    return
-                try:
-                    q = int(qty)
-                except Exception:
-                    return
-                items.append({
-                    "shipment_id": ctx.get("shipment_id", "") or "",
-                    "ml_order_id": str(ctx.get("ml_order_id")),
-                    "pack_id": (str(ctx.get("pack_id")) if ctx.get("pack_id") else None),
-                    "sku": str(sku),
-                    "qty": q,
-                    "title_ml": (ctx.get("title_ml") or current_title or "")[:200],
-                    "buyer": (ctx.get("buyer") or "")[:120],
-                })
-
-            # Heurística: en algunos PDFs vienen títulos al final; guardamos el último "título largo" como fallback.
-            for ln in lines:
-                # 1) shipment id (Flex) dentro de una línea tipo "4638.... <texto>"
-                m_ship = re.match(r"^(\d{8,15})\s+(.+)$", ln)
-                if m_ship and not ln.lower().startswith("venta"):
-                    ctx["shipment_id"] = m_ship.group(1)
-                    title = m_ship.group(2).strip()
-                    if title and len(title) >= 8:
-                        ctx["title_ml"] = title[:200]
-                    continue
-
-                # 2) Pack ID / Venta
-                m_pack = re.search(r"\bPack\s*ID:\s*([0-9]{10,20})\b", ln, flags=re.I)
-                if m_pack:
-                    ctx["pack_id"] = m_pack.group(1)
-                    # a veces trae SKU en la misma línea
-                    m_pack_sku = re.search(r"\bSKU:\s*([0-9A-Za-z_-]+)\b", ln, flags=re.I)
-                    if m_pack_sku:
-                        current_sku = m_pack_sku.group(1)
-                    continue
-
-                m_sale = re.search(r"\bVenta:\s*([0-9]{10,20})\b", ln, flags=re.I)
-                if m_sale:
-                    ctx["ml_order_id"] = m_sale.group(1)
-                    # En algunos casos viene un SKU y Cantidad en la misma línea
-                    m_sale_sku = re.search(r"\bSKU:\s*([0-9A-Za-z_-]+)\b", ln, flags=re.I)
-                    if m_sale_sku:
-                        current_sku = m_sale_sku.group(1)
-                    m_sale_qty = re.search(r"\bCantidad:\s*(\d+)\b", ln, flags=re.I)
-                    if m_sale_qty and current_sku:
-                        push_item(current_sku, m_sale_qty.group(1))
-                        current_sku = None
-                    continue
-
-                # 3) SKU (línea sola)
-                m_sku = re.match(r"^SKU:\s*([0-9A-Za-z_-]+)\b", ln, flags=re.I)
-                if m_sku:
-                    current_sku = m_sku.group(1)
-                    continue
-
-                # 4) Cantidad (línea sola) -> si hay current_sku, crea item
-                m_qty = re.match(r"^Cantidad:\s*(\d+)\b", ln, flags=re.I)
-                if m_qty:
-                    if current_sku:
-                        push_item(current_sku, m_qty.group(1))
-                        current_sku = None
-                    continue
-
-                # 5) Comprador (suele venir justo después de Venta)
-                if looks_like_name(ln):
-                    # Si aún no hay buyer y ya hay venta, lo tomamos
-                    if ctx.get("ml_order_id") and not ctx.get("buyer"):
-                        ctx["buyer"] = ln[:120]
-                        continue
-
-                # 6) Guardar posible título largo como fallback
-                if len(ln) >= 18 and ":" not in ln and not re.match(r"^(Despacha|Identif|Pack\s*ID|Venta:|SKU:|Cantidad:)", ln, flags=re.I):
-                    current_title = ln[:200]
-
-            pages.append({"page_no": pno, "items": items})
-
-    return pages
-
-def upsert_labels_to_db(manifest_id: int, pack_map: dict, raw: str):
-    conn = get_conn()
-    c = conn.cursor()
-    for pack_id, rec in pack_map.items():
-        c.execute(
-            """INSERT INTO sorting_labels (manifest_id, pack_id, shipment_id, buyer, address, raw)
-                 VALUES (?,?,?,?,?,?)
-                 ON CONFLICT(manifest_id, pack_id) DO UPDATE SET
-                    shipment_id=excluded.shipment_id,
-                    buyer=excluded.buyer,
-                    address=excluded.address,
-                    raw=excluded.raw;""",
-            (manifest_id, pack_id, rec.get("shipment_id"), rec.get("buyer"), rec.get("address"), raw)
-        )
-    conn.commit()
-    conn.close()
-
-def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_map_sku: dict, barcode_to_sku: dict):
-    # assignments: page_no -> mesa
-    conn = get_conn()
-    c = conn.cursor()
-    # load labels for this manifest
-    c.execute("SELECT pack_id, shipment_id, buyer, address FROM sorting_labels WHERE manifest_id=?;", (manifest_id,))
-    label_rows = c.fetchall()
-    labels = {r[0]: {"shipment_id": r[1], "buyer": r[2], "address": r[3]} for r in label_rows}
-
-    for page in pages:
-        pno = page["page_no"]
-        mesa = assignments.get(pno)
-        if not mesa:
-            continue
-        c.execute(
-            "INSERT OR IGNORE INTO sorting_runs (manifest_id, page_no, mesa, status, created_at) VALUES (?,?,?,?,?);",
-            (manifest_id, pno, int(mesa), "PENDING", now_iso())
-        )
-        c.execute("SELECT id FROM sorting_runs WHERE manifest_id=? AND page_no=?;", (manifest_id, pno))
-        run_id = c.fetchone()[0]
-        # clear previous items if re-created
-        c.execute("DELETE FROM sorting_run_items WHERE run_id=?;", (run_id,))
-        for it in page["items"]:
-            sku = str(it.get("sku") or "").strip()
-            title_ml = (it.get("title_ml") or "").strip()
-            # translate using maestro
-            title_tec = inv_map_sku.get(sku, "") if inv_map_sku else ""
-            buyer = it.get("buyer") or ""
-            pack_id = it.get("pack_id") or ""
-            ship = labels.get(pack_id, {}).get("shipment_id") if pack_id else None
-            addr = labels.get(pack_id, {}).get("address") if pack_id else None
-            buyer2 = labels.get(pack_id, {}).get("buyer") if pack_id else None
-            if buyer2 and not buyer:
-                buyer = buyer2
-            c.execute(
-                """INSERT INTO sorting_run_items
-                    (run_id, seq, ml_order_id, pack_id, sku, title_ml, title_tec, qty, buyer, address, shipment_id, status)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?, 'PENDING');""",
-                (run_id, it["seq"], it.get("ml_order_id"), pack_id, sku, title_ml, title_tec, int(it.get("qty") or 1),
-                 buyer, addr, ship)
-            )
-    conn.commit()
-    conn.close()
-
-
 
 def _s2_now_iso():
     # Timestamp en hora Chile con offset
@@ -5035,22 +4580,6 @@ def _s2_reset_all_sorting():
     for t in s2_tables:
         c.execute(f"DELETE FROM {t};")
 
-    # Legacy sorting tables (kept for backward compat in older code paths)
-    legacy = [
-        "sorting_run_items",
-        "sorting_runs",
-        "sorting_labels",
-        "sorting_manifests",
-        "sorting_status",
-    ]
-    for t in legacy:
-        try:
-            c.execute(f"DELETE FROM {t};")
-        except Exception:
-            pass
-
-    conn.commit()
-
 
 def _s2_get_pages(mid:int):
     conn=get_conn()
@@ -5805,105 +5334,6 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         st.rerun()
 
     conn.close()
-
-def get_next_run_for_mesa(mesa: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        """SELECT r.id, r.page_no, r.status, m.name
-             FROM sorting_runs r
-             JOIN sorting_manifests m ON m.id=r.manifest_id
-             WHERE r.mesa=? AND r.status!='DONE'
-             ORDER BY r.page_no ASC, r.id ASC
-             LIMIT 1;""",
-        (int(mesa),)
-    )
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"run_id": row[0], "page_no": row[1], "status": row[2], "manifest_name": row[3]}
-
-def get_next_group(run_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        """SELECT ml_order_id, pack_id, MIN(seq) as mseq
-             FROM sorting_run_items
-             WHERE run_id=? AND status!='DONE'
-             GROUP BY ml_order_id, pack_id
-             ORDER BY mseq ASC
-             LIMIT 1;""",
-        (run_id,)
-    )
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return None
-    order_id, pack_id, _ = row
-    c.execute(
-        """SELECT id, sku, title_ml, title_tec, qty, buyer, address, shipment_id, status
-             FROM sorting_run_items
-             WHERE run_id=? AND ml_order_id=? AND pack_id=?
-             ORDER BY seq ASC;""",
-        (run_id, order_id, pack_id)
-    )
-    items = []
-    for r in c.fetchall():
-        items.append({
-            "id": r[0],
-            "sku": r[1],
-            "title_ml": r[2] or "",
-            "title_tec": r[3] or "",
-            "qty": r[4] or 1,
-            "buyer": r[5] or "",
-            "address": r[6] or "",
-            "shipment_id": r[7] or "",
-            "status": r[8] or "PENDING",
-        })
-    conn.close()
-    return {"ml_order_id": order_id, "pack_id": pack_id, "items": items}
-
-def mark_item_done(item_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE sorting_run_items SET status='DONE', done_at=? WHERE id=?;", (now_iso(), int(item_id)))
-    conn.commit()
-    conn.close()
-
-def mark_item_incidence(item_id: int, note: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE sorting_run_items SET status='INCIDENCE', incidence_note=?, done_at=? WHERE id=?;", (note, now_iso(), int(item_id)))
-    conn.commit()
-    conn.close()
-
-def maybe_close_run(run_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(1) FROM sorting_run_items WHERE run_id=? AND status!='DONE';", (run_id,))
-    remaining = c.fetchone()[0]
-    if remaining == 0:
-        c.execute("UPDATE sorting_runs SET status='DONE', closed_at=? WHERE id=?;", (now_iso(), run_id))
-        conn.commit()
-    conn.close()
-
-def maybe_close_manifest_if_done():
-    active = get_active_sorting_manifest()
-    if not active:
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=? AND status!='DONE';", (active["id"],))
-    rem = c.fetchone()[0]
-    conn.close()
-    if rem == 0:
-        mark_manifest_done(active["id"])
-        # clear session state
-        for k in ["sorting_manifest_id","sorting_parsed_pages","sorting_manifest_name","sorting_assignments"]:
-            st.session_state.pop(k, None)
-
-
 
 # =========================
 # CONTADOR DE PAQUETES (Flex/Colecta)
