@@ -1,5 +1,4 @@
 import os
-from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -12,6 +11,7 @@ import json
 import random
 import string
 import requests
+from pathlib import Path
 # =========================
 # CONFIG
 # =========================
@@ -724,7 +724,6 @@ def init_db():
         ml_item_id TEXT,
         title TEXT,
         link TEXT,
-        img_url TEXT,
         updated_at TEXT
     );
     """)
@@ -915,9 +914,7 @@ def init_db():
     _ensure_col("sku_publications", "link", "TEXT")
     _ensure_col("sku_publications", "updated_at", "TEXT")
 
-    
-    _ensure_col("sku_publications", "img_url", "TEXT")
-# Asegurar índices/constraints para UPSERT (BD antiguas)
+    # Asegurar índices/constraints para UPSERT (BD antiguas)
     try:
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sorting_labels_manifest_pack ON sorting_labels(manifest_id, pack_id);")
     except Exception:
@@ -1207,6 +1204,8 @@ def master_bootstrap(master_path: str):
 # =========================
 # PUBLICACIONES (Links + Fotos por SKU)
 # =========================
+PUBLICATIONS_FILE = str((Path(__file__).resolve().parent / 'links de publicaciones.xlsx'))
+
 ML_ITEM_RE = re.compile(r"\b(ML[A-Z]{1,3}[-]?(\d+))\b", re.IGNORECASE)
 
 def extract_ml_item_id(value: str) -> str:
@@ -1222,94 +1221,97 @@ def extract_ml_item_id(value: str) -> str:
     return prefix
 
 def import_publication_links_excel(file) -> pd.DataFrame:
-    """Lee Excel de links de publicaciones.
-
-    Requisitos mínimos: SKU + Link (o SKU + Id).
-    Columnas típicas: Id, SKU, Título, Link.
-    Opcional: Imagen (url directa). Si existe, se usará para mostrar fotos sin scraping.
-    """
+    """Lee Excel con columnas Id, SKU, Título, Link (tolerante)."""
     df = pd.read_excel(file, dtype=str)
-
-    # Normalizar headers
-    def norm(x): 
-        return str(x).strip().lower()
-
-    cols = {norm(c): c for c in df.columns}
-
-    sku_c = cols.get("sku") or cols.get("sku_ml") or cols.get("codigo") or cols.get("código")
-    id_c  = cols.get("id") or cols.get("ml_item_id") or cols.get("item") or cols.get("item_id")
+    # normalizar headers
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    sku_c = cols.get("sku") or cols.get("codigo") or cols.get("código") or cols.get("sku_ml")
+    id_c = cols.get("id") or cols.get("item") or cols.get("item_id") or cols.get("ml_item_id")
     title_c = cols.get("título") or cols.get("titulo") or cols.get("title")
     link_c = cols.get("link") or cols.get("url") or cols.get("enlace")
-    img_c = (cols.get("imagen") or cols.get("image") or cols.get("img") or cols.get("foto") or
-             cols.get("imagen_url") or cols.get("url_imagen") or cols.get("url imagen"))
 
     if not sku_c:
-        raise ValueError("No encuentro columna SKU en el Excel de publicaciones.")
-    if not link_c and not id_c and not img_c:
-        raise ValueError("El Excel debe traer Link, o Id, o Imagen.")
+        raise ValueError("No encuentro columna SKU en el Excel.")
+    if not link_c and not id_c:
+        raise ValueError("El Excel debe traer Link (url) o Id (item).")
 
     out = pd.DataFrame()
-    out["sku_ml"] = df[sku_c].astype(str).fillna("").map(normalize_sku)
-
+    out["sku_ml"] = df[sku_c].astype(str).map(normalize_sku)
     out["title"] = df[title_c].astype(str).fillna("").map(lambda x: str(x).strip()) if title_c else ""
-    out["link"]  = df[link_c].astype(str).fillna("").map(lambda x: str(x).strip()) if link_c else ""
-
+    out["link"] = df[link_c].astype(str).fillna("").map(lambda x: str(x).strip()) if link_c else ""
+    # item id: preferir Id, si no, extraer desde link
     if id_c:
         out["ml_item_id"] = df[id_c].astype(str).fillna("").map(extract_ml_item_id)
     else:
         out["ml_item_id"] = ""
-    # extraer id desde link si falta
-    miss = out["ml_item_id"].eq("")
-    if miss.any():
-        out.loc[miss, "ml_item_id"] = out.loc[miss, "link"].map(extract_ml_item_id)
-
-    out["img_url"] = df[img_c].astype(str).fillna("").map(lambda x: str(x).strip()) if img_c else ""
+    need = out["ml_item_id"].eq("")
+    if need.any():
+        out.loc[need, "ml_item_id"] = out.loc[need, "link"].map(extract_ml_item_id)
 
     out = out[out["sku_ml"].ne("")].copy()
     out = out.drop_duplicates(subset=["sku_ml"], keep="last")
-    return out[["sku_ml", "ml_item_id", "title", "link", "img_url"]]
+    return out[["sku_ml", "ml_item_id", "title", "link"]]
 
 def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
     """Guarda/actualiza publicaciones en DB. Retorna (ok, sin_id)."""
     if df_pub is None or df_pub.empty:
         return 0, 0
-
     ok = 0
     noid = 0
-
     conn = get_conn()
     c = conn.cursor()
-
     for _, r in df_pub.iterrows():
         sku = normalize_sku(r.get("sku_ml", ""))
         if not sku:
             continue
-
         item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
-        title   = str(r.get("title", "") or "").strip()
-        link    = str(r.get("link", "") or "").strip()
-        img_url = str(r.get("img_url", "") or "").strip()
-
+        title = str(r.get("title", "") or "").strip()
+        link = str(r.get("link", "") or "").strip()
         if not item_id:
             noid += 1
-
         c.execute(
-            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, img_url, updated_at)
-               VALUES (?,?,?,?,?,?)
+            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
+               VALUES (?,?,?,?,?)
                ON CONFLICT(sku_ml) DO UPDATE SET
                  ml_item_id=excluded.ml_item_id,
                  title=excluded.title,
                  link=excluded.link,
-                 img_url=excluded.img_url,
                  updated_at=excluded.updated_at
             """,
-            (sku, item_id, title, link, img_url, now_iso())
+            (sku, item_id, title, link, now_iso())
         )
         ok += 1
-
     conn.commit()
     conn.close()
     return ok, noid
+
+
+
+def publications_bootstrap_repo(force: bool = False) -> str:
+    '''Carga links de publicaciones desde el repo y los guarda en DB.
+    Retorna estado: ok(...)/missing/err:...
+    '''
+    try:
+        path = PUBLICATIONS_FILE
+        if not os.path.exists(path):
+            st.session_state['_pub_repo_status'] = 'missing'
+            return 'missing'
+        mtime = os.path.getmtime(path)
+        loaded = st.session_state.get('_pub_repo_loaded', False)
+        last_mtime = st.session_state.get('_pub_repo_mtime', None)
+        if (not force) and loaded and (last_mtime == mtime):
+            return st.session_state.get('_pub_repo_status', 'ok')
+        dfp = import_publication_links_excel(path)
+        ok_n, noid_n = upsert_publications_to_db(dfp)
+        st.session_state['_pub_repo_loaded'] = True
+        st.session_state['_pub_repo_mtime'] = mtime
+        st.session_state['_pub_repo_status'] = f"ok ({ok_n} SKUs)"
+        st.session_state['_pub_repo_noid'] = noid_n
+        return st.session_state['_pub_repo_status']
+    except Exception as e:
+        st.session_state['_pub_repo_status'] = f"err: {e}"
+        return st.session_state['_pub_repo_status']
+
 
 def get_publication_row(sku: str) -> dict:
     sku = normalize_sku(sku)
@@ -1317,96 +1319,93 @@ def get_publication_row(sku: str) -> dict:
         return {}
     conn = get_conn()
     c = conn.cursor()
-    try:
-        c.execute("SELECT sku_ml, ml_item_id, title, link, img_url, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
-        row = c.fetchone()
-        conn.close()
-        if not row:
-            return {}
-        return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "img_url": row[4], "updated_at": row[5]}
-    except Exception:
-        # BD antigua sin img_url
-        try:
-            c.execute("SELECT sku_ml, ml_item_id, title, link, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
-            row = c.fetchone()
-        finally:
-            conn.close()
-        if not row:
-            return {}
-        return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "img_url": "", "updated_at": row[4]}
+    c.execute("SELECT sku_ml, ml_item_id, title, link, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return {}
+    return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
+
+OG_IMAGE_RE1 = re.compile(
+    r'<meta[^>]+property=["\']og:image(?::url)?["\'][^>]*content=["\']([^"\']+)["\']',
+    re.IGNORECASE
+)
+OG_IMAGE_RE2 = re.compile(
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']og:image(?::url)?["\']',
+    re.IGNORECASE
+)
+TW_IMAGE_RE1 = re.compile(
+    r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]*content=["\']([^"\']+)["\']',
+    re.IGNORECASE
+)
+TW_IMAGE_RE2 = re.compile(
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*name=["\']twitter:image(?::src)?["\']',
+    re.IGNORECASE
+)
+JSONLD_IMAGE_RE1 = re.compile(r'"image"\s*:\s*\[\s*"([^"]+)"', re.IGNORECASE)
+JSONLD_IMAGE_RE2 = re.compile(r'"image"\s*:\s*"([^"]+)"', re.IGNORECASE)
 
 def publication_main_image_from_html(link: str) -> str:
-    """Extrae imagen principal desde HTML (og:image / twitter:image / JSON-LD).
-    NO usa API. Cachea solo éxitos en st.session_state para no quedar 'pegado' con vacío.
-    """
+    """Devuelve la imagen principal desde HTML (og:image/twitter:image/JSON-LD). Sin API."""
     url = (link or "").strip()
     if not url:
         return ""
 
-    cache = st.session_state.setdefault("_photo_html_cache", {})
-    if url in cache:
-        return cache[url]
-
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
-
     try:
         r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
+        st.session_state["_last_pub_http_status"] = r.status_code
+        st.session_state["_last_pub_final_url"] = r.url
         if r.status_code != 200:
-            st.session_state["_photo_html_last_err"] = f"HTTP {r.status_code} url={r.url}"
             return ""
-        html = r.text or ""
+        html_text = r.text or ""
+        for rgx in (OG_IMAGE_RE1, OG_IMAGE_RE2, TW_IMAGE_RE1, TW_IMAGE_RE2):
+            m = rgx.search(html_text)
+            if m:
+                return (m.group(1) or "").strip()
+        m = JSONLD_IMAGE_RE1.search(html_text) or JSONLD_IMAGE_RE2.search(html_text)
+        if m:
+            return (m.group(1) or "").strip()
+        return ""
     except Exception as e:
-        st.session_state["_photo_html_last_err"] = f"REQ_ERR {e}"
+        st.session_state["_last_pub_http_status"] = f"err: {e}"
+        return ""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+        }
+        r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        html_text = r.text or ""
+        m = OG_IMAGE_RE.search(html_text)
+        return m.group(1).strip() if m else ""
+    except Exception:
         return ""
 
-    # patrones robustos (property/content en cualquier orden)
-    patterns = [
-        re.compile(r'<meta[^>]+property=["\']og:image(?::url)?["\'][^>]*content=["\']([^"\']+)["\']', re.I),
-        re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']og:image(?::url)?["\']', re.I),
-        re.compile(r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]*content=["\']([^"\']+)["\']', re.I),
-        re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*name=["\']twitter:image(?::src)?["\']', re.I),
-        re.compile(r'"image"\s*:\s*\[\s*"([^\"]+)"', re.I),
-    ]
-    img = ""
-    for rgx in patterns:
-        m = rgx.search(html)
-        if m:
-            img = (m.group(1) or "").strip()
-            if img:
-                break
+def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
+    """Retorna (urls, link_publicacion).
 
-    if img:
-        cache[url] = img  # cachear solo éxito
-    else:
-        st.session_state["_photo_html_last_err"] = "NO_META_IMAGE"
-    return img
-
-def get_picture_urls_for_sku(sku_ml: str, limit: int = 3) -> list:
-    sku_ml = normalize_sku(sku_ml)
-    if not sku_ml:
-        return []
-    row = get_publication_row(sku_ml)
+    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
+    """
+    row = get_publication_row(sku)
     if not row:
-        return []
-
-    # 1) si hay url directa en Excel/DB, usarla
-    img_url = (row.get("img_url") or "").strip()
-    if img_url:
-        return [img_url]
-
-    # 2) fallback HTML og:image
+        return [], ""
     link = (row.get("link") or "").strip()
     if not link:
-        return []
+        return [], ""
     img = publication_main_image_from_html(link)
-    return [img] if img else []
-
+    urls = [img] if img else []
+    return urls, link# =========================
+# CORTES (lista de SKUs)
+# =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
     """Carga listado de SKUs que requieren corte manual desde Excel (defensivo)."""
     # Cache en session_state para evitar leer el Excel en cada rerun
@@ -3243,27 +3242,56 @@ def page_admin():
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.subheader("Fotos de productos (Publicaciones)")
-    st.caption("Carga el Excel con columnas SKU + Link/Id para poder mostrar fotos dentro del sistema.")
-    up = st.file_uploader("Excel de links de publicaciones (xlsx)", type=["xlsx"], key="pub_links_xlsx")
-    colA, colB = st.columns([1,1])
+
+    st.caption("El archivo `links de publicaciones.xlsx` se lee automáticamente desde el repositorio (misma carpeta que app.py).")
+
+    st.code(PUBLICATIONS_FILE)
+
+
+    # Auto-carga silenciosa (una vez por mtime)
+
+    publications_bootstrap_repo(force=False)
+
+
+    colA, colB, colC = st.columns([1,1,2])
+
     with colA:
-        do_load = st.button("Cargar / actualizar links", use_container_width=True, key="pub_links_load_btn")
+
+        if st.button("Recargar desde repo", use_container_width=True):
+
+            publications_bootstrap_repo(force=True)
+
     with colB:
-        st.info("Tip: con esto podrás ver fotos en Picking/Sorting/Full cuando exista match por SKU.")
-    if do_load:
-        if up is None:
-            st.warning("Sube el Excel primero.")
-        else:
-            try:
-                dfp = import_publication_links_excel(up)
-                ok_n, noid_n = upsert_publications_to_db(dfp)
-                st.success(f"Listo: {ok_n} SKUs guardados/actualizados. Sin ID detectado: {noid_n}.")
-                st.dataframe(dfp.head(30), use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.error(f"No se pudo cargar: {e}")
+
+        if st.button("Ver estado", use_container_width=True):
+
+            publications_bootstrap_repo(force=False)
+
+    with colC:
+
+        st.info(f"Estado: {st.session_state.get('_pub_repo_status', '(sin cargar)')}")
+
+        if st.session_state.get('_pub_repo_noid', 0):
+
+            st.warning(f"Sin ID detectado: {st.session_state.get('_pub_repo_noid')} (no es crítico para HTML).")
+
+
+    # Diagnóstico rápido para Streamlit Cloud (bloqueos 403)
+
+    if st.toggle("Diagnóstico rápido de fotos (HTML)", value=False):
+
+        sample = st.text_input("Pega un Link de MercadoLibre para test", value="")
+
+        if sample:
+
+            _ = publication_main_image_from_html(sample)
+
+            st.write("HTTP status:", st.session_state.get("_last_pub_http_status"))
+
+            st.write("URL final:", st.session_state.get("_last_pub_final_url"))
+
 
     st.divider()
-
     st.divider()
     st.subheader("Liberar y repartir tareas pendientes (por SKU)")
 
