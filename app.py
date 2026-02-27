@@ -11,6 +11,7 @@ import json
 import random
 import string
 import requests
+import time
 # =========================
 # CONFIG
 # =========================
@@ -1422,19 +1423,104 @@ def get_publication_row(sku: str) -> dict:
     return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
 
 OG_IMAGE_RE = re.compile(
-    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-    re.IGNORECASE
+    r"""<meta[^>]+(?:property|name)=['\"]og:image(?::secure_url)?['\"][^>]*content=['\"]([^'\"]+)['\"]|
+        <meta[^>]+content=['\"]([^'\"]+)['\"][^>]+(?:property|name)=['\"]og:image(?::secure_url)?['\"]""",
+    re.IGNORECASE | re.VERBOSE
 )
 
-@st.cache_data(show_spinner=False, ttl=24*3600)
+def _images_debug_enabled() -> bool:
+    """Bandera de diagnóstico para imágenes OG (sin API)."""
+    return bool(st.session_state.get("debug_images", False))
+
+def _images_set_last_error(link: str, status: int | None = None, note: str = "") -> None:
+    ss = st.session_state
+    if "images_last_error" not in ss:
+        ss["images_last_error"] = {}
+    ss["images_last_error"][link] = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "status": status,
+        "note": (note or "")[:300],
+    }
+
+def _images_get_last_error(link: str) -> dict:
+    ss = st.session_state
+    return (ss.get("images_last_error") or {}).get(link, {})
+
+def _images_cache_get(link: str, ttl_seconds: int = 6*3600) -> str | None:
+    """Cache SOLO de éxitos (para no 'congelar' vacíos por bloqueo temporal)."""
+    ss = st.session_state
+    cache = ss.get("_images_ok_cache") or {}
+    hit = cache.get(link)
+    if not hit:
+        return None
+    ts, img = hit.get("ts", 0), hit.get("img", "")
+    if not img:
+        return None
+    if (time.time() - ts) > ttl_seconds:
+        return None
+    return img
+
+def _images_cache_set(link: str, img: str) -> None:
+    ss = st.session_state
+    if "_images_ok_cache" not in ss:
+        ss["_images_ok_cache"] = {}
+    ss["_images_ok_cache"][link] = {"ts": time.time(), "img": img}
+
 def publication_main_image_from_html(link: str) -> str:
     """Devuelve 1 URL de imagen principal leyendo og:image desde el HTML de la publicación.
 
-    Sin API: solo usa el link público de Mercado Libre.
+    IMPORTANTE:
+    - Sin API (solo HTML).
+    - Cachea SOLO resultados exitosos (para evitar 24h de vacío si ML bloquea temporalmente).
+    - Guarda diagnóstico del último error cuando debug_images está activo.
     """
     url = (link or "").strip()
     if not url:
         return ""
+
+    # Cache de éxitos
+    cached = _images_cache_get(url)
+    if cached:
+        return cached
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": "https://www.mercadolibre.cl/",
+        }
+        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+
+        if r.status_code != 200:
+            if _images_debug_enabled():
+                _images_set_last_error(url, status=r.status_code, note=(r.text or "")[:180])
+            return ""
+
+        html_text = r.text or ""
+        m = OG_IMAGE_RE.search(html_text)
+        img = ""
+        if m:
+            img = (m.group(1) or m.group(2) or "").strip()
+
+        if img.startswith("//"):
+            img = "https:" + img
+
+        if img:
+            _images_cache_set(url, img)
+            return img
+
+        if _images_debug_enabled():
+            _images_set_last_error(url, status=200, note="No se encontró og:image en el HTML (posible cambio de plantilla / bloqueo parcial).")
+        return ""
+
+    except Exception as e:
+        if _images_debug_enabled():
+            _images_set_last_error(url, status=None, note=f"Exception: {type(e).__name__}: {str(e)[:180]}")
+        return ""
+
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -2483,6 +2569,12 @@ def page_picking():
         pics, pub_link = [], ""
     if pics:
         st.image(pics[0], use_container_width=True)
+    else:
+        st.caption("Sin imagen disponible")
+        if _images_debug_enabled() and pub_link:
+            err = _images_get_last_error(pub_link)
+            if err:
+                st.caption(f"🧪 Debug imágenes — status: {err.get('status')} — {err.get('note')}")
         if len(pics) > 1:
             with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
                 st.image(pics, use_container_width=True)
@@ -5480,6 +5572,10 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 st.image(pics[0], use_container_width=True)
             else:
                 st.caption("Sin imagen disponible")
+                if _images_debug_enabled() and _pub_link:
+                    err = _images_get_last_error(_pub_link)
+                    if err:
+                        st.caption(f"🧪 Debug imágenes — status: {err.get('status')} — {err.get('note')}")
 
         if status != "DONE" and remaining > 0:
             bcols = st.columns([1,1,6])
@@ -6765,6 +6861,10 @@ def main():
     _sfx_unlock_render()
     _sfx_global_click_hook()
     sfx_render_pending()
+
+    # 🖼️ Diagnóstico de imágenes (solo para detectar bloqueos / cambios HTML)
+    with st.sidebar.expander("🖼️ Imágenes", expanded=False):
+        st.checkbox("Debug imágenes (mostrar causa cuando diga 'Sin imagen')", key="debug_images")
     init_db()
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
