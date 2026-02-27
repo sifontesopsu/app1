@@ -5,12 +5,12 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 import re
-import hashlib
 import html
 import json
 import random
 import string
 import requests
+from contextlib import contextmanager
 # =========================
 # CONFIG
 # =========================
@@ -281,18 +281,6 @@ def now_iso():
 # =========================
 UBC_RE = re.compile(r"\[\s*UBC\s*:\s*([^\]]+)\]", re.IGNORECASE)
 
-def split_title_ubc(title: str):
-    """Return (title_without_ubc, ubc_str_or_empty)."""
-    t = str(title or "").strip()
-    ubc = ""
-    m = UBC_RE.search(t)
-    if m:
-        ubc = m.group(1).strip()
-        # remove the whole [UBC: ...] chunk
-        t = UBC_RE.sub("", t).strip()
-        # collapse double spaces
-        t = re.sub(r"\s{2,}", " ", t)
-    return t, ubc
 
 def to_chile_display(iso_str: str) -> str:
     """Muestra timestamps en hora Chile.
@@ -357,6 +345,50 @@ def split_barcodes(cell_value) -> list[str]:
 
 def get_conn():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
+
+
+# =========================
+# DB HELPERS (centralizados)
+# =========================
+@contextmanager
+def db_conn(commit: bool = False):
+    """Context manager para SQLite.
+    - commit=True: hace commit al salir si no hubo excepción; si hubo, rollback.
+    """
+    conn = get_conn()
+    try:
+        yield conn
+        if commit:
+            conn.commit()
+    except Exception:
+        if commit:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_fetchone(sql: str, params: tuple = ()):
+    with db_conn(commit=False) as conn:
+        return conn.execute(sql, params).fetchone()
+
+
+def db_fetchall(sql: str, params: tuple = ()):
+    with db_conn(commit=False) as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def db_exec(sql: str, params: tuple = (), commit: bool = False):
+    with db_conn(commit=commit) as conn:
+        cur = conn.execute(sql, params)
+        return cur
+
 
 
 # =========================
@@ -948,66 +980,6 @@ def load_master_from_path(path: str) -> tuple[dict, dict, dict, list]:
 
     return inv_map_sku, familia_map_sku, barcode_to_sku, conflicts
 
-    df = pd.read_excel(path, dtype=str)
-    cols = df.columns.tolist()
-    lower = [str(c).strip().lower() for c in cols]
-
-    sku_col = None
-    if "sku" in lower:
-        sku_col = cols[lower.index("sku")]
-
-    tech_col = None
-    for cand in ["artículo", "articulo", "descripcion", "descripción", "nombre", "producto", "detalle"]:
-        if cand in lower:
-            tech_col = cols[lower.index(cand)]
-            break
-
-    barcode_col = None
-    for cand in ["codigo de barras", "código de barras", "barcode", "ean", "eans"]:
-        if cand in lower:
-            barcode_col = cols[lower.index(cand)]
-            break
-
-    # Fallback por si el archivo no trae headers claros
-    if sku_col is None or tech_col is None:
-        df0 = pd.read_excel(path, header=None, dtype=str)
-        if df0.shape[1] >= 2:
-            a, b = df0.columns[0], df0.columns[1]
-            sample = df0.head(200)
-
-            def score(series):
-                s = 0
-                for v in series:
-                    if re.fullmatch(r"\d{4,}", normalize_sku(v)):
-                        s += 1
-                return s
-
-            sa, sb = score(sample[a]), score(sample[b])
-            if sb >= sa:
-                sku_col, tech_col = b, a
-            else:
-                sku_col, tech_col = a, b
-            df = df0
-            barcode_col = None  # sin header no asumimos dónde está EAN
-
-    for _, r in df.iterrows():
-        sku = normalize_sku(r.get(sku_col, ""))
-        if not sku:
-            continue
-
-        tech = str(r.get(tech_col, "")).strip() if tech_col is not None else ""
-        if tech and tech.lower() != "nan":
-            inv_map_sku[sku] = tech
-
-        if barcode_col is not None:
-            codes = split_barcodes(r.get(barcode_col, ""))
-            for code in codes:
-                if code in barcode_to_sku and barcode_to_sku[code] != sku:
-                    conflicts.append((code, barcode_to_sku[code], sku))
-                    continue
-                barcode_to_sku[code] = sku
-
-    return inv_map_sku, barcode_to_sku, conflicts
 
 
 # Cache extra: lookup directo del título "tal cual" en el maestro (sin limpiar)
@@ -1099,8 +1071,8 @@ def upsert_barcodes_to_db(barcode_to_sku: dict):
     """
     if not barcode_to_sku:
         return
-    conn = get_conn()
-    c = conn.cursor()
+    with db_conn(commit=True) as conn:
+        c = conn.cursor()
     try:
         # asegurar tabla/columnas
         c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes (
@@ -1120,10 +1092,6 @@ def upsert_barcodes_to_db(barcode_to_sku: dict):
             );""")
     except Exception:
         # si no podemos asegurar schema, no bloqueamos la app
-        try:
-            conn.close()
-        except Exception:
-            pass
         return
 
     try:
@@ -1139,8 +1107,6 @@ def upsert_barcodes_to_db(barcode_to_sku: dict):
             conn.rollback()
         except Exception:
             pass
-    finally:
-        conn.close()
 
 
 
@@ -1155,16 +1121,11 @@ def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
     # 2) Fallback to DB map (persists across reruns)
     if digits:
         try:
-            conn = get_conn()
-            row = conn.execute("SELECT sku_ml FROM sku_barcodes WHERE barcode=?", (digits,)).fetchone()
-            conn.close()
+            row = db_fetchone("SELECT sku_ml FROM sku_barcodes WHERE barcode=?", (digits,))
             if row and row[0]:
                 return str(row[0]).strip()
         except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            pass
 
     # 3) As last resort: treat scan as SKU text
     return normalize_sku(raw)
@@ -1185,34 +1146,9 @@ def extract_location_suffix(text: str) -> str:
         return f"[{m.group(1).strip()}]"
     return ""
 
-def strip_location_suffix(text: str) -> str:
-    """Remove trailing location suffix like '[UBC: 2260]' if present."""
-    t = str(text or "").strip()
-    if not t:
-        return ""
-    # remove bracketed suffix
-    t2 = re.sub(r"\s*(\[\s*UBC\s*:\s*[^\]]+\])\s*$", "", t, flags=re.IGNORECASE).strip()
-    # remove unbracketed suffix
-    t2 = re.sub(r"\s*(UBC\s*:\s*\d+)\s*$", "", t2, flags=re.IGNORECASE).strip()
-    return t2
 
 
 
-def with_location(title_display: str, title_tec: str) -> str:
-    """Ensures the product title shown includes the location suffix when available."""
-    base = str(title_display or "").strip()
-    tec = str(title_tec or "").strip()
-
-    # If base already contains a suffix, keep it
-    if extract_location_suffix(base):
-        return base
-
-    # If technical title contains suffix, append it
-    suf = extract_location_suffix(tec)
-    if suf:
-        return f"{base} {suf}".strip()
-
-    return base
 
 
 @st.cache_data(show_spinner=False)
@@ -1282,8 +1218,8 @@ def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
         return 0, 0
     ok = 0
     noid = 0
-    conn = get_conn()
-    c = conn.cursor()
+    with db_conn(commit=True) as conn:
+        c = conn.cursor()
     for _, r in df_pub.iterrows():
         sku = normalize_sku(r.get("sku_ml", ""))
         if not sku:
@@ -1305,19 +1241,13 @@ def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
             (sku, item_id, title, link, now_iso())
         )
         ok += 1
-    conn.commit()
-    conn.close()
     return ok, noid
 
 def get_publication_row(sku: str) -> dict:
     sku = normalize_sku(sku)
     if not sku:
         return {}
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT sku_ml, ml_item_id, title, link, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
-    row = c.fetchone()
-    conn.close()
+    row = db_fetchone("SELECT sku_ml, ml_item_id, title, link, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
     if not row:
         return {}
     return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
@@ -2721,20 +2651,6 @@ def read_full_excel(file) -> pd.DataFrame:
     return pd.DataFrame(all_rows)
 
 
-def compute_full_status(qty_required: int, qty_checked: int, has_incidence: bool = False) -> str:
-    if qty_checked <= 0:
-        return "PENDING"
-    if qty_checked == qty_required and not has_incidence:
-        return "OK"
-    if qty_checked == qty_required and has_incidence:
-        return "OK_WITH_ISSUES"
-    if qty_checked < qty_required and has_incidence:
-        return "INCIDENCE"
-    if qty_checked < qty_required:
-        return "PARTIAL"
-    if qty_checked > qty_required:
-        return "OVER"
-    return "PENDING"
 
 
 def get_open_full_batches():
@@ -4258,64 +4174,6 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
 
 
 
-def _s2_repair_customer_destino(mid: int):
-    """Recalcula customer/destino desde el Control PDF guardado, sin tocar estados/mesas/ítems."""
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute("SELECT control_pdf, control_name FROM s2_files WHERE manifest_id=?", (mid,)).fetchone()
-    if not row or not row[0]:
-        conn.close()
-        return 0
-    pdf_bytes = row[0]
-    parsed = _s2_parse_control_pdf(pdf_bytes)
-
-    # map sale_id -> (customer, destino)
-    fixes = {}
-    for s in parsed:
-        sale_id = str(s.get("sale_id") or "").strip()
-        if not sale_id:
-            continue
-        cust = _s2_clean_person_text(s.get("customer"), 70)
-        dest = _s2_clean_person_text(s.get("destino"), 80)
-        if cust or dest:
-            fixes[sale_id] = (cust, dest)
-
-    def is_bad(val: str) -> bool:
-        t = (val or "").strip()
-        if not t:
-            return True
-        if re.search(r"\b(venta|sku|cantidad|pack\s*id|env[ií]o)\b\s*:", t, flags=re.I):
-            return True
-        if re.search(r"\d{6,}", t):
-            return True
-        return False
-
-    updated = 0
-    # actualizar SOLO si el campo está vacío o corrupto
-    for sale_id, (cust, dest) in fixes.items():
-        cur = c.execute(
-            "SELECT customer, destino FROM s2_sales WHERE manifest_id=? AND sale_id=?",
-            (mid, sale_id),
-        ).fetchone()
-        if not cur:
-            continue
-        cur_cust, cur_dest = cur[0], cur[1]
-        new_cust = cust if cust and is_bad(cur_cust) else None
-        new_dest = dest if dest and is_bad(cur_dest) else None
-        if new_cust is None and new_dest is None:
-            continue
-        c.execute(
-            """UPDATE s2_sales
-               SET customer = COALESCE(?, customer),
-                   destino  = COALESCE(?, destino)
-               WHERE manifest_id=? AND sale_id=?""",
-            (new_cust, new_dest, mid, sale_id),
-        )
-        updated += c.rowcount or 0
-
-    conn.commit()
-    conn.close()
-    return updated
 
 def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
     # Detectar ship ids y relaciones pack/venta -> ship
@@ -4643,28 +4501,7 @@ def _s2_create_corridas(mid:int):
     conn.close()
     return updated
 
-def _s2_find_sale_for_scan(mid:int, mesa:int, shipment_id:str):
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("""SELECT sale_id FROM s2_sales
-                 WHERE manifest_id=? AND mesa=? AND shipment_id=? AND status='PENDING'
-                 ORDER BY page_no, row_no, sale_id
-                 LIMIT 1;""", (mid, int(mesa), str(shipment_id)))
-    row=c.fetchone()
-    conn.close()
-    return row[0] if row else None
 
-def _s2_find_sale_for_pack_scan(mid:int, mesa:int, pack_id:str):
-    """Fallback: algunos escáneres/etiquetas devuelven Pack ID en vez de Shipment ID (Colecta)."""
-    conn=get_conn()
-    c=conn.cursor()
-    c.execute("""SELECT sale_id FROM s2_sales
-                 WHERE manifest_id=? AND mesa=? AND pack_id=? AND status='PENDING'
-                 ORDER BY page_no, row_no, sale_id
-                 LIMIT 1;""", (mid, int(mesa), str(pack_id)))
-    row=c.fetchone()
-    conn.close()
-    return row[0] if row else None
 
 def _s2_next_pending_sale_in_sequence(mid:int, mesa:int):
     """Devuelve la próxima venta pendiente (secuencia obligatoria) para una mesa,
@@ -4746,13 +4583,6 @@ def _s2_close_sale(mid:int, sale_id:str):
     conn.commit()
     conn.close()
 
-def _s2_reset_all():
-    conn=get_conn()
-    c=conn.cursor()
-    for t in ["s2_labels","s2_items","s2_sales","s2_page_assign","s2_files","s2_manifests"]:
-        c.execute(f"DROP TABLE IF EXISTS {t};")
-    conn.commit()
-    conn.close()
 
 def page_sorting_upload(inv_map_sku, barcode_to_sku):
     _s2_create_tables()
@@ -5368,12 +5198,6 @@ def _pkg_create_run(kind: str) -> int:
     conn.close()
     return rid
 
-def _pkg_close_run(run_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE pkg_counter_runs SET status='DONE', closed_at=? WHERE id=?;", (now_iso(), int(run_id)))
-    conn.commit()
-    conn.close()
 
 def _pkg_run_count(run_id: int) -> int:
     conn = get_conn()
