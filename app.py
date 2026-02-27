@@ -1291,20 +1291,96 @@ def publication_main_image_from_html(link: str) -> str:
     except Exception:
         return ""
 
+def _normalize_ml_item_id(item_id: str) -> str:
+    """Normaliza IDs tipo 'MLC-123' -> 'MLC123'."""
+    s = str(item_id or "").strip().upper()
+    m = re.match(r"^(ML[A-Z]{1,3})-?(\d+)$", s)
+    if m:
+        return f"{m.group(1)}{m.group(2)}"
+    return s
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def _ml_item_pictures(item_id: str) -> list[str]:
+    """Devuelve lista de URLs de fotos desde la API pública de MercadoLibre."""
+    item_id = _normalize_ml_item_id(item_id)
+    if not item_id:
+        return []
+    url = f"https://api.mercadolibre.com/items/{item_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (AuroraWMS/1.0)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return []
+        data = r.json() if r.content else {}
+    except Exception:
+        return []
+    pics = data.get("pictures") or []
+    out = []
+    for p in pics:
+        if not isinstance(p, dict):
+            continue
+        u = (p.get("secure_url") or p.get("url") or "").strip()
+        if u and u not in out:
+            out.append(u)
+    return out
+
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
     """Retorna (urls, link_publicacion).
 
-    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
+    1) Preferido: API pública de MercadoLibre (rápida y estable) usando ml_item_id.
+    2) Fallback: og:image del HTML (si no hay item_id o la API falla).
     """
     row = get_publication_row(sku)
     if not row:
         return [], ""
+
     link = (row.get("link") or "").strip()
-    if not link:
-        return [], ""
-    img = publication_main_image_from_html(link)
-    urls = [img] if img else []
-    return urls, link# =========================
+    item_id = (row.get("ml_item_id") or "").strip()
+
+    # Si no está guardado el item_id, intentamos extraerlo del link y persistirlo.
+    if (not item_id) and link:
+        try:
+            extracted = extract_ml_item_id(link)  # e.g., MLC123 o MLC-123
+        except Exception:
+            extracted = ""
+        extracted = _normalize_ml_item_id(extracted)
+        if extracted:
+            item_id = extracted
+            try:
+                conn = get_conn()
+                c = conn.cursor()
+                c.execute(
+                    "UPDATE sku_publications SET ml_item_id=?, updated_at=? WHERE sku_ml=?;",
+                    (item_id, now_iso(), str(sku).strip()),
+                )
+                conn.commit()
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # 1) API
+    if item_id:
+        pics = _ml_item_pictures(item_id)
+        if pics:
+            return pics, link
+
+    # 2) Fallback HTML og:image
+    if link:
+        try:
+            img = publication_main_image_from_html(link)
+        except Exception:
+            img = ""
+        if img:
+            return [img], link
+
+    return [], link# =========================
 # CORTES (lista de SKUs)
 # =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
