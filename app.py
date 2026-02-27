@@ -1479,11 +1479,8 @@ def parse_manifest_pdf(uploaded_file) -> pd.DataFrame:
 # =========================
 def publications_bootstrap(path: str = PUBLICATIONS_FILE):
     """Carga/actualiza automáticamente los links de publicaciones desde el repo.
-
-    FIX (imágenes que no aparecen):
-    - Antes, si en un arranque previo se marcó _pub_links_loaded=True con 0 filas insertadas (por un bug),
-      quedaba "pegado" y NO volvía a cargar mientras el mtime del Excel no cambiara.
-    - Ahora: si la DB tiene 0 publicaciones (o está vacía), forzamos recarga aunque el mtime sea el mismo.
+    - Evita recargar en cada rerun usando mtime.
+    - No requiere upload manual desde el panel administrador.
     """
     ss = st.session_state
     cache_key = "_pub_links_mtime"
@@ -1497,45 +1494,27 @@ def publications_bootstrap(path: str = PUBLICATIONS_FILE):
     except Exception:
         mtime = None
 
-    # Si aparentemente ya cargamos, validamos que realmente haya datos en DB.
-    already_loaded = bool(ss.get("_pub_links_loaded", False))
-    same_file = (ss.get(cache_key) == mtime)
-
-    db_count = None
-    try:
-        conn = get_conn()
-        row = conn.execute("SELECT COUNT(1) FROM sku_publications;").fetchone()
-        conn.close()
-        db_count = int(row[0] or 0) if row else 0
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        db_count = None
-
-    # Si está cargado, el archivo no cambió y la DB tiene datos => no recargar
-    if already_loaded and same_file and (db_count is not None and db_count > 0):
+    if ss.get(cache_key) == mtime and ss.get("_pub_links_loaded", False):
         return int(ss.get("_pub_links_ok", 0) or 0), int(ss.get("_pub_links_noid", 0) or 0), False
 
-    # Si DB está vacía, forzamos recarga aunque el mtime sea igual
     try:
         dfp = import_publication_links_excel(path)
         ok_n, noid_n = upsert_publications_to_db(dfp)
-
         ss[cache_key] = mtime
         ss["_pub_links_loaded"] = True
         ss["_pub_links_ok"] = int(ok_n or 0)
         ss["_pub_links_noid"] = int(noid_n or 0)
         ss["_pub_links_status"] = ("ok", str(path))
-
         return int(ok_n or 0), int(noid_n or 0), True
     except Exception as e:
         ss["_pub_links_status"] = ("err", str(e))
-        # Importante: NO marcar loaded en error
-        ss["_pub_links_loaded"] = False
         return 0, 0, False
 
+
+
+# =========================
+# IMPORTAR VENTAS (FLEX)
+# =========================
 def import_sales_excel(file) -> pd.DataFrame:
     """Importa reporte de ventas ML.
 
