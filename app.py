@@ -1065,50 +1065,33 @@ def master_raw_title_lookup(path: str, sku: str) -> str:
 def upsert_barcodes_to_db(barcode_to_sku: dict):
     """Guarda el mapa EAN->SKU en SQLite.
 
-    Importante: en Streamlit Cloud la DB puede quedar con esquemas antiguos. Esta función es defensiva:
-    - verifica que exista la tabla y columnas esperadas (barcode, sku_ml)
-    - si no calza, intenta recrearla (es seguro: se reconstruye desde el maestro)
+    FIX:
+    - Antes se cerraba la conexión al salir del `with db_conn(...)` y después se seguía usando
+      el cursor/conn => no persistía bien y podía romper los mapeos.
     """
     if not barcode_to_sku:
         return
+
     with db_conn(commit=True) as conn:
         c = conn.cursor()
-    try:
-        # asegurar tabla/columnas
-        c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes (
-            barcode TEXT PRIMARY KEY,
-            sku_ml TEXT
-        );""")
-        cols = [r[1] for r in c.execute("PRAGMA table_info(sku_barcodes);").fetchall()]
-        if "barcode" not in cols or ("sku_ml" not in cols):
-            try:
-                c.execute("ALTER TABLE sku_barcodes RENAME TO sku_barcodes_old;")
-            except Exception:
-                pass
-            c.execute("DROP TABLE IF EXISTS sku_barcodes;")
-            c.execute("""CREATE TABLE IF NOT EXISTS sku_barcodes (
+
+        # Asegurar tabla
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS sku_barcodes (
                 barcode TEXT PRIMARY KEY,
                 sku_ml TEXT
-            );""")
-    except Exception:
-        # si no podemos asegurar schema, no bloqueamos la app
-        return
+            );"""
+        )
 
-    try:
-        c.execute("BEGIN;")
+        # Insert/replace
         for bc, sku in barcode_to_sku.items():
             bc = only_digits(bc)
             if not bc:
                 continue
-            c.execute("INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)", (bc, str(sku).strip()))
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-
+            c.execute(
+                "INSERT OR REPLACE INTO sku_barcodes (barcode, sku_ml) VALUES (?, ?)",
+                (bc, str(sku).strip())
+            )
 
 def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
     raw = str(scan).strip()
@@ -1213,34 +1196,45 @@ def import_publication_links_excel(file) -> pd.DataFrame:
     return out[["sku_ml", "ml_item_id", "title", "link"]]
 
 def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
-    """Guarda/actualiza publicaciones en DB. Retorna (ok, sin_id)."""
+    """Guarda/actualiza publicaciones en DB. Retorna (ok, sin_id).
+
+    FIX:
+    - Antes se creaba el cursor dentro de un `with db_conn(...)` y luego se usaba fuera,
+      con la conexión ya cerrada => NO se guardaban publicaciones y quedabas sin imágenes.
+    """
     if df_pub is None or df_pub.empty:
         return 0, 0
+
     ok = 0
     noid = 0
+
     with db_conn(commit=True) as conn:
         c = conn.cursor()
-    for _, r in df_pub.iterrows():
-        sku = normalize_sku(r.get("sku_ml", ""))
-        if not sku:
-            continue
-        item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
-        title = str(r.get("title", "") or "").strip()
-        link = str(r.get("link", "") or "").strip()
-        if not item_id:
-            noid += 1
-        c.execute(
-            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
-               VALUES (?,?,?,?,?)
-               ON CONFLICT(sku_ml) DO UPDATE SET
-                 ml_item_id=excluded.ml_item_id,
-                 title=excluded.title,
-                 link=excluded.link,
-                 updated_at=excluded.updated_at
-            """,
-            (sku, item_id, title, link, now_iso())
-        )
-        ok += 1
+        for _, r in df_pub.iterrows():
+            sku = normalize_sku(r.get("sku_ml", ""))
+            if not sku:
+                continue
+
+            item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
+            title = str(r.get("title", "") or "").strip()
+            link = str(r.get("link", "") or "").strip()
+
+            if not item_id:
+                noid += 1
+
+            c.execute(
+                """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(sku_ml) DO UPDATE SET
+                     ml_item_id=excluded.ml_item_id,
+                     title=excluded.title,
+                     link=excluded.link,
+                     updated_at=excluded.updated_at
+                """,
+                (sku, item_id, title, link, now_iso())
+            )
+            ok += 1
+
     return ok, noid
 
 def get_publication_row(sku: str) -> dict:
