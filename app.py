@@ -31,16 +31,13 @@ PICKING_TABLES = [
     "picking_incidences",
     "cortes_tasks",
     "ot_orders",
-    "sorting_status",
 ]
 FULL_TABLES = [
     "full_batches","full_batch_items","full_incidences"
 ]
 SORTING_TABLES = [
-    # Sorting v1
-    "sorting_manifests","sorting_runs","sorting_run_items","sorting_labels",
-    # Sorting v2 (control + etiquetas + corridas)
-    "s2_manifests","s2_files","s2_page_assign","s2_sales","s2_items","s2_labels","s2_pack_ship"
+    # Sorting v2 (único)
+    "s2_manifests","s2_files","s2_sales","s2_items","s2_page_assign","s2_labels","s2_packing","s2_pack_ship","s2_dispatch",
 ]
 
 
@@ -706,19 +703,6 @@ def init_db():
         order_id INTEGER
     );
     """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_status (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ot_id INTEGER,
-        order_id INTEGER,
-        status TEXT,
-        marked_at TEXT,
-        mesa INTEGER,
-        printed_at TEXT
-    );
-    """)
-
     # Maestro EAN/SKU (común)
     # Maestro EAN/SKU (común)
     c.execute("""
@@ -773,7 +757,6 @@ def init_db():
         ml_item_id TEXT,
         title TEXT,
         link TEXT,
-        img_url TEXT,
         updated_at TEXT
     );
     """)
@@ -842,60 +825,6 @@ def init_db():
         created_at TEXT
     );
     """)
-
-    # --- SORTING (Camarero) ---
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_manifests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        created_at TEXT,
-        status TEXT  -- ACTIVE / DONE
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        manifest_id INTEGER,
-        page_no INTEGER,
-        mesa INTEGER,
-        status TEXT, -- PENDING / IN_PROGRESS / DONE
-        created_at TEXT,
-        closed_at TEXT,
-        UNIQUE(manifest_id, page_no)
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_run_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id INTEGER,
-        seq INTEGER,
-        ml_order_id TEXT,
-        pack_id TEXT,
-        sku TEXT,
-        title_ml TEXT,
-        title_tec TEXT,
-        qty INTEGER,
-        buyer TEXT,
-        address TEXT,
-        shipment_id TEXT,
-        status TEXT, -- PENDING / DONE / INCIDENCE
-        done_at TEXT,
-        incidence_note TEXT
-    );
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sorting_labels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        manifest_id INTEGER,
-        pack_id TEXT,
-        shipment_id TEXT,
-        buyer TEXT,
-        address TEXT,
-        raw TEXT,
-        UNIQUE(manifest_id, pack_id)
-    );
-    """)
-
     # --- MIGRACIONES SUAVES (para BD antiguas) ---
     def _cols(table: str) -> set:
         try:
@@ -921,43 +850,6 @@ def init_db():
     _ensure_col("picking_ots", "model", "TEXT")
     _ensure_col("picking_incidences", "note", "TEXT")
 
-# sorting_manifests
-    _ensure_col("sorting_manifests", "name", "TEXT")
-    _ensure_col("sorting_manifests", "created_at", "TEXT")
-    _ensure_col("sorting_manifests", "status", "TEXT")
-
-    # sorting_runs
-    _ensure_col("sorting_runs", "manifest_id", "INTEGER")
-    _ensure_col("sorting_runs", "page_no", "INTEGER")
-    _ensure_col("sorting_runs", "mesa", "INTEGER")
-    _ensure_col("sorting_runs", "status", "TEXT")
-    _ensure_col("sorting_runs", "created_at", "TEXT")
-    _ensure_col("sorting_runs", "closed_at", "TEXT")
-
-    # sorting_run_items
-    _ensure_col("sorting_run_items", "run_id", "INTEGER")
-    _ensure_col("sorting_run_items", "seq", "INTEGER")
-    _ensure_col("sorting_run_items", "ml_order_id", "TEXT")
-    _ensure_col("sorting_run_items", "pack_id", "TEXT")
-    _ensure_col("sorting_run_items", "sku", "TEXT")
-    _ensure_col("sorting_run_items", "title_ml", "TEXT")
-    _ensure_col("sorting_run_items", "title_tec", "TEXT")
-    _ensure_col("sorting_run_items", "qty", "INTEGER")
-    _ensure_col("sorting_run_items", "buyer", "TEXT")
-    _ensure_col("sorting_run_items", "address", "TEXT")
-    _ensure_col("sorting_run_items", "shipment_id", "TEXT")
-    _ensure_col("sorting_run_items", "status", "TEXT")
-    _ensure_col("sorting_run_items", "done_at", "TEXT")
-    _ensure_col("sorting_run_items", "incidence_note", "TEXT")
-
-    # sorting_labels
-    _ensure_col("sorting_labels", "manifest_id", "INTEGER")
-    _ensure_col("sorting_labels", "pack_id", "TEXT")
-    _ensure_col("sorting_labels", "shipment_id", "TEXT")
-    _ensure_col("sorting_labels", "buyer", "TEXT")
-    _ensure_col("sorting_labels", "address", "TEXT")
-    _ensure_col("sorting_labels", "raw", "TEXT")
-
 
     # sku_publications
     _ensure_col("sku_publications", "sku_ml", "TEXT")
@@ -966,19 +858,9 @@ def init_db():
     _ensure_col("sku_publications", "link", "TEXT")
     _ensure_col("sku_publications", "updated_at", "TEXT")
 
-    # Asegurar índices/constraints para UPSERT (BD antiguas)
-    try:
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sorting_labels_manifest_pack ON sorting_labels(manifest_id, pack_id);")
-    except Exception:
-        pass
-    try:
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sorting_runs_manifest_page ON sorting_runs(manifest_id, page_no);")
-    except Exception:
-        pass
 
     conn.commit()
     conn.close()
-
 
 # =========================
 # MAESTRO SKU/EAN (AUTO)
@@ -1014,7 +896,7 @@ def load_master_from_path(path: str) -> tuple[dict, dict, dict, list]:
             break
 
     barcode_col = None
-    for cand in ["codigo de barras", "código de barras", "barcode", "ean", "eans"]:
+    for cand in ["codigos de barras", "códigos de barras", "codigo de barras", "código de barras", "barcode", "ean", "eans"]:
         if cand in lower:
             barcode_col = cols[lower.index(cand)]
             break
@@ -1265,8 +1147,26 @@ def upsert_barcodes_to_db(barcode_to_sku: dict):
 def resolve_scan_to_sku(scan: str, barcode_to_sku: dict) -> str:
     raw = str(scan).strip()
     digits = only_digits(raw)
-    if digits and digits in barcode_to_sku:
+
+    # 1) Prefer in-memory map loaded from maestro
+    if digits and digits in (barcode_to_sku or {}):
         return barcode_to_sku[digits]
+
+    # 2) Fallback to DB map (persists across reruns)
+    if digits:
+        try:
+            conn = get_conn()
+            row = conn.execute("SELECT sku_ml FROM sku_barcodes WHERE barcode=?", (digits,)).fetchone()
+            conn.close()
+            if row and row[0]:
+                return str(row[0]).strip()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # 3) As last resort: treat scan as SKU text
     return normalize_sku(raw)
 
 
@@ -1363,9 +1263,6 @@ def import_publication_links_excel(file) -> pd.DataFrame:
     out["sku_ml"] = df[sku_c].astype(str).map(normalize_sku)
     out["title"] = df[title_c].astype(str).fillna("").map(lambda x: str(x).strip()) if title_c else ""
     out["link"] = df[link_c].astype(str).fillna("").map(lambda x: str(x).strip()) if link_c else ""
-    # imagen (opcional): columna IMG_URL / img_url / imagen
-    img_c = cols.get("img_url") or cols.get("img") or cols.get("imagen") or cols.get("image")
-    out["img_url"] = df[img_c].astype(str).fillna("").map(lambda x: str(x).strip()) if img_c else ""
     # item id: preferir Id, si no, extraer desde link
     if id_c:
         out["ml_item_id"] = df[id_c].astype(str).fillna("").map(extract_ml_item_id)
@@ -1394,20 +1291,18 @@ def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
         item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
         title = str(r.get("title", "") or "").strip()
         link = str(r.get("link", "") or "").strip()
-        img_url = str(r.get("img_url", "") or "").strip()
         if not item_id:
             noid += 1
         c.execute(
-            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, img_url, updated_at)
-               VALUES (?,?,?,?,?,?)
+            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
+               VALUES (?,?,?,?,?)
                ON CONFLICT(sku_ml) DO UPDATE SET
                  ml_item_id=excluded.ml_item_id,
                  title=excluded.title,
                  link=excluded.link,
-                 img_url=CASE WHEN excluded.img_url IS NOT NULL AND excluded.img_url<>'' THEN excluded.img_url ELSE sku_publications.img_url END,
                  updated_at=excluded.updated_at
             """,
-            (sku, item_id, title, link, img_url, now_iso())
+            (sku, item_id, title, link, now_iso())
         )
         ok += 1
     conn.commit()
@@ -1420,241 +1315,55 @@ def get_publication_row(sku: str) -> dict:
         return {}
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT sku_ml, ml_item_id, title, link, img_url, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
+    c.execute("SELECT sku_ml, ml_item_id, title, link, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
     row = c.fetchone()
     conn.close()
     if not row:
         return {}
-    return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "img_url": row[4], "updated_at": row[5]}
+    return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
 
-import streamlit as st
-import requests
-import re
-
-def debug_fetch_ml_html(url: str):
-    st.write("### 🧪 Debug HTML MercadoLibre (desde Streamlit Cloud)")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-CL,es;q=0.9,en;q=0.7",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
-    try:
-        r = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
-        html = r.text or ""
-        st.write("Status:", r.status_code)
-        st.write("Len HTML:", len(html))
-        st.write("Contiene mlstatic?:", ("mlstatic.com" in html))
-        st.write("Contiene D_NQ_NP?:", ("D_NQ_NP" in html))
-        st.write("Contiene ui-pdp-image?:", ("ui-pdp-image" in html))
-
-        # Busca pistas típicas de "estado" embebido
-        hints = ["__PRELOADED_STATE__", "__APOLLO_STATE__", "initialState", "apolloState", "preloadedState"]
-        found = [h for h in hints if h in html]
-        st.write("Hints state JSON:", found if found else "ninguna")
-
-        # Muestra un extracto alrededor de 'mlstatic' o de una hint
-        snippet = ""
-        if "mlstatic.com" in html:
-            idx = html.find("mlstatic.com")
-            snippet = html[max(0, idx-400): idx+800]
-        elif found:
-            idx = html.find(found[0])
-            snippet = html[max(0, idx-400): idx+1200]
-        else:
-            snippet = html[:1500]
-
-        st.code(snippet)
-
-        # Opción: descargar HTML completo
-        st.download_button(
-            "⬇️ Descargar HTML capturado",
-            data=html.encode("utf-8", errors="ignore"),
-            file_name="ml_captured.html",
-            mime="text/html"
-        )
-
-    except Exception as e:
-        st.error(f"Error: {e}")
-
-# UI simple
-st.markdown("## 🧪 Capturar HTML desde Cloud")
-test_link = st.text_input("Pega aquí el link de una publicación ML")
-if st.button("Capturar"):
-    if test_link.strip():
-        debug_fetch_ml_html(test_link.strip())
-    else:
-        st.warning("Pega un link primero.")
-# =========================
-# IMÁGENES DE PUBLICACIONES (sin API)
-# =========================
-
-# Regex tolerantes (no dependen del orden de atributos)
-_META_IMG_RE = re.compile(
-    r'<meta[^>]+(?:property|name)=[\"\'](?:og:image(?::secure_url)?|twitter:image(?::src)?)'
-    r'[\\"\'][^>]+content=[\"\']([^"\']+)[\"\']',
+OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
     re.IGNORECASE
 )
 
-# Captura URLs de imágenes de ML embebidas en HTML/JSON (sin ejecutar JS)
-_MLSTATIC_IMG_RE = re.compile(
-    r'https?://[^"\'\s>]*mlstatic\.com/[^"\'\s>]+\.(?:webp|jpg|png)',
-    re.IGNORECASE
-)
-
-_BAD_IMG_HINTS = ("logo", "favicon", "sprite", "icon", "analytics", "tracking", "pixel", "data:image")
-
-def _score_ml_image_url(url: str) -> int:
-    u = (url or "").strip().lower()
-    if not u:
-        return -999
-    score = 0
-    if "mlstatic.com" in u:
-        score += 30
-    if "d_nq_np" in u:
-        score += 80
-    # prioriza Chile cuando exista
-    if "-mlc" in u:
-        score += 50
-    elif "-mla" in u or "-mlu" in u:
-        score += 15
-    # calidad/tamaño
-    if "2x_" in u:
-        score += 10
-    if u.endswith((".webp", ".jpg", ".png")):
-        score += 5
-    if any(b in u for b in _BAD_IMG_HINTS):
-        score -= 400
-    return score
-
-def _pick_best_image(candidates: list[str]) -> str:
-    cands = []
-    seen = set()
-    for c in (candidates or []):
-        if not c:
-            continue
-        cc = str(c).strip()
-        if not cc or cc in seen:
-            continue
-        seen.add(cc)
-        # filtra basura obvia
-        ul = cc.lower()
-        if any(b in ul for b in _BAD_IMG_HINTS):
-            continue
-        cands.append(cc)
-    if not cands:
-        return ""
-    cands.sort(key=_score_ml_image_url, reverse=True)
-    best = cands[0]
-    return best if _score_ml_image_url(best) >= 40 else ""
-
-@st.cache_data(show_spinner=False, ttl=6*3600)
+@st.cache_data(show_spinner=False, ttl=24*3600)
 def publication_main_image_from_html(link: str) -> str:
-    """Devuelve 1 URL de imagen principal leyendo HTML público (sin API).
+    """Devuelve 1 URL de imagen principal leyendo og:image desde el HTML de la publicación.
 
-    Nota: en Streamlit Cloud, MercadoLibre a veces entrega HTML distinto; por eso
-    guardamos la imagen encontrada en DB (lazy-cache) para no recalcular siempre.
+    Sin API: solo usa el link público de Mercado Libre.
     """
     url = (link or "").strip()
     if not url:
         return ""
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.7",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Accept-Encoding": "gzip, deflate",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
         }
-        r = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
         if r.status_code != 200:
             return ""
         html_text = r.text or ""
-
-        candidates: list[str] = []
-
-        # 1) meta tags (og/twitter)
-        candidates += [m.group(1).strip() for m in _META_IMG_RE.finditer(html_text)]
-
-        # 2) URLs mlstatic embebidas (muchas veces vienen en JSON dentro del HTML)
-        # preferimos las que parecen de producto: incluyen D_NQ_NP o -MLA/-MLC/-MLU
-        for u in _MLSTATIC_IMG_RE.findall(html_text):
-            ul = u.lower()
-            if ("d_nq_np" in ul) or re.search(r"-(mlc|mla|mlu)\d+", ul):
-                candidates.append(u)
-
-        # 3) fallback: cualquier mlstatic (filtrado por score)
-        if not candidates:
-            candidates += _MLSTATIC_IMG_RE.findall(html_text)
-
-        return _pick_best_image(candidates)
+        m = OG_IMAGE_RE.search(html_text)
+        return m.group(1).strip() if m else ""
     except Exception:
         return ""
-
-def _ensure_publications_img_col():
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        _ensure_col("sku_publications", "img_url", "TEXT")
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
     """Retorna (urls, link_publicacion).
 
-    Primero usa img_url guardada en DB/Excel (estable). Si falta, intenta
-    extraer desde HTML público y guarda el resultado (lazy-cache).
+    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
     """
-    _ensure_publications_img_col()
     row = get_publication_row(sku)
     if not row:
         return [], ""
     link = (row.get("link") or "").strip()
     if not link:
         return [], ""
-
-    # 1) si ya tenemos img_url persistida, usarla directo
-    persisted = str(row.get("img_url") or "").strip()
-    if persisted:
-        return [persisted], link
-
-    # 2) si no, intentar extraer (best-effort) y persistir
     img = publication_main_image_from_html(link)
-    if img:
-        try:
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("UPDATE sku_publications SET img_url=?, updated_at=? WHERE sku_ml=?", (img, now_iso(), normalize_sku(sku)))
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
-        return [img], link
-
-    return [], link
-
-
-def st_show_image_url(url: str, *, max_width_px: int = 520, radius_px: int = 10):
-    """Muestra imagen por HTML (<img>), evitando problemas de WEBP en Streamlit Cloud."""
-    u = (url or "").strip()
-    if not u:
-        return
-    st.markdown(
-        f"""
-        <div style="text-align:center;">
-          <img src="{html.escape(u)}"
-               style="max-width:{int(max_width_px)}px; width:100%; height:auto; border-radius:{int(radius_px)}px;" />
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-# =========================
+    urls = [img] if img else []
+    return urls, link# =========================
 # CORTES (lista de SKUs)
 # =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
@@ -1978,7 +1687,7 @@ def save_orders_and_build_ots(
       - "VENTAS" (actual): reparte ventas por OT y crea tareas por SKU dentro de esas ventas.
       - "SKU" (nuevo): agrupa SKUs por Familia (desde maestro) y asigna familias a OTs (batch picking).
         Nota: para evitar conflictos con pantallas antiguas, igual se mantiene la asignación de ventas->OT
-        en ot_orders/sorting_status, pero las tareas de picking se construyen por familia/SKU.
+        en ot_orders (registro de ventas por OT), pero las tareas de picking se construyen por familia/SKU.
     """
     model = (model or "VENTAS").upper().strip()
     if model not in ("VENTAS", "SKU"):
@@ -1997,7 +1706,6 @@ def save_orders_and_build_ots(
     c.execute("DELETE FROM picking_incidences;")
     c.execute("DELETE FROM cortes_tasks;")
     c.execute("DELETE FROM ot_orders;")
-    c.execute("DELETE FROM sorting_status;")
     c.execute("DELETE FROM picking_ots;")
     c.execute("DELETE FROM pickers;")
 
@@ -2061,10 +1769,6 @@ def save_orders_and_build_ots(
         order_id = order_id_by_ml[ml_order_id]
         mesa = (idx % NUM_MESAS) + 1
         c.execute("INSERT INTO ot_orders (ot_id, order_id) VALUES (?,?)", (ot_id, order_id))
-        c.execute("""
-            INSERT INTO sorting_status (ot_id, order_id, status, marked_at, mesa, printed_at)
-            VALUES (?,?,?,?,?,?)
-        """, (ot_id, order_id, "PENDING", None, mesa, None))
 
     if model == "VENTAS":
         # === Modelo actual (sin cambios) ===
@@ -2115,92 +1819,52 @@ def save_orders_and_build_ots(
                     break
             title_ml_by_sku[sku] = t
 
-                # Prefijos (SKU base -> Familia) para inferir packs/variantes sin Familia
-        _fam_bases = [
-            (normalize_sku(k), str(v).strip())
-            for k, v in (familia_map_sku or {}).items()
-            if str(v or "").strip() and str(v).strip().lower() != "nan"
-        ]
-        # Evitar prefijos demasiado cortos que podrían mezclar familias
-        _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
-        _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
-
-        # Índice por prefijo dominante: prefix -> (best_fam, share, n)
-        _pref_counts = {}
-        for _sku_base, _fam_base in _fam_bases:
-            _maxL = min(len(_sku_base), 10)
-            for _L in range(4, _maxL + 1):
-                _p = _sku_base[:_L]
-                if _p not in _pref_counts:
-                    _pref_counts[_p] = {}
-                _pref_counts[_p][_fam_base] = _pref_counts[_p].get(_fam_base, 0) + 1
-
-        _fam_pref_index = {}
-        for _p, _cnts in _pref_counts.items():
-            _total = sum(_cnts.values())
-            if _total <= 0:
-                continue
-            _best_fam = max(_cnts.items(), key=lambda kv: kv[1])[0]
-            _best_n = _cnts[_best_fam]
-            _share = _best_n / _total
-            _fam_pref_index[_p] = (_best_fam, _share, _total)
-
-        def _fam_for_sku(sku: str) -> str:
-            """Familia efectiva:
-            1) Familia directa del maestro
-            2) Inferencia por prefijo dominante (packs/variantes)
-            3) Fallback: SKU base con familia más largo que sea prefijo
-            """
-            ssku = normalize_sku(sku)
-
-            # 1) directa
-            f = str(familia_map_sku.get(ssku, "") or "").strip()
+        # Prefijos (SKU base -> Familia) para inferir packs sin Familia (prefijo más largo)
+        _fam_bases = []
+        try:
+            _fam_bases = [
+                (normalize_sku(k), str(v).strip())
+                for k, v in (familia_map_sku or {}).items()
+                if str(v or "").strip() and str(v).strip().lower() != "nan"
+            ]
+            # Evitar prefijos demasiado cortos que podrían mezclar familias
+            _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
+            _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
+        except Exception:
+            _fam_bases = []
+    def _fam_for_sku(sku: str) -> str:
+            # 1) Familia directa en maestro
+            f = str(familia_map_sku.get(sku, "") or "").strip()
             if f and f.lower() != "nan":
                 return f
+
+            # 2) Fallback: inferir por "prefijo más largo" (packs)
+            # Busca un SKU base del maestro (con familia) que sea prefijo del SKU actual.
+            ssku = normalize_sku(sku)
             if not ssku:
                 return "Sin Familia"
-
-            # 2) prefijo dominante (probamos de largo a corto)
-            _maxL = min(len(ssku), 10)
-            for _L in range(_maxL, 3, -1):
-                _p = ssku[:_L]
-                if _p in _fam_pref_index:
-                    fam, share, n = _fam_pref_index[_p]
-                    if n >= 2 and share >= 0.70:
-                        return fam
-
-            # 3) fallback: SKU base más largo prefijo completo
             for base_sku, base_fam in _fam_bases:
                 if ssku != base_sku and ssku.startswith(base_sku):
                     return base_fam
-
             return "Sin Familia"
 
-        dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
+    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
 
-
+    # totales por familia+sku
     grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
     grp["qty"] = grp["qty"].astype(int)
 
     # 2) asignar familias a OTs (greedy balance por unidades)
-    # 2) asignar grupos a OTs (greedy balance por unidades)
-    #    - Familias normales se asignan completas
-    #    - "Sin Familia" se divide en subgrupos por prefijo para no cargar todo a un solo picker
-    grp = grp.copy()
-    grp["assign_group"] = grp.apply(
-        lambda r: ("SF:" + str(r["sku_ml"])[:4]) if str(r["family"]) == "Sin Familia" else str(r["family"]),
-        axis=1
-    )
-    group_weights = grp.groupby("assign_group")["qty"].sum().to_dict()
-    group_list = sorted(group_weights.items(), key=lambda x: x[1], reverse=True)
+    fam_weights = grp.groupby("family")["qty"].sum().to_dict()
+    fam_list = sorted(fam_weights.items(), key=lambda x: x[1], reverse=True)
 
     ot_load = {ot_id: 0 for ot_id in ot_ids}
     ot_fams = {ot_id: [] for ot_id in ot_ids}
 
-    for grp_key, w in group_list:
+    for fam, w in fam_list:
         # ot menos cargada
         target_ot = min(ot_load.items(), key=lambda kv: kv[1])[0]
-        ot_fams[target_ot].append(grp_key)
+        ot_fams[target_ot].append(fam)
         ot_load[target_ot] += int(w or 0)
 
     # 3) Insertar tareas por OT
@@ -2208,7 +1872,7 @@ def save_orders_and_build_ots(
         fams = ot_fams.get(ot_id, [])
         if not fams:
             continue
-        sub = grp[grp["assign_group"].isin(fams)].copy()
+        sub = grp[grp["family"].isin(fams)].copy()
         # orden: familia, sku
         try:
             sub["sku_int"] = sub["sku_ml"].map(lambda x: int(x) if str(x).isdigit() else 10**18)
@@ -2675,7 +2339,7 @@ def page_picking():
     except Exception:
         pics, pub_link = [], ""
     if pics:
-        st_show_image_url(pics[0])
+        st.image(pics[0], use_container_width=True)
         if len(pics) > 1:
             with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
                 st.image(pics, use_container_width=True)
@@ -3931,7 +3595,6 @@ def page_admin():
             if st.button("✅ Sí, borrar todo y reiniciar"):
                 c.execute("DELETE FROM picking_tasks;")
                 c.execute("DELETE FROM picking_incidences;")
-                c.execute("DELETE FROM sorting_status;")
                 c.execute("DELETE FROM ot_orders;")
                 c.execute("DELETE FROM picking_ots;")
                 c.execute("DELETE FROM pickers;")
@@ -3949,338 +3612,6 @@ def page_admin():
                 st.rerun()
 
     conn.close()
-
-# =========================
-# SORTING (CAMARERO)
-# =========================
-
-
-def get_active_sorting_manifest():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT id, name, created_at, status FROM sorting_manifests WHERE status='ACTIVE' ORDER BY id DESC LIMIT 1;")
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"id": row[0], "name": row[1], "created_at": row[2], "status": row[3]}
-
-def create_sorting_manifest(name: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO sorting_manifests (name, created_at, status) VALUES (?,?, 'ACTIVE');", (name, now_iso()))
-    mid = c.lastrowid
-    conn.commit()
-    conn.close()
-    return mid
-
-def mark_manifest_done(manifest_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE sorting_manifests SET status='DONE' WHERE id=?;", (manifest_id,))
-    conn.commit()
-    conn.close()
-
-def decode_fh(text: str) -> str:
-    # ZPL ^FH uses _HH hex escapes
-    def repl(m):
-        try:
-            return bytes([int(m.group(1), 16)]).decode("latin-1")
-        except Exception:
-            return m.group(0)
-    return re.sub(r"_(..)", repl, text)
-
-def clean_address(text: str) -> str:
-    if not text:
-        return ""
-    t = decode_fh(text)
-
-    # remove JSON objects from QR payloads if present
-    t = re.sub(r"\{.*?\}", "", t)
-
-    # normalize separators
-    t = t.replace("->", " ")
-    t = t.replace("|", " ")
-    t = t.replace(";", " ")
-
-    # hard-cut promotional/UX sentences sometimes embedded in labels
-    low = t.lower()
-    promo_tokens = [
-        "despacha tus productos",
-        "no te relajes",
-        "tu comprador",
-        "está esperando",
-        "esta esperando",
-    ]
-    cut_at = None
-    for tok in promo_tokens:
-        i = low.find(tok)
-        if i != -1:
-            cut_at = i if cut_at is None else min(cut_at, i)
-    if cut_at is not None:
-        if cut_at == 0:
-            return ""
-        t = t[:cut_at]
-
-    t = re.sub(r"\s+", " ", t).strip()
-
-    # cut off technical tails often present
-    t = re.sub(r"\s*\(\s*Liberador.*$", "", t, flags=re.IGNORECASE).strip()
-    return t
-
-def parse_zpl_labels(raw: str):
-    # Returns dict pack_id -> {shipment_id,buyer,address,raw}
-    # and dict shipment_id -> same (for FLEX QR)
-    pack_map = {}
-    ship_map = {}
-
-    # collect ^FD...^FS fields and decode ^FH content
-    fd = re.findall(r"\^FD(.*?)\^FS", raw, flags=re.DOTALL)
-    fd = [decode_fh(x.replace("\n"," ").replace("\r"," ").strip()) for x in fd if x]
-    joined = " ".join(fd)
-
-    # Split by ^XA/^XZ blocks
-    blocks = re.split(r"\^XA", raw)
-    for b in blocks:
-        if "^XZ" not in b:
-            continue
-        # shipment id from barcode
-        ship = None
-        m = re.search(r"\^FD>:\s*(\d{6,20})", b)
-        if m:
-            ship = m.group(1)
-        # shipment id from QR JSON
-        if not ship:
-            m = re.search(r'"id"\s*:\s*"(\d{6,20})"', b)
-            if m:
-                ship = m.group(1)
-
-        # pack id (may be split across fields)
-        pack = None
-        # try "Pack ID:" with digits/spaces following
-        dec_b = decode_fh(b.replace("\n"," ").replace("\r"," "))
-        m = re.search(r"Pack ID:\s*([0-9 ]{6,30})", dec_b)
-        if m:
-            pack = re.sub(r"\s+", "", m.group(1))
-        # fallback: if we see a 17-18 digit starting with 20000
-        if not pack:
-            m = re.search(r"\b(20000\d{7,20})\b", dec_b)
-            if m:
-                pack = m.group(1)
-
-        # buyer and address heuristics
-        buyer = None
-        addr = None
-        # buyer often appears after ' - ' near end
-        m = re.search(r"\b([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)?)\s*\(", dec_b)
-        if m:
-            buyer = m.group(1).strip()
-        # domicile/address text
-        m = re.search(r"Domicilio:\s*([^\^]+?)(?:Ciudad de destino:|Despacha tus productos|\^FS|$)", dec_b, flags=re.IGNORECASE)
-        if m:
-            addr = clean_address(m.group(1))
-        else:
-            # try line that contains comuna / ciudad
-            m = re.search(r"(?:\bComuna\b|\bCiudad\b|\bRM\b).{10,200}", dec_b)
-            if m:
-                addr = clean_address(m.group(0))
-
-        rec = {"pack_id": pack, "shipment_id": ship, "buyer": buyer, "address": addr, "raw": b}
-        if pack:
-            pack_map[pack] = rec
-        if ship:
-            ship_map[ship] = rec
-
-    return pack_map, ship_map
-
-def parse_control_pdf_by_page(pdf_file):
-    """Parsea Control.pdf (Flex/Colecta) por página.
-
-    Soporta 2 formatos principales:
-    - **Colecta / Identificación Productos**: bloques con Pack ID / Venta / (Comprador) / SKU / Cantidad (puede traer múltiples SKU por venta)
-    - **Flex (y a veces Colecta)**: líneas con envío (shipment id) y luego Venta/Pack/SKU/Cantidad.
-
-    Devuelve:
-      [{"page_no": int, "items": [ {shipment_id, ml_order_id, pack_id, sku, qty, title_ml, buyer} ... ]}]
-    """
-    if not HAS_PDF_LIB:
-        st.error("Falta pdfplumber en el entorno.")
-        return None
-
-    def looks_like_name(s: str) -> bool:
-        s = (s or "").strip()
-        if not s:
-            return False
-        if len(s) > 60:
-            return False
-        # Evitar líneas tipo "Color: Blanco", etc.
-        if re.search(r"\b(color|acabado|modelo|di[aá]metro|voltaje|dise[nñ]o|tipo)\b\s*:", s, flags=re.I):
-            return False
-        # Debe tener letras
-        return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", s))
-
-    pages = []
-    with pdfplumber.open(pdf_file) as pdf:
-        for pno, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            lines = [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
-
-            items = []
-
-            # Contexto (se mantiene mientras cambian SKU/Cantidad)
-            ctx = {
-                "shipment_id": "",
-                "ml_order_id": None,
-                "pack_id": None,
-                "buyer": "",
-                "title_ml": "",
-            }
-
-            current_sku = None
-            current_title = ""
-
-            def push_item(sku, qty):
-                if not ctx.get("ml_order_id") or not sku or not qty:
-                    return
-                try:
-                    q = int(qty)
-                except Exception:
-                    return
-                items.append({
-                    "shipment_id": ctx.get("shipment_id", "") or "",
-                    "ml_order_id": str(ctx.get("ml_order_id")),
-                    "pack_id": (str(ctx.get("pack_id")) if ctx.get("pack_id") else None),
-                    "sku": str(sku),
-                    "qty": q,
-                    "title_ml": (ctx.get("title_ml") or current_title or "")[:200],
-                    "buyer": (ctx.get("buyer") or "")[:120],
-                })
-
-            # Heurística: en algunos PDFs vienen títulos al final; guardamos el último "título largo" como fallback.
-            for ln in lines:
-                # 1) shipment id (Flex) dentro de una línea tipo "4638.... <texto>"
-                m_ship = re.match(r"^(\d{8,15})\s+(.+)$", ln)
-                if m_ship and not ln.lower().startswith("venta"):
-                    ctx["shipment_id"] = m_ship.group(1)
-                    title = m_ship.group(2).strip()
-                    if title and len(title) >= 8:
-                        ctx["title_ml"] = title[:200]
-                    continue
-
-                # 2) Pack ID / Venta
-                m_pack = re.search(r"\bPack\s*ID:\s*([0-9]{10,20})\b", ln, flags=re.I)
-                if m_pack:
-                    ctx["pack_id"] = m_pack.group(1)
-                    # a veces trae SKU en la misma línea
-                    m_pack_sku = re.search(r"\bSKU:\s*([0-9A-Za-z_-]+)\b", ln, flags=re.I)
-                    if m_pack_sku:
-                        current_sku = m_pack_sku.group(1)
-                    continue
-
-                m_sale = re.search(r"\bVenta:\s*([0-9]{10,20})\b", ln, flags=re.I)
-                if m_sale:
-                    ctx["ml_order_id"] = m_sale.group(1)
-                    # En algunos casos viene un SKU y Cantidad en la misma línea
-                    m_sale_sku = re.search(r"\bSKU:\s*([0-9A-Za-z_-]+)\b", ln, flags=re.I)
-                    if m_sale_sku:
-                        current_sku = m_sale_sku.group(1)
-                    m_sale_qty = re.search(r"\bCantidad:\s*(\d+)\b", ln, flags=re.I)
-                    if m_sale_qty and current_sku:
-                        push_item(current_sku, m_sale_qty.group(1))
-                        current_sku = None
-                    continue
-
-                # 3) SKU (línea sola)
-                m_sku = re.match(r"^SKU:\s*([0-9A-Za-z_-]+)\b", ln, flags=re.I)
-                if m_sku:
-                    current_sku = m_sku.group(1)
-                    continue
-
-                # 4) Cantidad (línea sola) -> si hay current_sku, crea item
-                m_qty = re.match(r"^Cantidad:\s*(\d+)\b", ln, flags=re.I)
-                if m_qty:
-                    if current_sku:
-                        push_item(current_sku, m_qty.group(1))
-                        current_sku = None
-                    continue
-
-                # 5) Comprador (suele venir justo después de Venta)
-                if looks_like_name(ln):
-                    # Si aún no hay buyer y ya hay venta, lo tomamos
-                    if ctx.get("ml_order_id") and not ctx.get("buyer"):
-                        ctx["buyer"] = ln[:120]
-                        continue
-
-                # 6) Guardar posible título largo como fallback
-                if len(ln) >= 18 and ":" not in ln and not re.match(r"^(Despacha|Identif|Pack\s*ID|Venta:|SKU:|Cantidad:)", ln, flags=re.I):
-                    current_title = ln[:200]
-
-            pages.append({"page_no": pno, "items": items})
-
-    return pages
-
-def upsert_labels_to_db(manifest_id: int, pack_map: dict, raw: str):
-    conn = get_conn()
-    c = conn.cursor()
-    for pack_id, rec in pack_map.items():
-        c.execute(
-            """INSERT INTO sorting_labels (manifest_id, pack_id, shipment_id, buyer, address, raw)
-                 VALUES (?,?,?,?,?,?)
-                 ON CONFLICT(manifest_id, pack_id) DO UPDATE SET
-                    shipment_id=excluded.shipment_id,
-                    buyer=excluded.buyer,
-                    address=excluded.address,
-                    raw=excluded.raw;""",
-            (manifest_id, pack_id, rec.get("shipment_id"), rec.get("buyer"), rec.get("address"), raw)
-        )
-    conn.commit()
-    conn.close()
-
-def create_runs_and_items(manifest_id: int, assignments: dict, pages: list, inv_map_sku: dict, barcode_to_sku: dict):
-    # assignments: page_no -> mesa
-    conn = get_conn()
-    c = conn.cursor()
-    # load labels for this manifest
-    c.execute("SELECT pack_id, shipment_id, buyer, address FROM sorting_labels WHERE manifest_id=?;", (manifest_id,))
-    label_rows = c.fetchall()
-    labels = {r[0]: {"shipment_id": r[1], "buyer": r[2], "address": r[3]} for r in label_rows}
-
-    for page in pages:
-        pno = page["page_no"]
-        mesa = assignments.get(pno)
-        if not mesa:
-            continue
-        c.execute(
-            "INSERT OR IGNORE INTO sorting_runs (manifest_id, page_no, mesa, status, created_at) VALUES (?,?,?,?,?);",
-            (manifest_id, pno, int(mesa), "PENDING", now_iso())
-        )
-        c.execute("SELECT id FROM sorting_runs WHERE manifest_id=? AND page_no=?;", (manifest_id, pno))
-        run_id = c.fetchone()[0]
-        # clear previous items if re-created
-        c.execute("DELETE FROM sorting_run_items WHERE run_id=?;", (run_id,))
-        for it in page["items"]:
-            sku = str(it.get("sku") or "").strip()
-            title_ml = (it.get("title_ml") or "").strip()
-            # translate using maestro
-            title_tec = inv_map_sku.get(sku, "") if inv_map_sku else ""
-            buyer = it.get("buyer") or ""
-            pack_id = it.get("pack_id") or ""
-            ship = labels.get(pack_id, {}).get("shipment_id") if pack_id else None
-            addr = labels.get(pack_id, {}).get("address") if pack_id else None
-            buyer2 = labels.get(pack_id, {}).get("buyer") if pack_id else None
-            if buyer2 and not buyer:
-                buyer = buyer2
-            c.execute(
-                """INSERT INTO sorting_run_items
-                    (run_id, seq, ml_order_id, pack_id, sku, title_ml, title_tec, qty, buyer, address, shipment_id, status)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?, 'PENDING');""",
-                (run_id, it["seq"], it.get("ml_order_id"), pack_id, sku, title_ml, title_tec, int(it.get("qty") or 1),
-                 buyer, addr, ship)
-            )
-    conn.commit()
-    conn.close()
-
-
 
 def _s2_now_iso():
     # Timestamp en hora Chile con offset
@@ -5249,22 +4580,6 @@ def _s2_reset_all_sorting():
     for t in s2_tables:
         c.execute(f"DELETE FROM {t};")
 
-    # Legacy sorting tables (kept for backward compat in older code paths)
-    legacy = [
-        "sorting_run_items",
-        "sorting_runs",
-        "sorting_labels",
-        "sorting_manifests",
-        "sorting_status",
-    ]
-    for t in legacy:
-        try:
-            c.execute(f"DELETE FROM {t};")
-        except Exception:
-            pass
-
-    conn.commit()
-
 
 def _s2_get_pages(mid:int):
     conn=get_conn()
@@ -5670,7 +4985,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             except Exception:
                 pics, _pub_link = [], ""
             if pics:
-                st_show_image_url(pics[0])
+                st.image(pics[0], use_container_width=True)
             else:
                 st.caption("Sin imagen disponible")
 
@@ -6019,105 +5334,6 @@ def page_sorting_admin(inv_map_sku, barcode_to_sku):
         st.rerun()
 
     conn.close()
-
-def get_next_run_for_mesa(mesa: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        """SELECT r.id, r.page_no, r.status, m.name
-             FROM sorting_runs r
-             JOIN sorting_manifests m ON m.id=r.manifest_id
-             WHERE r.mesa=? AND r.status!='DONE'
-             ORDER BY r.page_no ASC, r.id ASC
-             LIMIT 1;""",
-        (int(mesa),)
-    )
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"run_id": row[0], "page_no": row[1], "status": row[2], "manifest_name": row[3]}
-
-def get_next_group(run_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        """SELECT ml_order_id, pack_id, MIN(seq) as mseq
-             FROM sorting_run_items
-             WHERE run_id=? AND status!='DONE'
-             GROUP BY ml_order_id, pack_id
-             ORDER BY mseq ASC
-             LIMIT 1;""",
-        (run_id,)
-    )
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return None
-    order_id, pack_id, _ = row
-    c.execute(
-        """SELECT id, sku, title_ml, title_tec, qty, buyer, address, shipment_id, status
-             FROM sorting_run_items
-             WHERE run_id=? AND ml_order_id=? AND pack_id=?
-             ORDER BY seq ASC;""",
-        (run_id, order_id, pack_id)
-    )
-    items = []
-    for r in c.fetchall():
-        items.append({
-            "id": r[0],
-            "sku": r[1],
-            "title_ml": r[2] or "",
-            "title_tec": r[3] or "",
-            "qty": r[4] or 1,
-            "buyer": r[5] or "",
-            "address": r[6] or "",
-            "shipment_id": r[7] or "",
-            "status": r[8] or "PENDING",
-        })
-    conn.close()
-    return {"ml_order_id": order_id, "pack_id": pack_id, "items": items}
-
-def mark_item_done(item_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE sorting_run_items SET status='DONE', done_at=? WHERE id=?;", (now_iso(), int(item_id)))
-    conn.commit()
-    conn.close()
-
-def mark_item_incidence(item_id: int, note: str):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE sorting_run_items SET status='INCIDENCE', incidence_note=?, done_at=? WHERE id=?;", (note, now_iso(), int(item_id)))
-    conn.commit()
-    conn.close()
-
-def maybe_close_run(run_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(1) FROM sorting_run_items WHERE run_id=? AND status!='DONE';", (run_id,))
-    remaining = c.fetchone()[0]
-    if remaining == 0:
-        c.execute("UPDATE sorting_runs SET status='DONE', closed_at=? WHERE id=?;", (now_iso(), run_id))
-        conn.commit()
-    conn.close()
-
-def maybe_close_manifest_if_done():
-    active = get_active_sorting_manifest()
-    if not active:
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(1) FROM sorting_runs WHERE manifest_id=? AND status!='DONE';", (active["id"],))
-    rem = c.fetchone()[0]
-    conn.close()
-    if rem == 0:
-        mark_manifest_done(active["id"])
-        # clear session state
-        for k in ["sorting_manifest_id","sorting_parsed_pages","sorting_manifest_name","sorting_assignments"]:
-            st.session_state.pop(k, None)
-
-
 
 # =========================
 # CONTADOR DE PAQUETES (Flex/Colecta)
@@ -6754,7 +5970,7 @@ def page_packing(inv_map_sku: dict):
                 c1, c2, c3 = st.columns([1.2, 6.6, 1.2], gap="small")
                 with c1:
                     if thumb:
-                        st_show_image_url(thumb, max_width_px=55, radius_px=6)
+                        st.image(thumb, width=55)
                     else:
                         st.caption(" ")
                 with c2:
