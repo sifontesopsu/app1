@@ -1427,23 +1427,67 @@ def get_publication_row(sku: str) -> dict:
         return {}
     return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "img_url": row[4], "updated_at": row[5]}
 
-# =========================
-# 🧪 TEST IMAGEN DIRECTA
-# =========================
 import streamlit as st
+import requests
+import re
 
-st.markdown("## 🧪 Test imagen directa")
+def debug_fetch_ml_html(url: str):
+    st.write("### 🧪 Debug HTML MercadoLibre (desde Streamlit Cloud)")
 
-test_url = "https://http2.mlstatic.com/D_NQ_NP_2X_700310-MLC74833501427_022024-F.webp"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-CL,es;q=0.9,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
-st.markdown(
-    f"""
-    <div style="text-align:center;">
-        <img src="{test_url}" style="max-width:400px; border-radius:10px;" />
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    try:
+        r = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+        html = r.text or ""
+        st.write("Status:", r.status_code)
+        st.write("Len HTML:", len(html))
+        st.write("Contiene mlstatic?:", ("mlstatic.com" in html))
+        st.write("Contiene D_NQ_NP?:", ("D_NQ_NP" in html))
+        st.write("Contiene ui-pdp-image?:", ("ui-pdp-image" in html))
+
+        # Busca pistas típicas de "estado" embebido
+        hints = ["__PRELOADED_STATE__", "__APOLLO_STATE__", "initialState", "apolloState", "preloadedState"]
+        found = [h for h in hints if h in html]
+        st.write("Hints state JSON:", found if found else "ninguna")
+
+        # Muestra un extracto alrededor de 'mlstatic' o de una hint
+        snippet = ""
+        if "mlstatic.com" in html:
+            idx = html.find("mlstatic.com")
+            snippet = html[max(0, idx-400): idx+800]
+        elif found:
+            idx = html.find(found[0])
+            snippet = html[max(0, idx-400): idx+1200]
+        else:
+            snippet = html[:1500]
+
+        st.code(snippet)
+
+        # Opción: descargar HTML completo
+        st.download_button(
+            "⬇️ Descargar HTML capturado",
+            data=html.encode("utf-8", errors="ignore"),
+            file_name="ml_captured.html",
+            mime="text/html"
+        )
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+# UI simple
+st.markdown("## 🧪 Capturar HTML desde Cloud")
+test_link = st.text_input("Pega aquí el link de una publicación ML")
+if st.button("Capturar"):
+    if test_link.strip():
+        debug_fetch_ml_html(test_link.strip())
+    else:
+        st.warning("Pega un link primero.")
 # =========================
 # IMÁGENES DE PUBLICACIONES (sin API)
 # =========================
