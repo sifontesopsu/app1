@@ -1328,41 +1328,72 @@ OG_IMAGE_RE = re.compile(
 )
 
 @st.cache_data(show_spinner=False, ttl=24*3600)
-def publication_main_image_from_html(link: str) -> str:
-    """Devuelve 1 URL de imagen principal leyendo og:image desde el HTML de la publicación.
+def publication_main_image_from_duckduckgo(query: str) -> str:
+    """Devuelve 1 URL de imagen (la 'mejor' candidata) usando búsqueda de imágenes en DuckDuckGo.
 
-    Sin API: solo usa el link público de Mercado Libre.
+    Política empresa: NO consultar directamente Mercado Libre para obtener imágenes.
+    Aquí solo usamos un tercero (DuckDuckGo) y tomamos el primer resultado válido.
     """
-    url = (link or "").strip()
-    if not url:
+    q = str(query or "").strip()
+    if not q:
         return ""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-        }
-        r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
-        if r.status_code != 200:
-            return ""
-        html_text = r.text or ""
-        m = OG_IMAGE_RE.search(html_text)
-        return m.group(1).strip() if m else ""
+        # Import lazy para que la app no reviente si falta la dependencia.
+        # Requisito: agregar 'duckduckgo-search' a requirements.txt
+        from duckduckgo_search import DDGS  # type: ignore
+    except Exception:
+        return ""
+
+    try:
+        # 'moderate' evita contenido sensible
+        with DDGS() as ddgs:
+            # max_results pequeño para que sea liviano en PDA/Cloud
+            results = ddgs.images(
+                keywords=q,
+                max_results=1,
+                safesearch="moderate",
+                size=None,
+                color=None,
+                type_image=None,
+                layout=None,
+                license_image=None,
+            )
+            for r in results:
+                # según la lib, suele venir 'image' (url directa) y/o 'thumbnail'
+                url = (r.get("image") or r.get("thumbnail") or "").strip()
+                if url:
+                    return url
+        return ""
     except Exception:
         return ""
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
     """Retorna (urls, link_publicacion).
 
-    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
+    Modo empresa (sin ML): NO se hace requests a la publicación.
+    - Construimos un query con el título (y SKU) y buscamos 1 imagen en DuckDuckGo.
     """
     row = get_publication_row(sku)
     if not row:
-        return [], ""
-    link = (row.get("link") or "").strip()
-    if not link:
-        return [], ""
-    img = publication_main_image_from_html(link)
+        # fallback: buscar por el SKU solo (último recurso)
+        q = f"{normalize_sku(sku)}"
+        img = publication_main_image_from_duckduckgo(q)
+        return ([img] if img else []), ""
+
+    sku_norm = normalize_sku(row.get("sku_ml") or sku)
+    title = str(row.get("title") or "").strip()
+
+    # Query preferido: título + sku (mejor precisión)
+    if title:
+        query = f"{title} {sku_norm}".strip()
+    else:
+        query = f"{sku_norm}".strip()
+
+    img = publication_main_image_from_duckduckgo(query)
     urls = [img] if img else []
+
+    # Mantengo el link solo como referencia/abrir manualmente (sin consultarlo)
+    link = (row.get("link") or "").strip()
     return urls, link# =========================
 # CORTES (lista de SKUs)
 # =========================
