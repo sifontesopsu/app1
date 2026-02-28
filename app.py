@@ -11,7 +11,6 @@ import json
 import random
 import string
 import requests
-import time
 # =========================
 # CONFIG
 # =========================
@@ -774,6 +773,7 @@ def init_db():
         ml_item_id TEXT,
         title TEXT,
         link TEXT,
+        img_url TEXT,
         updated_at TEXT
     );
     """)
@@ -1363,6 +1363,9 @@ def import_publication_links_excel(file) -> pd.DataFrame:
     out["sku_ml"] = df[sku_c].astype(str).map(normalize_sku)
     out["title"] = df[title_c].astype(str).fillna("").map(lambda x: str(x).strip()) if title_c else ""
     out["link"] = df[link_c].astype(str).fillna("").map(lambda x: str(x).strip()) if link_c else ""
+    # imagen (opcional): columna IMG_URL / img_url / imagen
+    img_c = cols.get("img_url") or cols.get("img") or cols.get("imagen") or cols.get("image")
+    out["img_url"] = df[img_c].astype(str).fillna("").map(lambda x: str(x).strip()) if img_c else ""
     # item id: preferir Id, si no, extraer desde link
     if id_c:
         out["ml_item_id"] = df[id_c].astype(str).fillna("").map(extract_ml_item_id)
@@ -1391,18 +1394,20 @@ def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
         item_id = str(r.get("ml_item_id", "") or "").strip().upper().replace("-", "")
         title = str(r.get("title", "") or "").strip()
         link = str(r.get("link", "") or "").strip()
+        img_url = str(r.get("img_url", "") or "").strip()
         if not item_id:
             noid += 1
         c.execute(
-            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, updated_at)
-               VALUES (?,?,?,?,?)
+            """INSERT INTO sku_publications (sku_ml, ml_item_id, title, link, img_url, updated_at)
+               VALUES (?,?,?,?,?,?)
                ON CONFLICT(sku_ml) DO UPDATE SET
                  ml_item_id=excluded.ml_item_id,
                  title=excluded.title,
                  link=excluded.link,
+                 img_url=CASE WHEN excluded.img_url IS NOT NULL AND excluded.img_url<>'' THEN excluded.img_url ELSE sku_publications.img_url END,
                  updated_at=excluded.updated_at
             """,
-            (sku, item_id, title, link, now_iso())
+            (sku, item_id, title, link, img_url, now_iso())
         )
         ok += 1
     conn.commit()
@@ -1415,380 +1420,180 @@ def get_publication_row(sku: str) -> dict:
         return {}
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT sku_ml, ml_item_id, title, link, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
+    c.execute("SELECT sku_ml, ml_item_id, title, link, img_url, updated_at FROM sku_publications WHERE sku_ml=?", (sku,))
     row = c.fetchone()
     conn.close()
     if not row:
         return {}
-    return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "updated_at": row[4]}
+    return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "img_url": row[4], "updated_at": row[5]}
 
-# --- Extracción de imágenes (sin API) ---
-# ML puede cambiar orden de atributos o usar tags alternativos; por eso no dependemos de un solo regex.
-_META_TAG_RE = re.compile(r"<meta\s+[^>]*>", re.IGNORECASE)
-_ATTR_RE = re.compile(r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(\".*?\"|\'.*?\'|[^\s>]+)", re.IGNORECASE | re.DOTALL)
-_MLSTATIC_IMG_RE = re.compile(r"https?://[^\"\']*mlstatic\.com[^\"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^\"\']*)?", re.IGNORECASE)
 
-def _extract_main_image_from_html(html_text: str) -> tuple[str, str]:
-    """Retorna (url, metodo). metodo vacío si no encontró.
+# =========================
+# IMÁGENES DE PUBLICACIONES (sin API)
+# =========================
 
-    Heurística:
-    - MercadoLibre a veces devuelve og:image con el logo (o cambia plantilla).
-    - Recolectamos candidatos (meta, JSON-LD, JSON embebido, fallback) y elegimos el mejor.
-    """
-    html_text = html_text or ""
-    if not html_text:
-        return "", ""
+# Regex tolerantes (no dependen del orden de atributos)
+_META_IMG_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=[\"\'](?:og:image(?::secure_url)?|twitter:image(?::src)?)'
+    r'[\\"\'][^>]+content=[\"\']([^"\']+)[\"\']',
+    re.IGNORECASE
+)
 
-    candidates: list[tuple[str, str]] = []  # (url, source)
+# Captura URLs de imágenes de ML embebidas en HTML/JSON (sin ejecutar JS)
+_MLSTATIC_IMG_RE = re.compile(
+    r'https?://[^"\'\s>]*mlstatic\.com/[^"\'\s>]+\.(?:webp|jpg|png)',
+    re.IGNORECASE
+)
 
-    def _norm(u: str) -> str:
-        u = (u or "").strip()
-        if not u:
-            return ""
-        # HTML entities / escapes comunes
-        u = html.unescape(u)
-        u = u.replace("\\/", "/")
-        if u.startswith("//"):
-            u = "https:" + u
-        return u.strip()
+_BAD_IMG_HINTS = ("logo", "favicon", "sprite", "icon", "analytics", "tracking", "pixel", "data:image")
 
-    def _add(u: str, src: str):
-        u = _norm(u)
-        if not u:
-            return
-        candidates.append((u, src))
+def _score_ml_image_url(url: str) -> int:
+    u = (url or "").strip().lower()
+    if not u:
+        return -999
+    score = 0
+    if "mlstatic.com" in u:
+        score += 30
+    if "d_nq_np" in u:
+        score += 80
+    # prioriza Chile cuando exista
+    if "-mlc" in u:
+        score += 50
+    elif "-mla" in u or "-mlu" in u:
+        score += 15
+    # calidad/tamaño
+    if "2x_" in u:
+        score += 10
+    if u.endswith((".webp", ".jpg", ".png")):
+        score += 5
+    if any(b in u for b in _BAD_IMG_HINTS):
+        score -= 400
+    return score
 
-    # 1) Meta tags (og/twitter) — recolectar todas
-    wanted = {"og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"}
-    for tag in _META_TAG_RE.findall(html_text):
-        attrs = {}
-        for k, v in _ATTR_RE.findall(tag):
-            key = (k or "").strip().lower()
-            val = (v or "").strip()
-            if len(val) >= 2 and ((val[0] == val[-1]) and val[0] in ("\"", "'")):
-                val = val[1:-1]
-            attrs[key] = val
-        prop = (attrs.get("property") or attrs.get("name") or "").strip().lower()
-        if prop in wanted:
-            _add(attrs.get("content") or "", f"meta:{prop}")
-
-    # 2) JSON-LD (application/ld+json) con clave 'image'
-    for m in re.finditer(
-        r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>",
-        html_text,
-        re.IGNORECASE | re.DOTALL,
-    ):
-        raw = (m.group(1) or "").strip()
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-
-        def _pick_images(obj):
-            out = []
-            if isinstance(obj, dict):
-                img = obj.get("image")
-                if isinstance(img, str):
-                    out.append(img)
-                elif isinstance(img, list):
-                    out.extend([it for it in img if isinstance(it, str)])
-                g = obj.get("@graph")
-                if isinstance(g, list):
-                    for node in g:
-                        out.extend(_pick_images(node))
-            elif isinstance(obj, list):
-                for it in obj:
-                    out.extend(_pick_images(it))
-            return out
-
-        for u in _pick_images(data):
-            _add(u, "jsonld:image")
-
-    # 3) JSON embebido (muy común en ML): buscar urls mlstatic dentro de scripts
-    #    Capturamos tanto en JSON como texto plano.
-    for m in re.finditer(r"https?://(?:http2\.)?mlstatic\.com/[^\s\"'>]+", html_text, re.IGNORECASE):
-        _add(m.group(0), "scan:mlstatic")
-
-    # Algunos HTML vienen con comillas escapadas o campos tipo "url":"https:\/\/http2.mlstatic.com\/..."
-    for m in re.finditer(r"\"url\"\s*:\s*\"(https?:\\\\/\\\\/(?:http2\\\\.)?mlstatic\\\\.com\\\\/[^\\\"]+)\"", html_text, re.IGNORECASE):
-        _add(m.group(1), "json:url")
-
-    for m in re.finditer(r"\"thumbnail\"\s*:\s*\"(https?:\\\\/\\\\/(?:http2\\\\.)?mlstatic\\\\.com\\\\/[^\\\"]+)\"", html_text, re.IGNORECASE):
-        _add(m.group(1), "json:thumbnail")
-
-    # 4) Si no hay nada, intentar el regex viejo como último recurso
-    m = _MLSTATIC_IMG_RE.search(html_text)
-    if m:
-        _add(m.group(0), "fallback:mlstatic_re")
-
-    # Elegir mejor candidato (evitar logo ML y assets de marca)
-    def _prefer_jpg(u: str) -> str:
-        """No cambia la URL.
-
-        Nota: preferimos mostrar .webp tal cual usando HTML (<img>) del lado del navegador,
-        porque el navegador sí soporta WEBP aunque Streamlit/PIL a veces no lo haga en server.
-        """
-        return (u or "").strip()
-
-    def _score(u: str) -> int:
-        lu = (u or "").lower()
-        s = 0
-
-        # Reglas fuertes: imagen de producto en CDN de ML suele verse así:
-        # https://http2.mlstatic.com/D_NQ_NP_...-MLA...-F.webp  (o MLC)
-        is_mlstatic = "mlstatic.com/" in lu
-        is_productish = ("/d_" in lu) and ("_np_" in lu) and ("-ml" in lu) and is_mlstatic
-        if is_productish:
-            s += 200
-        # Preferir variantes de alta calidad
-        if "_2x_" in lu:
-            s += 60
-        if "d_nq_np_" in lu:
-            s += 60
-        if "d_q_np_" in lu:
-            s += 35
-        # Preferir archivos de imagen comunes (incluye WEBP)
-        if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", lu):
-            s += 20
-
-        # Penalizaciones: logos / íconos / sprites / UI
-        if any(x in lu for x in ["logo", "favicon", "sprite", "apple-touch-icon", "icons/", "/icons", ".svg"]):
-            s -= 300
-        if "mercadolibre" in lu and not is_productish:
-            s -= 200
-
-        # Si no parece imagen de producto, bajarle mucho para evitar que gane el logo
-        if not is_productish:
-            s -= 120
-
-        return s
-
-    # Deduplicar preservando mejor score
-    best = ("", "")
-    best_score = -10**9
+def _pick_best_image(candidates: list[str]) -> str:
+    cands = []
     seen = set()
-    for u, src in candidates:
-        if u in seen:
+    for c in (candidates or []):
+        if not c:
             continue
-        seen.add(u)
-        sc = _score(u)
-        if sc > best_score:
-            best_score = sc
-            best = (u, src)
-
-    if best[0] and best_score > -50:
-        return _prefer_jpg(best[0]), best[1]
-
-    return "", ""
-
-
-    # 1) Meta tags (og:image / secure_url / twitter:image)
-    wanted = {
-        "og:image",
-        "og:image:secure_url",
-        "twitter:image",
-        "twitter:image:src",
-    }
-    for tag in _META_TAG_RE.findall(html_text):
-        attrs = {}
-        for k, v in _ATTR_RE.findall(tag):
-            key = (k or "").strip().lower()
-            val = (v or "").strip()
-            if len(val) >= 2 and ((val[0] == val[-1]) and val[0] in ("\"", "'")):
-                val = val[1:-1]
-            attrs[key] = val
-        prop = (attrs.get("property") or attrs.get("name") or "").strip().lower()
-        if prop in wanted:
-            img = (attrs.get("content") or "").strip()
-            if img:
-                if img.startswith("//"):
-                    img = "https:" + img
-                return img, f"meta:{prop}"
-
-    # 2) JSON-LD (application/ld+json) con clave 'image'
-    # Buscamos de forma tolerante: puede venir como string o lista.
-    for m in re.finditer(r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>", html_text, re.IGNORECASE | re.DOTALL):
-        raw = (m.group(1) or "").strip()
-        if not raw:
+        cc = str(c).strip()
+        if not cc or cc in seen:
             continue
-        # A veces viene con múltiples JSONs; intentamos parsear el primero válido.
-        try:
-            data = json.loads(raw)
-        except Exception:
+        seen.add(cc)
+        # filtra basura obvia
+        ul = cc.lower()
+        if any(b in ul for b in _BAD_IMG_HINTS):
             continue
+        cands.append(cc)
+    if not cands:
+        return ""
+    cands.sort(key=_score_ml_image_url, reverse=True)
+    best = cands[0]
+    return best if _score_ml_image_url(best) >= 40 else ""
 
-        def _pick_image(obj):
-            if isinstance(obj, dict):
-                img = obj.get("image")
-                if isinstance(img, str):
-                    return img
-                if isinstance(img, list) and img:
-                    for it in img:
-                        if isinstance(it, str) and it:
-                            return it
-                # A veces anida en @graph
-                g = obj.get("@graph")
-                if isinstance(g, list):
-                    for node in g:
-                        got = _pick_image(node)
-                        if got:
-                            return got
-            if isinstance(obj, list):
-                for it in obj:
-                    got = _pick_image(it)
-                    if got:
-                        return got
-            return ""
-
-        img = _pick_image(data)
-        if isinstance(img, str) and img.strip():
-            img = img.strip()
-            if img.startswith("//"):
-                img = "https:" + img
-            return img, "jsonld:image"
-
-    # 3) Fallback: primer URL a mlstatic en el HTML
-    m = _MLSTATIC_IMG_RE.search(html_text)
-    if m:
-        return m.group(0).strip(), "fallback:mlstatic"
-
-    return "", ""
-
-def _images_debug_enabled() -> bool:
-    """Bandera de diagnóstico para imágenes OG (sin API)."""
-    return bool(st.session_state.get("debug_images", False))
-
-def _images_set_last_error(link: str, status: int | None = None, note: str = "") -> None:
-    ss = st.session_state
-    if "images_last_error" not in ss:
-        ss["images_last_error"] = {}
-    ss["images_last_error"][link] = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "status": status,
-        "note": (note or "")[:300],
-    }
-
-def _images_get_last_error(link: str) -> dict:
-    ss = st.session_state
-    return (ss.get("images_last_error") or {}).get(link, {})
-
-def _images_cache_get(link: str, ttl_seconds: int = 6*3600) -> str | None:
-    """Cache SOLO de éxitos (para no 'congelar' vacíos por bloqueo temporal)."""
-    ss = st.session_state
-    cache = ss.get("_images_ok_cache") or {}
-    hit = cache.get(link)
-    if not hit:
-        return None
-    ts, img = hit.get("ts", 0), hit.get("img", "")
-    if not img:
-        return None
-    if (time.time() - ts) > ttl_seconds:
-        return None
-    return img
-
-def _images_cache_set(link: str, img: str) -> None:
-    ss = st.session_state
-    if "_images_ok_cache" not in ss:
-        ss["_images_ok_cache"] = {}
-    ss["_images_ok_cache"][link] = {"ts": time.time(), "img": img}
-
+@st.cache_data(show_spinner=False, ttl=6*3600)
 def publication_main_image_from_html(link: str) -> str:
-    """Devuelve 1 URL de imagen principal leyendo el HTML público de la publicación (sin API).
+    """Devuelve 1 URL de imagen principal leyendo HTML público (sin API).
 
-    Notas:
-    - Cachea SOLO resultados exitosos (para evitar 24h de vacío).
-    - En modo debug, guarda el status y una nota corta en session_state.
+    Nota: en Streamlit Cloud, MercadoLibre a veces entrega HTML distinto; por eso
+    guardamos la imagen encontrada en DB (lazy-cache) para no recalcular siempre.
     """
     url = (link or "").strip()
     if not url:
         return ""
-
-    # Cache de éxitos
-    cached = _images_cache_get(url)
-    if cached:
-        return cached
-
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.7",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
-            "Referer": "https://www.mercadolibre.cl/",
+            "Accept-Encoding": "gzip, deflate",
         }
-        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-
+        r = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
         if r.status_code != 200:
-            if _images_debug_enabled():
-                _images_set_last_error(url, status=r.status_code, note=(r.text or "")[:180])
             return ""
-
         html_text = r.text or ""
-        img, method = _extract_main_image_from_html(html_text)
 
-        if img.startswith("//"):
-            img = "https:" + img
+        candidates: list[str] = []
 
-        if img:
-            _images_cache_set(url, img)
-            if _images_debug_enabled():
-                _images_set_last_error(url, status=200, note=f"OK ({method})")
-            return img
+        # 1) meta tags (og/twitter)
+        candidates += [m.group(1).strip() for m in _META_IMG_RE.finditer(html_text)]
 
-        if _images_debug_enabled():
-            _images_set_last_error(
-                url,
-                status=200,
-                note="No se encontró imagen en HTML (meta og/twitter, JSON-LD o fallback mlstatic)."
-            )
+        # 2) URLs mlstatic embebidas (muchas veces vienen en JSON dentro del HTML)
+        # preferimos las que parecen de producto: incluyen D_NQ_NP o -MLA/-MLC/-MLU
+        for u in _MLSTATIC_IMG_RE.findall(html_text):
+            ul = u.lower()
+            if ("d_nq_np" in ul) or re.search(r"-(mlc|mla|mlu)\d+", ul):
+                candidates.append(u)
+
+        # 3) fallback: cualquier mlstatic (filtrado por score)
+        if not candidates:
+            candidates += _MLSTATIC_IMG_RE.findall(html_text)
+
+        return _pick_best_image(candidates)
+    except Exception:
         return ""
 
-    except Exception as e:
-        if _images_debug_enabled():
-            _images_set_last_error(url, status=None, note=f"Exception: {type(e).__name__}: {str(e)[:180]}")
-        return ""
+def _ensure_publications_img_col():
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        _ensure_col("sku_publications", "img_url", "TEXT")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
     """Retorna (urls, link_publicacion).
 
-    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
+    Primero usa img_url guardada en DB/Excel (estable). Si falta, intenta
+    extraer desde HTML público y guarda el resultado (lazy-cache).
     """
+    _ensure_publications_img_col()
     row = get_publication_row(sku)
     if not row:
         return [], ""
     link = (row.get("link") or "").strip()
     if not link:
         return [], ""
+
+    # 1) si ya tenemos img_url persistida, usarla directo
+    persisted = str(row.get("img_url") or "").strip()
+    if persisted:
+        return [persisted], link
+
+    # 2) si no, intentar extraer (best-effort) y persistir
     img = publication_main_image_from_html(link)
-    urls = [img] if img else []
-    return urls, link
+    if img:
+        try:
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("UPDATE sku_publications SET img_url=?, updated_at=? WHERE sku_ml=?", (img, now_iso(), normalize_sku(sku)))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        return [img], link
+
+    return [], link
 
 
-def _st_show_image_url(url: str, *, width: int | None = None, use_container_width: bool = False):
-    """Muestra imágenes por HTML (<img>) para que el navegador renderice WEBP.
-
-    Importante: en Streamlit Community Cloud, st.image(url) puede fallar con WEBP porque
-    intenta decodificar del lado del servidor. Con <img>, el render es del lado del cliente.
-    """
+def st_show_image_url(url: str, *, max_width_px: int = 520, radius_px: int = 10):
+    """Muestra imagen por HTML (<img>), evitando problemas de WEBP en Streamlit Cloud."""
     u = (url or "").strip()
     if not u:
         return
-    style = []
-    if use_container_width:
-        style.append("max-width:100%")
-        style.append("height:auto")
-    if width is not None:
-        style.append(f"width:{int(width)}px")
-        style.append("height:auto")
-    style_attr = (";".join(style)) if style else "max-width:100%;height:auto"
     st.markdown(
-        f"<img src='{html.escape(u, quote=True)}' style='{style_attr}' loading='lazy' referrerpolicy='no-referrer' />",
-        unsafe_allow_html=True
+        f"""
+        <div style="text-align:center;">
+          <img src="{html.escape(u)}"
+               style="max-width:{int(max_width_px)}px; width:100%; height:auto; border-radius:{int(radius_px)}px;" />
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-
 # =========================
 # CORTES (lista de SKUs)
 # =========================
@@ -2250,68 +2055,69 @@ def save_orders_and_build_ots(
                     break
             title_ml_by_sku[sku] = t
 
-    # Prefijos (SKU base -> Familia) para inferir packs/variantes sin Familia
-    _fam_bases = [
-        (normalize_sku(k), str(v).strip())
-        for k, v in (familia_map_sku or {}).items()
-        if str(v or "").strip() and str(v).strip().lower() != "nan"
-    ]
-    # Evitar prefijos demasiado cortos que podrían mezclar familias
-    _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
-    _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
+                # Prefijos (SKU base -> Familia) para inferir packs/variantes sin Familia
+        _fam_bases = [
+            (normalize_sku(k), str(v).strip())
+            for k, v in (familia_map_sku or {}).items()
+            if str(v or "").strip() and str(v).strip().lower() != "nan"
+        ]
+        # Evitar prefijos demasiado cortos que podrían mezclar familias
+        _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
+        _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
 
-    # Índice por prefijo dominante: prefix -> (best_fam, share, n)
-    _pref_counts = {}
-    for _sku_base, _fam_base in _fam_bases:
-        _maxL = min(len(_sku_base), 10)
-        for _L in range(4, _maxL + 1):
-            _p = _sku_base[:_L]
-            if _p not in _pref_counts:
-                _pref_counts[_p] = {}
-            _pref_counts[_p][_fam_base] = _pref_counts[_p].get(_fam_base, 0) + 1
+        # Índice por prefijo dominante: prefix -> (best_fam, share, n)
+        _pref_counts = {}
+        for _sku_base, _fam_base in _fam_bases:
+            _maxL = min(len(_sku_base), 10)
+            for _L in range(4, _maxL + 1):
+                _p = _sku_base[:_L]
+                if _p not in _pref_counts:
+                    _pref_counts[_p] = {}
+                _pref_counts[_p][_fam_base] = _pref_counts[_p].get(_fam_base, 0) + 1
 
-    _fam_pref_index = {}
-    for _p, _cnts in _pref_counts.items():
-        _total = sum(_cnts.values())
-        if _total <= 0:
-            continue
-        _best_fam = max(_cnts.items(), key=lambda kv: kv[1])[0]
-        _best_n = _cnts[_best_fam]
-        _share = _best_n / _total
-        _fam_pref_index[_p] = (_best_fam, _share, _total)
+        _fam_pref_index = {}
+        for _p, _cnts in _pref_counts.items():
+            _total = sum(_cnts.values())
+            if _total <= 0:
+                continue
+            _best_fam = max(_cnts.items(), key=lambda kv: kv[1])[0]
+            _best_n = _cnts[_best_fam]
+            _share = _best_n / _total
+            _fam_pref_index[_p] = (_best_fam, _share, _total)
 
-    def _fam_for_sku(sku: str) -> str:
-        """Familia efectiva:
-        1) Familia directa del maestro
-        2) Inferencia por prefijo dominante (packs/variantes)
-        3) Fallback: SKU base con familia más largo que sea prefijo
-        """
-        ssku = normalize_sku(sku)
+        def _fam_for_sku(sku: str) -> str:
+            """Familia efectiva:
+            1) Familia directa del maestro
+            2) Inferencia por prefijo dominante (packs/variantes)
+            3) Fallback: SKU base con familia más largo que sea prefijo
+            """
+            ssku = normalize_sku(sku)
 
-        # 1) directa
-        f = str(familia_map_sku.get(ssku, "") or "").strip()
-        if f and f.lower() != "nan":
-            return f
-        if not ssku:
+            # 1) directa
+            f = str(familia_map_sku.get(ssku, "") or "").strip()
+            if f and f.lower() != "nan":
+                return f
+            if not ssku:
+                return "Sin Familia"
+
+            # 2) prefijo dominante (probamos de largo a corto)
+            _maxL = min(len(ssku), 10)
+            for _L in range(_maxL, 3, -1):
+                _p = ssku[:_L]
+                if _p in _fam_pref_index:
+                    fam, share, n = _fam_pref_index[_p]
+                    if n >= 2 and share >= 0.70:
+                        return fam
+
+            # 3) fallback: SKU base más largo prefijo completo
+            for base_sku, base_fam in _fam_bases:
+                if ssku != base_sku and ssku.startswith(base_sku):
+                    return base_fam
+
             return "Sin Familia"
 
-        # 2) prefijo dominante (probamos de largo a corto)
-        _maxL = min(len(ssku), 10)
-        for _L in range(_maxL, 3, -1):
-            _p = ssku[:_L]
-            if _p in _fam_pref_index:
-                fam, share, n = _fam_pref_index[_p]
-                if n >= 2 and share >= 0.70:
-                    return fam
+        dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
 
-        # 3) fallback: SKU base más largo prefijo completo
-        for base_sku, base_fam in _fam_bases:
-            if ssku != base_sku and ssku.startswith(base_sku):
-                return base_fam
-
-        return "Sin Familia"
-
-    dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
 
     grp = dfw.groupby(["family", "sku_ml"], as_index=False)["qty"].sum()
     grp["qty"] = grp["qty"].astype(int)
@@ -2322,7 +2128,7 @@ def save_orders_and_build_ots(
     #    - "Sin Familia" se divide en subgrupos por prefijo para no cargar todo a un solo picker
     grp = grp.copy()
     grp["assign_group"] = grp.apply(
-        lambda r: ("SF:" + str(r["sku_ml"])[:6]) if str(r["family"]) == "Sin Familia" else str(r["family"]),
+        lambda r: ("SF:" + str(r["sku_ml"])[:4]) if str(r["family"]) == "Sin Familia" else str(r["family"]),
         axis=1
     )
     group_weights = grp.groupby("assign_group")["qty"].sum().to_dict()
@@ -2809,19 +2615,10 @@ def page_picking():
     except Exception:
         pics, pub_link = [], ""
     if pics:
-        _st_show_image_url(pics[0], use_container_width=True)
-    else:
-        st.caption("Sin imagen disponible")
-        if _images_debug_enabled() and pub_link:
-            err = _images_get_last_error(pub_link)
-            if err:
-                st.caption(f"🧪 Debug imágenes — status: {err.get('status')} — {err.get('note')}")
+        st_show_image_url(pics[0])
         if len(pics) > 1:
             with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
-                
-                for _u in pics:
-                    _st_show_image_url(_u, use_container_width=True)
-
+                st.image(pics, use_container_width=True)
 
     st.markdown(f"### Solicitado: {qty_total}")
 
@@ -5813,13 +5610,9 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             except Exception:
                 pics, _pub_link = [], ""
             if pics:
-                _st_show_image_url(pics[0], use_container_width=True)
+                st_show_image_url(pics[0])
             else:
                 st.caption("Sin imagen disponible")
-                if _images_debug_enabled() and _pub_link:
-                    err = _images_get_last_error(_pub_link)
-                    if err:
-                        st.caption(f"🧪 Debug imágenes — status: {err.get('status')} — {err.get('note')}")
 
         if status != "DONE" and remaining > 0:
             bcols = st.columns([1,1,6])
@@ -6901,7 +6694,7 @@ def page_packing(inv_map_sku: dict):
                 c1, c2, c3 = st.columns([1.2, 6.6, 1.2], gap="small")
                 with c1:
                     if thumb:
-                        _st_show_image_url(thumb, width=55)
+                        st_show_image_url(thumb, max_width_px=55, radius_px=6)
                     else:
                         st.caption(" ")
                 with c2:
@@ -7105,10 +6898,6 @@ def main():
     _sfx_unlock_render()
     _sfx_global_click_hook()
     sfx_render_pending()
-
-    # 🖼️ Diagnóstico de imágenes (solo para detectar bloqueos / cambios HTML)
-    with st.sidebar.expander("🖼️ Imágenes", expanded=False):
-        st.checkbox("Debug imágenes (mostrar causa cuando diga 'Sin imagen')", key="debug_images")
     init_db()
 
     # Auto-carga maestro desde repo (sirve para ambos modos)
