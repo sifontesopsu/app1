@@ -1427,7 +1427,23 @@ def get_publication_row(sku: str) -> dict:
         return {}
     return {"sku_ml": row[0], "ml_item_id": row[1], "title": row[2], "link": row[3], "img_url": row[4], "updated_at": row[5]}
 
+# =========================
+# 🧪 TEST IMAGEN DIRECTA
+# =========================
+import streamlit as st
 
+st.markdown("## 🧪 Test imagen directa")
+
+test_url = "https://http2.mlstatic.com/D_NQ_NP_2X_700310-MLC74833501427_022024-F.webp"
+
+st.markdown(
+    f"""
+    <div style="text-align:center;">
+        <img src="{test_url}" style="max-width:400px; border-radius:10px;" />
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 # =========================
 # IMÁGENES DE PUBLICACIONES (sin API)
 # =========================
