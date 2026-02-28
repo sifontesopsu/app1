@@ -1327,125 +1327,218 @@ OG_IMAGE_RE = re.compile(
     re.IGNORECASE
 )
 
-# =========================
-# DUCKDUCKGO (Empresa): imágenes vía tercero, sin consultar ML
-# =========================
-
-def _norm_item_id(s: str) -> str:
-    s = (s or "").strip().upper()
-    return s.replace("-", "")
-
-def _contains_item_id(text: str, item_id: str) -> bool:
-    t = (text or "").upper()
-    iid = _norm_item_id(item_id)
-    if not iid:
-        return False
-    # Aceptar con o sin guion (MLC123 / MLC-123)
-    return (iid in t) or (iid[:3] + "-" + iid[3:] in t)
-
-def _ddg_iter_images(ddgs, query: str, max_results: int = 15):
-    """Compat: duckduckgo-search ha cambiado firmas en distintas versiones."""
-    # Intento 1: firma moderna (query posicional)
-    try:
-        return ddgs.images(query, max_results=max_results)
-    except TypeError:
-        pass
-    # Intento 2: firma antigua (keywords=...)
-    try:
-        return ddgs.images(
-            keywords=query,
-            max_results=max_results,
-            safesearch="moderate",
-            size=None,
-            color=None,
-            type_image=None,
-            layout=None,
-            license_image=None,
-        )
-    except TypeError:
-        # Último intento: solo keywords + max_results
-        return ddgs.images(keywords=query, max_results=max_results)
-
 @st.cache_data(show_spinner=False, ttl=24*3600)
-def publication_main_image_from_duckduckgo_strict(link: str, title: str = "", sku: str = "") -> str:
-    """Devuelve 1 URL de imagen usando DuckDuckGo, de forma *estricta*:
+def publication_main_image_from_duckduckgo(query: str, item_id: str = "", link: str = "") -> tuple[str, dict]:
+    """Busca 1 imagen en DuckDuckGo y retorna (img_url, meta).
 
-    - NO hace requests al HTML/API de Mercado Libre.
-    - Extrae el item_id (MLCxxxx) desde el link de la publicación.
-    - Busca en DuckDuckGo y SOLO acepta resultados cuya URL de origen contenga ese item_id.
-    - Si no hay match, devuelve "" (mejor sin imagen que una incorrecta).
+    Objetivo:
+    - NO consultar directamente Mercado Libre (ni API ni HTML).
+    - Preferir exactitud: si tenemos item_id (ej: MLC2300706830), intentamos match por origen primero.
+    - Si no hay match, ampliamos gradualmente para 'progresar' y mostrar algo.
+
+    meta puede incluir:
+      - mode: 'strict' | 'ml_domain' | 'fallback'
+      - source: url de procedencia (si viene)
+      - query: query usada
     """
-    link = (link or "").strip()
-    item_id = extract_ml_item_id(link)
-    if not item_id:
-        return ""
+    q = str(query or "").strip()
+    if not q:
+        return "", {"mode": "none", "source": "", "query": ""}
 
+    # Normalizadores
+    def _norm_item_id(s: str) -> str:
+        s = (s or "").strip().upper()
+        return s.replace("-", "")
+
+    iid = _norm_item_id(item_id)
+
+    # Import lazy (si falta dependencia, no romper la app)
     try:
         from duckduckgo_search import DDGS  # type: ignore
-    except Exception as e:
+    except Exception:
+        return "", {"mode": "missing_dep", "source": "", "query": q}
+
+    def _iter_results(ddgs, keywords: str, max_results: int = 20):
+        """Compatibilidad con distintas versiones de duckduckgo-search."""
+        # Firma nueva (posicional)
         try:
-            st.session_state["_img_last_err"] = f"duckduckgo_search no disponible: {e}"
+            for r in ddgs.images(keywords, max_results=max_results):
+                yield r
+            return
         except Exception:
             pass
-        return ""
-
-    iid = _norm_item_id(item_id)
-
-    # Queries ultra restrictivas, priorizando el dominio exacto de la publicación
-    queries = [
-        f"site:articulo.mercadolibre.cl {iid}",
-        f"site:mercadolibre.cl {iid}",
-        f"{iid} mercado libre",
-    ]
-
-    # Si tenemos título, lo agregamos como refinamiento (sin depender de él)
-    t = str(title or "").strip()
-    if t:
-        queries.insert(0, f"site:articulo.mercadolibre.cl {iid} {t}")
-
-    last_err = ""
-    for q in queries:
+        # Firma común (keywords=)
         try:
-            with DDGS() as ddgs:
-                results = _ddg_iter_images(ddgs, q, max_results=25)
-                # results puede ser generador; iteramos directo
-                for r in results:
-                    img = (r.get("image") or r.get("thumbnail") or "").strip()
-                    src = (r.get("url") or r.get("source") or r.get("page") or "").strip()
-                    if not img or not src:
+            for r in ddgs.images(keywords=keywords, max_results=max_results):
+                yield r
+            return
+        except Exception:
+            pass
+        # Firma extendida (con safesearch)
+        try:
+            for r in ddgs.images(keywords=keywords, max_results=max_results, safesearch="moderate"):
+                yield r
+            return
+        except Exception:
+            return
+
+    def _pick_url(r: dict) -> str:
+        return (str(r.get("image") or r.get("thumbnail") or "")).strip()
+
+    def _pick_source(r: dict) -> str:
+        return (str(r.get("url") or r.get("source") or r.get("page") or "")).strip()
+
+    def _source_has_iid(src: str) -> bool:
+        if not iid:
+            return False
+        up = (src or "").upper()
+        if iid in up:
+            return True
+        # aceptar con guion MLC-xxxx
+        if len(iid) > 3 and (iid[:3] + "-" + iid[3:]) in up:
+            return True
+        return False
+
+    def _is_ml_domain(src: str) -> bool:
+        s = (src or "").lower()
+        return ("mercadolibre" in s) and (".cl" in s)
+
+    # Construir queries progresivas
+    queries = []
+
+    # 0) si tenemos iid, forzamos site + iid primero
+    if iid:
+        queries.extend([
+            f"site:articulo.mercadolibre.cl {iid}",
+            f"site:mercadolibre.cl {iid}",
+            f"{iid} mercadolibre",
+        ])
+
+    # 1) query entregada (título + sku normalmente)
+    queries.append(q)
+
+    # 2) fallback por SKU (último recurso)
+    sku_only = "".join(re.findall(r"\d+", q))
+    if sku_only:
+        queries.append(sku_only)
+
+    # Dedupe conservando orden
+    seen = set()
+    queries = [x for x in queries if x and not (x in seen or seen.add(x))]
+
+    # Buscar
+    try:
+        with DDGS() as ddgs:
+            # Paso A: match estricto por origen que contiene iid
+            if iid:
+                for qq in queries:
+                    for r in _iter_results(ddgs, qq, max_results=25):
+                        img = _pick_url(r)
+                        src = _pick_source(r)
+                        if not img:
+                            continue
+                        if _source_has_iid(src):
+                            return img, {"mode": "strict", "source": src, "query": qq}
+
+            # Paso B: ampliar a dominio ML (origen mercadolibre.*). Reduce errores, pero ya no exige iid.
+            for qq in queries:
+                for r in _iter_results(ddgs, qq, max_results=25):
+                    img = _pick_url(r)
+                    src = _pick_source(r)
+                    if not img:
                         continue
-                    if _contains_item_id(src, iid):
-                        return img
-        except Exception as e:
-            last_err = str(e)
-            continue
+                    if _is_ml_domain(src):
+                        return img, {"mode": "ml_domain", "source": src, "query": qq}
 
-    if last_err:
-        try:
-            st.session_state["_img_last_err"] = f"DDG sin match por ID {iid}. Último error: {last_err}"
-        except Exception:
-            pass
-    return ""
+            # Paso C: fallback total (primera imagen que venga). Puede equivocarse.
+            for qq in queries:
+                for r in _iter_results(ddgs, qq, max_results=10):
+                    img = _pick_url(r)
+                    src = _pick_source(r)
+                    if img:
+                        return img, {"mode": "fallback", "source": src, "query": qq}
+
+            return "", {"mode": "no_results", "source": "", "query": queries[0] if queries else q}
+    except Exception:
+        return "", {"mode": "error", "source": "", "query": queries[0] if queries else q}
+ ""
+
+    try:
+        # 'moderate' evita contenido sensible
+        with DDGS() as ddgs:
+            # max_results pequeño para que sea liviano en PDA/Cloud
+            results = ddgs.images(
+                keywords=q,
+                max_results=1,
+                safesearch="moderate",
+                size=None,
+                color=None,
+                type_image=None,
+                layout=None,
+                license_image=None,
+            )
+            for r in results:
+                # según la lib, suele venir 'image' (url directa) y/o 'thumbnail'
+                url = (r.get("image") or r.get("thumbnail") or "").strip()
+                if url:
+                    return url
+        return ""
+    except Exception:
+        return ""
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
     """Retorna (urls, link_publicacion).
 
-    Política empresa:
-    - No consultar Mercado Libre directamente (ni HTML ni API).
-    - La imagen se obtiene vía DuckDuckGo y SOLO se acepta si el origen coincide con el link (ID) de ML.
+    Política empresa: NO se consulta directamente Mercado Libre (ni API ni HTML).
+    Progresivo para "avanzar" en terreno:
+      A) estricto por item_id (origen contiene MLCxxxx)   -> mode='strict'
+      B) dominio mercadolibre.*                           -> mode='ml_domain'
+      C) primer resultado (puede no ser exacto)          -> mode='fallback'
     """
     row = get_publication_row(sku)
+
+    # Fallback cuando no hay fila: buscar por SKU normalizado
     if not row:
-        return [], ""
+        sku_norm = normalize_sku(sku)
+        img, meta = publication_main_image_from_duckduckgo(sku_norm, item_id="", link="")
+        try:
+            st.session_state[f"_img_meta_{sku_norm}"] = meta
+        except Exception:
+            pass
+        return ([img] if img else []), ""
 
+    sku_norm = normalize_sku(row.get("sku_ml") or sku)
+    title = str(row.get("title") or "").strip()
     link = (row.get("link") or "").strip()
-    title = (row.get("title") or "").strip()
+    item_id = extract_ml_item_id(link)
 
-    if not link:
-        return [], ""
+    # Query preferido: ID + título + SKU (el ID va por parámetro para el modo estricto)
+    if title:
+        query = f"{title} {sku_norm}".strip()
+    else:
+        query = f"{sku_norm}".strip()
 
-    img = publication_main_image_from_duckduckgo_strict(link=link, title=title, sku=sku)
-    return ([img] if img else []), link# =========================
+    img, meta = publication_main_image_from_duckduckgo(query, item_id=item_id, link=link)
+
+    # Guardar meta para diagnóstico (sin romper pantallas)
+    try:
+        st.session_state[f"_img_meta_{sku_norm}"] = meta
+    except Exception:
+        pass
+
+    urls = [img] if img else []
+    return urls, link
+
+
+def get_image_meta_for_sku(sku: str) -> dict:
+    """Devuelve meta de la última búsqueda DDG para ese SKU (si existe)."""
+    try:
+        k = f"_img_meta_{normalize_sku(sku)}"
+        return dict(st.session_state.get(k) or {})
+    except Exception:
+        return {}
+
+# =========================
 # CORTES (lista de SKUs)
 # =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
