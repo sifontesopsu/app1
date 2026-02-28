@@ -5,3 +5,4 @@ pdfplumber
 python-barcode
 Pillow
 reportlab
+duckduckgo-search
