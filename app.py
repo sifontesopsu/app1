@@ -7,275 +7,9 @@ from datetime import datetime
 import re
 import html
 import json
-import urllib.parse
 import random
 import string
 import requests
-
-# =========================
-# IMÁGENES (descarga con headers para evitar 403 de CDNs)
-# =========================
-@st.cache_data(show_spinner=False, ttl=6*3600)
-def ddg_images_first_urls(query: str, max_results: int = 4) -> list[str]:
-    """Busca imágenes en DuckDuckGo y retorna URLs directas (best-effort)."""
-    q = (query or "").strip()
-    if not q:
-        return []
-
-# =========================
-# FALLBACK 2: Bing Images (scraping liviano, sin API)
-# =========================
-_BING_MURL_RE = re.compile(r'"murl"\s*:\s*"([^"]+)"', re.IGNORECASE)
-_BING_ENC_MURL_RE = re.compile(r'murl\\u003a\\u0022([^\\]+?)\\u0022', re.IGNORECASE)
-
-@st.cache_data(show_spinner=False, ttl=6*3600)
-def bing_images_first_urls(query: str, max_results: int = 4) -> list[str]:
-    """Busca imágenes en Bing y retorna URLs directas (best-effort)."""
-    q = (query or "").strip()
-    if not q:
-        return []
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-        url = "https://www.bing.com/images/search?" + urllib.parse.urlencode({"q": q, "form": "HDRSC2", "first": "1"})
-        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-        if r.status_code != 200:
-            return []
-        html0 = r.text or ""
-        urls = []
-
-        for mm in _BING_MURL_RE.finditer(html0):
-            u = (mm.group(1) or "").strip()
-            if u:
-                urls.append(u)
-            if len(urls) >= max_results * 3:
-                break
-
-        if not urls:
-            for mm in _BING_ENC_MURL_RE.finditer(html0):
-                u = (mm.group(1) or "").strip()
-                if u:
-                    u = u.replace("\\u002f", "/").replace("\\u003a", ":").replace("\\u0026", "&")
-                    urls.append(u)
-                if len(urls) >= max_results * 3:
-                    break
-
-        out = []
-        seen = set()
-        for u in urls:
-            if u in seen:
-                continue
-            seen.add(u)
-            out.append(u)
-            if len(out) >= max_results:
-                break
-        return out
-    except Exception:
-        return []
-
-
-def image_search_debug_probe(queries: list[str], max_results: int = 6) -> dict:
-    """Diagnóstico simple de buscadores (DDG + Bing)."""
-    info = {"queries": [], "chosen": [], "provider": ""}
-    for q in queries:
-        ddg = ddg_images_first_urls(q, max_results=max_results)
-        ddg2 = _prefer_mlstatic(ddg, limit=max_results)
-        bing = bing_images_first_urls(q, max_results=max_results)
-        bing2 = _prefer_mlstatic(bing, limit=max_results)
-
-        info["queries"].append({
-            "q": q,
-            "ddg": len(ddg),
-            "ddg_top": (ddg2[0] if ddg2 else (ddg[0] if ddg else "")),
-            "bing": len(bing),
-            "bing_top": (bing2[0] if bing2 else (bing[0] if bing else "")),
-        })
-
-        if ddg2:
-            info["chosen"] = ddg2
-            info["provider"] = "duckduckgo"
-            break
-        if bing2:
-            info["chosen"] = bing2
-            info["provider"] = "bing"
-            break
-    return info
-
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-
-        url0 = "https://duckduckgo.com/?" + urllib.parse.urlencode({"q": q, "iax": "images", "ia": "images"})
-        r0 = requests.get(url0, headers=headers, timeout=15, allow_redirects=True)
-        if r0.status_code != 200:
-            return []
-
-        html0 = r0.text or ""
-        vqd = ""
-
-        # Varias formas en que aparece vqd (DDG cambia seguido)
-        patterns = [
-            r"vqd=([0-9-]+)&",
-            r"vqd='([^']+)'",
-            r'"vqd"\s*:\s*"([^"]+)"',
-            r"\bvqd\s*:\s*\['([^']+)'\]",
-            r'\bvqd\s*:\s*\["([^"]+)"\]',
-        ]
-        for rx in patterns:
-            mm = re.search(rx, html0, re.IGNORECASE)
-            if mm:
-                vqd = mm.group(1)
-                break
-
-        if not vqd:
-            return []
-
-        params = {
-            "l": "cl-es",
-            "o": "json",
-            "q": q,
-            "vqd": vqd,
-            "f": ",,,",
-            "p": "1",
-        }
-        url1 = "https://duckduckgo.com/i.js?" + urllib.parse.urlencode(params)
-        r1 = requests.get(
-            url1,
-            headers={**headers, "Accept": "application/json,text/plain,*/*", "Referer": url0},
-            timeout=15,
-            allow_redirects=True,
-        )
-        if r1.status_code != 200:
-            return []
-
-        try:
-            data = r1.json()
-        except Exception:
-            txt = (r1.text or "").strip()
-            if not txt.startswith("{"):
-                return []
-            data = json.loads(txt)
-
-        results = data.get("results") or []
-        out: list[str] = []
-        for it in results:
-            u = (it.get("image") or it.get("thumbnail") or "").strip()
-            if not u:
-                continue
-            out.append(u)
-            if len(out) >= max_results:
-                break
-        return out
-    except Exception:
-        return []
-
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-        }
-        # 1) Obtener vqd
-        url0 = "https://duckduckgo.com/?" + urllib.parse.urlencode({"q": q})
-        r0 = requests.get(url0, headers=headers, timeout=12)
-        if r0.status_code != 200:
-            return []
-        m = _DDG_VQD_RE.search(r0.text or "")
-        if not m:
-            # fallback regex alterna
-            m = re.search(r'"vqd"\s*:\s*"([^"]+)"', r0.text or "")
-            if m:
-                vqd = m.group(1)
-            else:
-                return []
-        else:
-            vqd = m.group(1)
-
-        # 2) Consultar endpoint JSON
-        params = {
-            "l": "cl-es",
-            "o": "json",
-            "q": q,
-            "vqd": vqd,
-            "f": ",,,",
-            "p": "1",  # safe search moderate
-        }
-        url1 = "https://duckduckgo.com/i.js?" + urllib.parse.urlencode(params)
-        r1 = requests.get(url1, headers={**headers, "Accept": "application/json,text/plain,*/*"}, timeout=12)
-        if r1.status_code != 200:
-            return []
-        data = r1.json()
-        results = data.get("results") or []
-        out = []
-        for it in results:
-            u = (it.get("image") or it.get("thumbnail") or "").strip()
-            if not u:
-                continue
-            # Preferimos mlstatic cuando exista
-            out.append(u)
-            if len(out) >= max_results:
-                break
-        return out
-    except Exception:
-        return []
-
-def _extract_mlc_id(text: str) -> str:
-    m = re.search(r'\bMLC-\d+\b', text or "")
-    return m.group(0) if m else ""
-
-def _build_fallback_queries(pub_link: str, sku: str = "", title: str = "") -> list[str]:
-    mlc = _extract_mlc_id(pub_link)
-    qs = []
-    if mlc:
-        qs.append(f"{mlc} http2.mlstatic.com D_Q_NP")
-        qs.append(f"{mlc} mlstatic D_Q_NP")
-        qs.append(f"{mlc} site:mlstatic.com D_Q_NP")
-        qs.append(f"{mlc} site:mlstatic.com")
-    if title:
-        qs.append(f"{title} MLC mlstatic")
-        qs.append(f"{title} mercadolibre imagen")
-    if sku:
-        qs.append(f"{sku} MLC mercadolibre imagen")
-    seen = set()
-    out = []
-    for q in qs:
-        q = (q or "").strip()
-        if not q or q in seen:
-            continue
-        seen.add(q)
-        out.append(q)
-    return out
-
-def _prefer_mlstatic(urls: list[str], limit: int = 6) -> list[str]:
-    # ordena priorizando mlstatic y patrones de imagen de producto
-    def score(u: str) -> int:
-        ul = (u or "").lower()
-        s = 0
-        if "mlstatic.com" in ul:
-            s += 50
-        if "/d_q_np_" in ul or "/d_nq_np_" in ul:
-            s += 200
-        if "-mlc" in ul:
-            s += 80
-        bad = ["logo", "mercadolibre/logo", "ui-navigation", "favicon", "sprite", "header", "nav", "frontend-assets"]
-        if any(b in ul for b in bad):
-            s -= 1000
-        return s
-    urls2 = [u for u in urls if u]
-    urls2.sort(key=score, reverse=True)
-    return urls2[:limit]
-
-
 from contextlib import contextmanager
 # =========================
 # CONFIG
@@ -357,11 +91,6 @@ def sfx_sidebar():
             st.success("Audio habilitado ✅")
         else:
             st.info("En Chrome debes tocar “Activar sonido” una vez.")
-
-with st.sidebar.expander("🖼️ Imágenes", expanded=False):
-    st.session_state["debug_images"] = st.toggle("Debug imágenes", value=st.session_state.get("debug_images", False))
-    st.caption("Actívalo solo para diagnóstico: muestra estado de carga de links e intentos de descarga.")
-
 
 def _sfx_unlock_render():
     _sfx_init_state()
@@ -1551,69 +1280,18 @@ TWITTER_IMAGE_RE_2 = re.compile(
     re.IGNORECASE
 )
 
-MLSTATIC_IMG_RE = re.compile(
-    r'(?:(?:https?:)?//)?(?:http2\.)?mlstatic\.com/[^"\'\s>]+\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\s>]*)?',
-    re.IGNORECASE
-)
+def _extract_main_image_from_html(html_text: str) -> str:
+    """Extrae una URL de imagen principal desde HTML sin depender de un único formato.
 
-def _extract_image_urls_from_html(html_text: str, limit: int = 6) -> list[str]:
-    """Extrae URLs de imágenes desde HTML (sin API).
-
-    Estrategia:
-    1) og:image / og:image:secure_url
-    2) twitter:image
-    3) fallback: cualquier URL de mlstatic dentro del HTML (scripts incluidos)
+    Prioridad: og:image (incluye secure_url) -> twitter:image.
     """
     if not html_text:
-        return []
-    # des-escape (&amp; etc.)
-    try:
-        txt = html.unescape(html_text)
-    except Exception:
-        txt = html_text
-
-    urls: list[str] = []
-
-    # 1) metas OG/Twitter (prioridad)
+        return ""
     for rx in (OG_IMAGE_RE_1, OG_IMAGE_RE_2, TWITTER_IMAGE_RE_1, TWITTER_IMAGE_RE_2):
-        m = rx.search(txt)
+        m = rx.search(html_text)
         if m:
-            u = (m.group(1) or "").strip()
-            if u:
-                urls.append(u)
-                break
-
-    # 2) fallback: buscar imágenes mlstatic (pueden venir en JSON embebido)
-    try:
-        found = MLSTATIC_IMG_RE.findall(txt)
-    except Exception:
-        found = []
-
-    # normalizar y deduplicar preservando orden
-    seen = set()
-    out: list[str] = []
-    for u in urls + list(found):
-        if not u:
-            continue
-        u = u.strip()
-        if u.startswith("//"):
-            u = "https:" + u
-        if u.lower().startswith("http://"):
-            # preferir https si es posible
-            u = "https://" + u[len("http://"):]
-        if u in seen:
-            continue
-        seen.add(u)
-        out.append(u)
-        if len(out) >= limit:
-            break
-
-    return out
-
-def _extract_main_image_from_html(html_text: str) -> str:
-    """Extrae 1 URL principal desde HTML."""
-    urls = _extract_image_urls_from_html(html_text, limit=1)
-    return urls[0] if urls else ""
+            return (m.group(1) or "").strip()
+    return ""
 
 
 @st.cache_data(show_spinner=False, ttl=24*3600)
@@ -1644,83 +1322,21 @@ def publication_main_image_from_html(link: str) -> str:
         return ""
 
 
-@st.cache_data(show_spinner=False, ttl=24*3600)
-def publication_image_urls_from_html(link: str, limit: int = 6) -> list[str]:
-    """Devuelve una lista de URLs de imágenes encontradas en el HTML de la publicación.
-
-    Si MercadoLibre redirige a 'account-verification', normalmente no hay fotos del producto en ese HTML.
-    """
-    url = (link or "").strip()
-    if not url:
-        return []
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Referer": "https://www.google.com/",
-        }
-        r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
-        if r.status_code != 200:
-            return []
-        final_url = (getattr(r, "url", "") or "").lower()
-        if "account-verification" in final_url:
-            return []
-        return _extract_image_urls_from_html(r.text or "", limit=limit)
-    except Exception:
-        return []
-
-    except Exception:
-        return []
-
-
-
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
     """Retorna (urls, link_publicacion).
 
-    Estrategia:
-    1) Busca link por SKU en tabla sku_publications.
-    2) Intenta extraer URLs desde el HTML (og/twitter/mlstatic).
-       - Si el HTML redirige a account-verification, normalmente no trae fotos del producto.
-    3) Fallback: buscadores (DuckDuckGo Images -> Bing Images) usando el MLC-ID del link.
+    Modo 'parche' (sin API): usa og:image del HTML para obtener la foto principal.
     """
     row = get_publication_row(sku)
     if not row:
         return [], ""
     link = (row.get("link") or "").strip()
-    title = (row.get("title") or "").strip()
     if not link:
         return [], ""
-
-    # 2) HTML de la publicación
-    urls = publication_image_urls_from_html(link, limit=6) if link else []
-    urls = _prefer_mlstatic(urls, limit=6)
-
-    # 3) Buscadores si no hay nada útil
-    if not urls:
-        queries = _build_fallback_queries(link, sku=sku, title=title)
-
-        for q in queries:
-            found = ddg_images_first_urls(q, max_results=8)
-            found = _prefer_mlstatic(found, limit=6)
-            if found:
-                urls = found
-                break
-
-        if not urls:
-            for q in queries:
-                found = bing_images_first_urls(q, max_results=8)
-                found = _prefer_mlstatic(found, limit=6)
-                if found:
-                    urls = found
-                    break
-
-    return urls, link
-
-# =========================
+    img = publication_main_image_from_html(link)
+    urls = [img] if img else []
+    return urls, link# =========================
 # CORTES (lista de SKUs)
 # =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
@@ -2696,58 +2312,11 @@ def page_picking():
     except Exception:
         pics, pub_link = [], ""
     if pics:
-        # Imagen principal (preferimos bytes con headers para evitar 403 de CDNs)
-        imgb = fetch_image_bytes(pics[0])
-        if imgb:
-            st.image(imgb, use_container_width=True)
-        else:
-            st.image(pics[0], use_container_width=True)
-
-        # Debug opcional
-        if st.session_state.get("debug_images", False):
-            with st.expander("DEBUG IMÁGENES", expanded=True):
-                st.write({
-                    "pics_count": len(pics),
-                    "pics_first": pics[0] if pics else "",
-                    "pub_link": pub_link,
-                    "pub_links_status": st.session_state.get("_pub_links_status"),
-                })
-
-                b0 = fetch_image_bytes(pics[0]) if pics else None
-                st.write({
-                    "first_image_bytes_ok": bool(b0),
-                    "first_image_bytes_len": len(b0) if b0 else 0,
-                })
-
-                if pub_link:
-                    try:
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-                            "Referer": "https://www.google.com/",
-                        }
-                        rr = requests.get(pub_link, headers=headers, timeout=12, allow_redirects=True)
-                        st.write({
-                            "html_status": rr.status_code,
-                            "final_url": getattr(rr, "url", ""),
-                            "html_len": len(rr.text or ""),
-                        })
-                        if rr.status_code == 200:
-                            st.write({"extracted_image_from_html": _extract_main_image_from_html(rr.text or "")})
-                    except Exception as e:
-                        st.write({"html_fetch_error": str(e)})
-
-        # Más fotos
+        st.image(pics[0], use_container_width=True)
         if len(pics) > 1:
             with st.expander(f"Ver más fotos ({len(pics)})", expanded=False):
-                imgs_bytes = []
-                for u in pics[:6]:
-                    b = fetch_image_bytes(u)
-                    imgs_bytes.append(b if b else u)
-                st.image(imgs_bytes, use_container_width=True)
-    else:
-        st.caption("Sin imagen disponible")
+                st.image(pics, use_container_width=True)
+
     st.markdown(f"### Solicitado: {qty_total}")
 
     if s["scan_status"] == "ok":
@@ -5289,11 +4858,7 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
             except Exception:
                 pics, _pub_link = [], ""
             if pics:
-                imgb = fetch_image_bytes(pics[0])
-                if imgb:
-                    st.image(imgb, use_container_width=True)
-                else:
-                    st.image(pics[0], use_container_width=True)
+                st.image(pics[0], use_container_width=True)
             else:
                 st.caption("Sin imagen disponible")
 
