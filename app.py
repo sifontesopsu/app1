@@ -15,43 +15,85 @@ import requests
 # =========================
 # IMÁGENES (descarga con headers para evitar 403 de CDNs)
 # =========================
-@st.cache_data(show_spinner=False, ttl=24*3600)
-def fetch_image_bytes(url: str) -> bytes | None:
-    url = (url or '').strip()
-    if not url:
-        return None
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-            'Accept-Language': 'es-CL,es;q=0.9,en;q=0.8',
-            'Referer': 'https://www.google.com/',
-        }
-        r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
-        if r.status_code != 200:
-            return None
-        ctype = (r.headers.get('content-type') or '').lower()
-        if 'image' not in ctype and not url.lower().endswith(('.jpg','.jpeg','.png','.webp','.gif')):
-            # a veces devuelve HTML
-            return None
-        return r.content
-    except Exception:
-        return None
-
-# =========================
-# FALLBACK: DuckDuckGo Images (sin API, scraping liviano)
-# =========================
-_DDG_VQD_RE = re.compile(r'vqd=([0-9-]+)&', re.IGNORECASE)
-
-@st.cache_data(show_spinner=False, ttl=24*3600)
+@st.cache_data(show_spinner=False, ttl=6*3600)
 def ddg_images_first_urls(query: str, max_results: int = 4) -> list[str]:
-    """Busca imágenes en DuckDuckGo y retorna URLs directas (pocas).
-
-    Nota: DuckDuckGo usa un token vqd obtenido desde la página HTML de búsqueda.
-    """
+    """Busca imágenes en DuckDuckGo y retorna URLs directas (best-effort)."""
     q = (query or "").strip()
     if not q:
         return []
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+        url0 = "https://duckduckgo.com/?" + urllib.parse.urlencode({"q": q, "iax": "images", "ia": "images"})
+        r0 = requests.get(url0, headers=headers, timeout=15, allow_redirects=True)
+        if r0.status_code != 200:
+            return []
+
+        html0 = r0.text or ""
+        vqd = ""
+
+        # Varias formas en que aparece vqd (DDG cambia seguido)
+        patterns = [
+            r"vqd=([0-9-]+)&",
+            r"vqd='([^']+)'",
+            r'"vqd"\s*:\s*"([^"]+)"',
+            r"\bvqd\s*:\s*\['([^']+)'\]",
+            r'\bvqd\s*:\s*\["([^"]+)"\]',
+        ]
+        for rx in patterns:
+            mm = re.search(rx, html0, re.IGNORECASE)
+            if mm:
+                vqd = mm.group(1)
+                break
+
+        if not vqd:
+            return []
+
+        params = {
+            "l": "cl-es",
+            "o": "json",
+            "q": q,
+            "vqd": vqd,
+            "f": ",,,",
+            "p": "1",
+        }
+        url1 = "https://duckduckgo.com/i.js?" + urllib.parse.urlencode(params)
+        r1 = requests.get(
+            url1,
+            headers={**headers, "Accept": "application/json,text/plain,*/*", "Referer": url0},
+            timeout=15,
+            allow_redirects=True,
+        )
+        if r1.status_code != 200:
+            return []
+
+        try:
+            data = r1.json()
+        except Exception:
+            txt = (r1.text or "").strip()
+            if not txt.startswith("{"):
+                return []
+            data = json.loads(txt)
+
+        results = data.get("results") or []
+        out: list[str] = []
+        for it in results:
+            u = (it.get("image") or it.get("thumbnail") or "").strip()
+            if not u:
+                continue
+            out.append(u)
+            if len(out) >= max_results:
+                break
+        return out
+    except Exception:
+        return []
+
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -110,21 +152,19 @@ def _build_fallback_queries(pub_link: str, sku: str = "", title: str = "") -> li
     mlc = _extract_mlc_id(pub_link)
     qs = []
     if mlc:
-        # query enfocada a imágenes de producto
+        qs.append(f"{mlc} http2.mlstatic.com D_Q_NP")
         qs.append(f"{mlc} mlstatic D_Q_NP")
+        qs.append(f"{mlc} site:mlstatic.com D_Q_NP")
         qs.append(f"{mlc} site:mlstatic.com")
-        qs.append(f"{mlc} producto")
-    # fallback por título/sku
     if title:
-        qs.append(f"{title} sitio:mercadolibre.cl imagen")
-        qs.append(f"{title} mlstatic")
+        qs.append(f"{title} MLC mlstatic")
+        qs.append(f"{title} mercadolibre imagen")
     if sku:
-        qs.append(f"{sku} mercadolibre imagen")
-    # dedup preservando orden
+        qs.append(f"{sku} MLC mercadolibre imagen")
     seen = set()
     out = []
     for q in qs:
-        q = q.strip()
+        q = (q or "").strip()
         if not q or q in seen:
             continue
         seen.add(q)
