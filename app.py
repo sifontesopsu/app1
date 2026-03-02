@@ -4939,10 +4939,10 @@ def page_sorting_camarero(inv_map_sku, barcode_to_sku):
                 pics, _pub_link = [], ""
             if pics:
                 imgb = fetch_image_bytes(pics[0])
-        if imgb:
-            st.image(imgb, use_container_width=True)
-        else:
-            st.image(pics[0], use_container_width=True)
+                if imgb:
+                    st.image(imgb, use_container_width=True)
+                else:
+                    st.image(pics[0], use_container_width=True)
             else:
                 st.caption("Sin imagen disponible")
 
