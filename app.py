@@ -1183,22 +1183,26 @@ def extract_ml_item_id(value: str) -> str:
     return prefix
 
 def import_publication_links_excel(file) -> pd.DataFrame:
-    """Lee Excel de publicaciones/imágenes.
+    """Lee Excel con columnas SKU + Link + Imagen (tolerante).
 
-    Soporta formatos:
-      - Antiguo: SKU, Id, Título, Link
-      - Nuevo: SKU, Link, Imagen (y opcional ImgStatus / Título / Id)
-
-    Devuelve columnas: sku_ml, ml_item_id, title, link, image_url
+    Acepta nombres comunes:
+      - SKU: sku, codigo, código, sku_ml
+      - Link: link, url, enlace
+      - Imagen: imagen, image_url, image, foto, picture
+      - Título: título, titulo, title
+      - Id: id, item, item_id, ml_item_id (opcional)
     """
     df = pd.read_excel(file, dtype=str)
+
+    # normalizar headers
     cols = {str(c).strip().lower(): c for c in df.columns}
 
     sku_c = cols.get("sku") or cols.get("codigo") or cols.get("código") or cols.get("sku_ml")
     id_c = cols.get("id") or cols.get("item") or cols.get("item_id") or cols.get("ml_item_id")
     title_c = cols.get("título") or cols.get("titulo") or cols.get("title")
     link_c = cols.get("link") or cols.get("url") or cols.get("enlace")
-    image_c = cols.get("imagen") or cols.get("image_url") or cols.get("image") or cols.get("foto")
+    img_c = (cols.get("imagen") or cols.get("image_url") or cols.get("image") or
+             cols.get("foto") or cols.get("picture") or cols.get("img") or cols.get("img_url"))
 
     if not sku_c:
         raise ValueError("No encuentro columna SKU en el Excel.")
@@ -1209,9 +1213,9 @@ def import_publication_links_excel(file) -> pd.DataFrame:
     out["sku_ml"] = df[sku_c].astype(str).map(normalize_sku)
     out["title"] = df[title_c].astype(str).fillna("").map(lambda x: str(x).strip()) if title_c else ""
     out["link"] = df[link_c].astype(str).fillna("").map(lambda x: str(x).strip()) if link_c else ""
+    out["image_url"] = df[img_c].astype(str).fillna("").map(lambda x: str(x).strip()) if img_c else ""
 
-    out["image_url"] = df[image_c].astype(str).fillna("").map(lambda x: str(x).strip()) if image_c else ""
-
+    # item id: preferir Id, si no, extraer desde link
     if id_c:
         out["ml_item_id"] = df[id_c].astype(str).fillna("").map(extract_ml_item_id)
     else:
@@ -1225,7 +1229,7 @@ def import_publication_links_excel(file) -> pd.DataFrame:
     return out[["sku_ml", "ml_item_id", "title", "link", "image_url"]]
 
 def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
-    """Inserta/actualiza tabla sku_publications desde el Excel.
+    """Inserta/actualiza tabla sku_publications desde el Excel (SKU + link/id/título + imagen).
 
     Retorna (ok_count, missing_id_count).
     """
@@ -1266,6 +1270,7 @@ def upsert_publications_to_db(df_pub: pd.DataFrame) -> tuple[int, int]:
             ok += 1
 
     return ok, noid
+
 
 def get_publication_row(sku: str) -> dict:
     sku = normalize_sku(sku)
@@ -1337,21 +1342,21 @@ def publication_main_image_from_html(link: str) -> str:
 
 
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
-    """Retorna (urls, link_publicacion).
+    """Retorna (urls, link_publicacion) usando el Excel links_con_imagenes.xlsx.
 
-    Nuevo modo estable:
-      - Usa image_url desde la tabla sku_publications (cargada desde links_con_imagenes.xlsx).
-      - No hace scraping HTML ni requests a Mercado Libre.
+    No hace scraping ni requests a Mercado Libre.
     """
     row = get_publication_row(sku)
     if not row:
         return [], ""
     link = (row.get("link") or "").strip()
-    image_url = (row.get("image_url") or "").strip()
-    if image_url:
-        return [image_url], link
-    return [], link
+    img = (row.get("image_url") or "").strip()
+    urls = [img] if img else []
+    return urls, link
 
+# =========================
+# CORTES (lista de SKUs)
+# =========================
 def load_cortes_set(path: str = CORTES_FILE) -> set:
     """Carga listado de SKUs que requieren corte manual desde Excel (defensivo)."""
     # Cache en session_state para evitar leer el Excel en cada rerun
@@ -4230,78 +4235,118 @@ def _s2_upsert_control(mid: int, pdf_name: str, pdf_bytes: bytes):
 
 
 
-def _s2_get_max_page(mid: int) -> int:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT MAX(page_no) FROM s2_sales WHERE manifest_id=?;", (mid,))
-    v = c.fetchone()[0]
-    conn.close()
-    try:
-        return int(v or 0)
-    except Exception:
+
+
+
+def _s2_upsert_controls_batch(mid: int, pdf_files: list):
+    """Carga varios Controls (PDF) en UNA sola tanda.
+    - No mezcla páginas: el 2do control comienza después del último número de página del 1ro, etc.
+    - Reemplaza (borra) lo anterior de este manifiesto y deja todo consolidado.
+    """
+    if not pdf_files:
         return 0
 
+    # Parsear todos primero (para offsets)
+    parsed = []
+    for f in pdf_files:
+        try:
+            name = getattr(f, "name", "control.pdf")
+            b = f.getvalue() if hasattr(f, "getvalue") else bytes(f)
+        except Exception:
+            continue
+        sales = _s2_parse_control_pdf(b)
+        parsed.append((name, b, sales))
 
-def _s2_append_control(mid: int, pdf_name: str, pdf_bytes: bytes, page_offset: int = 0) -> int:
-    """Append a control PDF into an existing manifest, offsetting page numbers to avoid mixing."""
-    pages_sales = _s2_parse_control_pdf(pdf_bytes)
+    if not parsed:
+        return 0
+
+    # Armar nombres (para auditoría)
+    names = [p[0] for p in parsed if p[0]]
+    combined_name = " + ".join(names)[:240] if names else "control_multi.pdf"
+
+    # Guardar 1er PDF como referencia (el schema actual sólo admite 1 blob)
+    first_name, first_bytes, _ = parsed[0]
+
     conn = get_conn()
     c = conn.cursor()
+
+    # store file metadata
+    c.execute("""INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
+                 VALUES(?, ?, ?, ?)
+                 ON CONFLICT(manifest_id) DO UPDATE SET
+                    control_pdf=excluded.control_pdf,
+                    control_name=excluded.control_name,
+                    updated_at=excluded.updated_at;""", (mid, first_bytes, combined_name, _s2_now_iso()))
+
+    # clear previous parsed sales/items
+    c.execute("DELETE FROM s2_items WHERE manifest_id=?;", (mid,))
+    c.execute("DELETE FROM s2_sales WHERE manifest_id=?;", (mid,))
 
     n_sales = 0
     page_counters = {}
-    for s in pages_sales:
-        sale_id = str(s.get("sale_id") or "")
-        if not sale_id:
-            continue
-        n_sales += 1
-        shipment_id = s.get("shipment_id")
-        raw_page_no = int(s.get("page_no") or 1)
-        page_no = int(raw_page_no + int(page_offset or 0))
-        pack_id = s.get("pack_id")
-        row_no = int(page_counters.get(page_no, 0) + 1)
-        page_counters[page_no] = row_no
-        customer = _s2_clean_person_text(s.get("customer"), 70)
-        destino = _s2_clean_person_text(s.get("destino"), 80)
+    page_offset = 0
 
-        c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, row_no, status, pack_id, customer, destino)
-                     VALUES(?,?,?,?,?, 'NEW', ?, ?, ?)
-                     ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
-                        shipment_id=excluded.shipment_id,
-                        page_no=excluded.page_no,
-                        status='NEW',
-                        mesa=NULL,
-                        opened_at=NULL,
-                        closed_at=NULL,
-                        pack_id=excluded.pack_id,
-                        customer=excluded.customer,
-                        destino=excluded.destino;""",
-                  (mid, sale_id, (str(shipment_id) if shipment_id else None), page_no, row_no,
-                   (str(pack_id) if pack_id else None), (str(customer) if customer else None),
-                   (str(destino) if destino else None)))
-
-        for it in s.get("items", []):
+    for _name, _bytes, pages_sales in parsed:
+        # calcular máximo de páginas en este control (para offset del siguiente)
+        max_page_this = 0
+        for s in pages_sales:
             try:
-                sku = str(it.get("sku"))
-                qty = int(it.get("qty") or 0)
+                p = int(s.get("page_no") or 1)
+                if p > max_page_this:
+                    max_page_this = p
             except Exception:
+                pass
+
+        for s in pages_sales:
+            sale_id = str(s.get("sale_id") or "")
+            if not sale_id:
                 continue
-            if not sku or qty <= 0:
-                continue
-            c.execute("""INSERT INTO s2_items(manifest_id, sale_id, sku, description, qty, picked, status)
-                         VALUES(?,?,?,?,?,0,'PENDING')
-                         ON CONFLICT(manifest_id, sale_id, sku) DO UPDATE SET
-                            description=excluded.description,
-                            qty=excluded.qty,
-                            picked=0,
-                            status='PENDING';""", (mid, sale_id, sku, it.get("desc",""), qty))
+
+            n_sales += 1
+            shipment_id = s.get("shipment_id")
+            page_no = int(s.get("page_no") or 1) + int(page_offset)
+            pack_id = s.get("pack_id")
+
+            row_no = int(page_counters.get(page_no, 0) + 1)
+            page_counters[page_no] = row_no
+
+            customer = _s2_clean_person_text(s.get("customer"), 70)
+            destino = _s2_clean_person_text(s.get("destino"), 80)
+
+            c.execute("""INSERT INTO s2_sales(manifest_id, sale_id, shipment_id, page_no, row_no, status, pack_id, customer, destino)
+                         VALUES(?,?,?,?,?, 'NEW', ?, ?, ?)
+                         ON CONFLICT(manifest_id, sale_id) DO UPDATE SET
+                            shipment_id=excluded.shipment_id,
+                            page_no=excluded.page_no,
+                            row_no=excluded.row_no,
+                            status='NEW',
+                            pack_id=excluded.pack_id,
+                            customer=excluded.customer,
+                            destino=excluded.destino;""", (mid, sale_id, shipment_id, page_no, row_no, pack_id, customer, destino))
+
+            # items
+            items = s.get("items") or []
+            for it in items:
+                sku = normalize_sku(it.get("sku") or "")
+                if not sku:
+                    continue
+                qty = int(it.get("qty") or 0)
+                if qty <= 0:
+                    continue
+                c.execute("""INSERT INTO s2_items(manifest_id, sale_id, sku, description, qty, picked, status)
+                             VALUES(?,?,?,?,?, 0, 'PENDING')
+                             ON CONFLICT(manifest_id, sale_id, sku) DO UPDATE SET
+                                description=excluded.description,
+                                qty=excluded.qty,
+                                picked=0,
+                                status='PENDING';""", (mid, sale_id, sku, it.get("desc",""), qty))
+
+        # siguiente control arranca después del último page de este control
+        page_offset += int(max_page_this)
 
     conn.commit()
     conn.close()
     return n_sales
-
-
-
 def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
     # Detectar ship ids y relaciones pack/venta -> ship
     pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(labels_bytes)
@@ -4421,6 +4466,97 @@ def _s2_upsert_labels(mid: int, labels_name: str, labels_bytes: bytes):
     conn.close()
     return len(shipment_ids)
 
+
+
+def _s2_upsert_labels_batch(mid: int, label_files: list):
+    """Carga varios archivos de etiquetas (TXT/ZPL) consolidando IDs.
+    Reemplaza (borra) las etiquetas anteriores del manifiesto y deja todo unido.
+    """
+    if not label_files:
+        return 0
+
+    all_pack_to_ship = {}
+    all_sale_to_ship = {}
+    all_shipments = set()
+    combined_txt_parts = []
+    names = []
+
+    for f in label_files:
+        try:
+            name = getattr(f, "name", "etiquetas.txt")
+            b = f.getvalue() if hasattr(f, "getvalue") else bytes(f)
+        except Exception:
+            continue
+
+        names.append(name)
+
+        pack_to_ship, sale_to_ship, shipment_ids = _s2_parse_labels_txt(b)
+        all_pack_to_ship.update({str(k): str(v) for k, v in (pack_to_ship or {}).items()})
+        all_sale_to_ship.update({str(k): str(v) for k, v in (sale_to_ship or {}).items()})
+        for sid in (shipment_ids or []):
+            if sid:
+                all_shipments.add(str(sid))
+
+        try:
+            combined_txt_parts.append(b.decode("utf-8", errors="ignore"))
+        except Exception:
+            combined_txt_parts.append(str(b))
+
+    # Guardar 1er archivo como referencia
+    first = label_files[0]
+    first_name = getattr(first, "name", "etiquetas.txt")
+    first_bytes = first.getvalue() if hasattr(first, "getvalue") else bytes(first)
+
+    combined_name = " + ".join([n for n in names if n])[:240] if names else first_name
+    combined_txt = "\n\n".join(combined_txt_parts)
+    try:
+        combined_bytes = combined_txt.encode("utf-8", errors="ignore")
+    except Exception:
+        combined_bytes = first_bytes
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""INSERT INTO s2_files(manifest_id, labels_txt, labels_name, updated_at)
+                 VALUES(?, ?, ?, ?)
+                 ON CONFLICT(manifest_id) DO UPDATE SET
+                    labels_txt=excluded.labels_txt,
+                    labels_name=excluded.labels_name,
+                    updated_at=excluded.updated_at;""", (mid, combined_bytes, combined_name, _s2_now_iso()))
+
+    # limpiar y reinsertar shipment ids
+    c.execute("DELETE FROM s2_labels WHERE manifest_id=?;", (mid,))
+    for sid in sorted(all_shipments):
+        c.execute("INSERT OR REPLACE INTO s2_labels(manifest_id, shipment_id, raw) VALUES(?,?,NULL);", (mid, str(sid)))
+
+    # guardar pack->ship
+    if all_pack_to_ship:
+        for pack_id, ship_id in all_pack_to_ship.items():
+            c.execute("INSERT OR REPLACE INTO s2_pack_ship(manifest_id, pack_id, shipment_id) VALUES(?,?,?);", (mid, str(pack_id), str(ship_id)))
+
+        # completar shipment_id en ventas usando pack_id si falta
+        try:
+            c.execute("""UPDATE s2_sales
+                           SET shipment_id = (
+                               SELECT ps.shipment_id FROM s2_pack_ship ps
+                               WHERE ps.manifest_id=s2_sales.manifest_id AND ps.pack_id=s2_sales.pack_id
+                           )
+                           WHERE manifest_id=? AND (shipment_id IS NULL OR shipment_id='') AND pack_id IS NOT NULL AND pack_id!='';""", (mid,))
+        except Exception:
+            pass
+
+    # completar shipment_id en ventas usando sale_id -> ship si viene
+    if all_sale_to_ship:
+        try:
+            for sale_id, ship_id in all_sale_to_ship.items():
+                c.execute("""UPDATE s2_sales
+                             SET shipment_id=?
+                             WHERE manifest_id=? AND sale_id=? AND (shipment_id IS NULL OR shipment_id='');""", (str(ship_id), mid, str(sale_id)))
+        except Exception:
+            pass
+
+    conn.commit()
+    conn.close()
+    return len(all_shipments)
 def _s2_get_stats(mid: int):
     """
     Stats del manifiesto (Sorting v2).
@@ -4551,27 +4687,30 @@ def _s2_get_stats(mid: int):
 def _s2_reset_all_sorting():
     """Hard reset of Sorting module only (keeps other modules intact)."""
     conn = get_conn()
-    c = conn.cursor()
-    # New (s2_*) tables (some deployments may not have all of them yet)
-    s2_tables = [
-        "s2_page_assign",
-        "s2_pack_ship",
-        "s2_labels",
-        "s2_items",
-        "s2_sales",
-        "s2_files",
-        "s2_manifests",
-        "s2_packing",
-        "s2_dispatch",
-    ]
-    for t in s2_tables:
+    try:
+        c = conn.cursor()
+        # New (s2_*) tables
+        s2_tables = [
+            "s2_page_assign",
+            "s2_pack_ship",
+            "s2_labels",
+            "s2_items",
+            "s2_sales",
+            "s2_files",
+            "s2_manifests",
+        ]
+        for t in s2_tables:
+            try:
+                c.execute(f"DELETE FROM {t};")
+            except Exception:
+                # Si la tabla no existe por alguna razón, no botar el reset
+                pass
+        conn.commit()
+    finally:
         try:
-            c.execute(f"DELETE FROM {t};")
+            conn.close()
         except Exception:
-            # table may not exist in older DBs
             pass
-    conn.commit()
-    conn.close()
 
 
 def _s2_get_pages(mid:int):
@@ -4733,124 +4872,31 @@ def page_sorting_upload(inv_map_sku, barcode_to_sku):
     if lock_control:
         st.warning("🔒 Ya hay un Control cargado en el manifiesto activo. Para cargar un manifiesto nuevo debes **Cerrar** o **Reiniciar** el Sorting desde Administrador.")
 
-    
-    mode = st.radio(
-        "Modo de carga",
-        ["Uno (1 Control + 1 Etiquetas)", "Varios (lote: varios Controles + varias Etiquetas)"],
-        horizontal=True,
-        key="s2_upload_mode",
-    )
-
-    if mode.startswith("Uno"):
-        col1, col2 = st.columns(2)
-        with col1:
-            pdf = st.file_uploader("Control (PDF)", type=["pdf"], key="s2_control_pdf", disabled=lock_control)
-        with col2:
-            zpl = st.file_uploader("Etiquetas de envío (TXT/ZPL)", type=["txt", "zpl"], key="s2_labels_txt")
-
-        if pdf is not None:
-            # Limpia asignaciones de páginas previas (por si el manifiesto se reutiliza)
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_pack_ship WHERE manifest_id=?;", (mid,))
-            conn.commit()
-            conn.close()
-
-            n_sales = _s2_upsert_control(mid, getattr(pdf, "name", "control.pdf"), pdf.getvalue())
-            st.success(f"Control cargado. Ventas detectadas: {n_sales}")
-            _s2_auto_assign_pages(mid, num_mesas=10)
-
-        if zpl is not None:
-            n_labels = _s2_upsert_labels(mid, getattr(zpl, "name", "etiquetas.txt"), zpl.getvalue())
-            st.success(f"Etiquetas cargadas. IDs detectados: {n_labels}")
-
-    else:
-        st.info("📦 Lote: se suman las páginas de todos los Controles (sin mezclar). Ej: 5 + 5 => 10 páginas para asignar a mesas.")
-        col1, col2 = st.columns(2)
-        with col1:
-            pdfs = st.file_uploader(
-                "Controles (PDF) — puedes subir varios",
-                type=["pdf"],
-                accept_multiple_files=True,
-                key="s2_control_pdfs",
-                disabled=lock_control,
-            )
-        with col2:
-            zpls = st.file_uploader(
-                "Etiquetas (TXT/ZPL) — puedes subir varios",
-                type=["txt", "zpl"],
-                accept_multiple_files=True,
-                key="s2_labels_txts",
-            )
-
-        do_batch = st.button(
-            "Procesar lote en una sola tanda",
-            type="primary",
-            disabled=lock_control or (not pdfs and not zpls),
-            key="s2_do_batch",
+    col1, col2 = st.columns(2)
+    with col1:
+        pdfs = st.file_uploader(
+            "Control (PDF) — puedes subir varios",
+            type=["pdf"],
+            key="s2_control_pdf_multi",
+            disabled=lock_control,
+            accept_multiple_files=True,
+        )
+    with col2:
+        zpls = st.file_uploader(
+            "Etiquetas de envío (TXT/ZPL) — puedes subir varios",
+            type=["txt", "zpl"],
+            key="s2_labels_txt_multi",
+            accept_multiple_files=True,
         )
 
-        if do_batch:
-            # Limpieza dura del manifiesto activo (solo datos del Sorting v2 del manifiesto)
-            conn = get_conn()
-            c = conn.cursor()
-            c.execute("DELETE FROM s2_page_assign WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_pack_ship WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_labels WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_items WHERE manifest_id=?;", (mid,))
-            c.execute("DELETE FROM s2_sales WHERE manifest_id=?;", (mid,))
-            conn.commit()
-            conn.close()
+    if pdfs:
+        n_sales = _s2_upsert_controls_batch(mid, pdfs)
+        st.success(f"Control(es) cargado(s). Ventas detectadas: {n_sales}")
+        _s2_auto_assign_pages(mid, num_mesas=10)
 
-            # 1) Controles: append con offset de páginas
-            total_sales = 0
-            if pdfs:
-                offset = 0
-                names = []
-                for i, pdf in enumerate(pdfs):
-                    names.append(getattr(pdf, "name", f"control_{i+1}.pdf"))
-                    added = _s2_append_control(mid, names[-1], pdf.getvalue(), page_offset=offset)
-                    total_sales += int(added or 0)
-                    offset = _s2_get_max_page(mid)
-
-                # Guarda referencia del lote en s2_files (solo como registro)
-                try:
-                    first_pdf = pdfs[0].getvalue()
-                except Exception:
-                    first_pdf = None
-                conn = get_conn()
-                c = conn.cursor()
-                c.execute(
-                    """INSERT INTO s2_files(manifest_id, control_pdf, control_name, updated_at)
-                         VALUES(?, ?, ?, ?)
-                         ON CONFLICT(manifest_id) DO UPDATE SET
-                            control_pdf=excluded.control_pdf,
-                            control_name=excluded.control_name,
-                            updated_at=excluded.updated_at;""",
-                    (mid, first_pdf, "LOTE: " + " + ".join(names), _s2_now_iso()),
-                )
-                conn.commit()
-                conn.close()
-
-                st.success(f"Controles procesados en lote. Ventas totales detectadas: {total_sales}")
-                _s2_auto_assign_pages(mid, num_mesas=10)
-
-            # 2) Etiquetas: concatenar y cargar 1 sola vez
-            if zpls:
-                parts = []
-                zpl_names = []
-                for i, z in enumerate(zpls):
-                    zpl_names.append(getattr(z, "name", f"etiquetas_{i+1}.txt"))
-                    try:
-                        parts.append(z.getvalue())
-                    except Exception:
-                        pass
-                labels_bytes = b"\n\n".join([p for p in parts if p])
-                n_labels = _s2_upsert_labels(mid, "LOTE: " + " + ".join(zpl_names), labels_bytes)
-                st.success(f"Etiquetas procesadas en lote. IDs detectados: {n_labels}")
-
-    # Resumen
+    if zpls:
+        n_labels = _s2_upsert_labels_batch(mid, zpls)
+        st.success(f"Etiqueta(s) cargada(s). Envíos únicos detectados: {n_labels}")
 
     # Resumen (para evitar confusión: ventas y etiquetas NO siempre coinciden 1:1)
     stats = _s2_get_stats(mid)
