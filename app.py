@@ -7,6 +7,7 @@ from datetime import datetime
 import re
 import html
 import json
+import urllib.parse
 import random
 import string
 import requests
@@ -36,6 +37,118 @@ def fetch_image_bytes(url: str) -> bytes | None:
         return r.content
     except Exception:
         return None
+
+# =========================
+# FALLBACK: DuckDuckGo Images (sin API, scraping liviano)
+# =========================
+_DDG_VQD_RE = re.compile(r'vqd=([0-9-]+)&', re.IGNORECASE)
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def ddg_images_first_urls(query: str, max_results: int = 4) -> list[str]:
+    """Busca imágenes en DuckDuckGo y retorna URLs directas (pocas).
+
+    Nota: DuckDuckGo usa un token vqd obtenido desde la página HTML de búsqueda.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+        }
+        # 1) Obtener vqd
+        url0 = "https://duckduckgo.com/?" + urllib.parse.urlencode({"q": q})
+        r0 = requests.get(url0, headers=headers, timeout=12)
+        if r0.status_code != 200:
+            return []
+        m = _DDG_VQD_RE.search(r0.text or "")
+        if not m:
+            # fallback regex alterna
+            m = re.search(r'"vqd"\s*:\s*"([^"]+)"', r0.text or "")
+            if m:
+                vqd = m.group(1)
+            else:
+                return []
+        else:
+            vqd = m.group(1)
+
+        # 2) Consultar endpoint JSON
+        params = {
+            "l": "cl-es",
+            "o": "json",
+            "q": q,
+            "vqd": vqd,
+            "f": ",,,",
+            "p": "1",  # safe search moderate
+        }
+        url1 = "https://duckduckgo.com/i.js?" + urllib.parse.urlencode(params)
+        r1 = requests.get(url1, headers={**headers, "Accept": "application/json,text/plain,*/*"}, timeout=12)
+        if r1.status_code != 200:
+            return []
+        data = r1.json()
+        results = data.get("results") or []
+        out = []
+        for it in results:
+            u = (it.get("image") or it.get("thumbnail") or "").strip()
+            if not u:
+                continue
+            # Preferimos mlstatic cuando exista
+            out.append(u)
+            if len(out) >= max_results:
+                break
+        return out
+    except Exception:
+        return []
+
+def _extract_mlc_id(text: str) -> str:
+    m = re.search(r'\bMLC-\d+\b', text or "")
+    return m.group(0) if m else ""
+
+def _build_fallback_queries(pub_link: str, sku: str = "", title: str = "") -> list[str]:
+    mlc = _extract_mlc_id(pub_link)
+    qs = []
+    if mlc:
+        # query enfocada a imágenes de producto
+        qs.append(f"{mlc} mlstatic D_Q_NP")
+        qs.append(f"{mlc} site:mlstatic.com")
+        qs.append(f"{mlc} producto")
+    # fallback por título/sku
+    if title:
+        qs.append(f"{title} sitio:mercadolibre.cl imagen")
+        qs.append(f"{title} mlstatic")
+    if sku:
+        qs.append(f"{sku} mercadolibre imagen")
+    # dedup preservando orden
+    seen = set()
+    out = []
+    for q in qs:
+        q = q.strip()
+        if not q or q in seen:
+            continue
+        seen.add(q)
+        out.append(q)
+    return out
+
+def _prefer_mlstatic(urls: list[str], limit: int = 6) -> list[str]:
+    # ordena priorizando mlstatic y patrones de imagen de producto
+    def score(u: str) -> int:
+        ul = (u or "").lower()
+        s = 0
+        if "mlstatic.com" in ul:
+            s += 50
+        if "/d_q_np_" in ul or "/d_nq_np_" in ul:
+            s += 200
+        if "-mlc" in ul:
+            s += 80
+        bad = ["logo", "mercadolibre/logo", "ui-navigation", "favicon", "sprite", "header", "nav", "frontend-assets"]
+        if any(b in ul for b in bad):
+            s -= 1000
+        return s
+    urls2 = [u for u in urls if u]
+    urls2.sort(key=score, reverse=True)
+    return urls2[:limit]
 
 
 from contextlib import contextmanager
@@ -1408,7 +1521,10 @@ def publication_main_image_from_html(link: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def publication_image_urls_from_html(link: str, limit: int = 6) -> list[str]:
-    """Devuelve una lista de URLs de imágenes encontradas en el HTML de la publicación."""
+    """Devuelve una lista de URLs de imágenes encontradas en el HTML de la publicación.
+
+    Si MercadoLibre redirige a 'account-verification', normalmente no hay fotos del producto en ese HTML.
+    """
     url = (link or "").strip()
     if not url:
         return []
@@ -1424,7 +1540,13 @@ def publication_image_urls_from_html(link: str, limit: int = 6) -> list[str]:
         r = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
         if r.status_code != 200:
             return []
+        final_url = (getattr(r, "url", "") or "").lower()
+        if "account-verification" in final_url:
+            return []
         return _extract_image_urls_from_html(r.text or "", limit=limit)
+    except Exception:
+        return []
+
     except Exception:
         return []
 
@@ -1434,18 +1556,34 @@ def publication_image_urls_from_html(link: str, limit: int = 6) -> list[str]:
 def get_picture_urls_for_sku(sku: str) -> tuple[list[str], str]:
     """Retorna (urls, link_publicacion).
 
-    Sin API:
-    - Busca el link de la publicación por SKU en tabla sku_publications.
-    - Descarga el HTML y extrae og:image / twitter:image / fallback mlstatic.
+    Estrategia:
+    1) Busca link por SKU en tabla sku_publications.
+    2) Intenta extraer URLs desde el HTML (og/twitter/mlstatic).
+       - Si el HTML redirige a account-verification, normalmente no trae fotos del producto.
+    3) Fallback: buscar en DuckDuckGo Images usando el MLC-ID del link (o título/sku).
     """
     row = get_publication_row(sku)
     if not row:
         return [], ""
     link = (row.get("link") or "").strip()
+    title = (row.get("title") or "").strip()
     if not link:
         return [], ""
-    urls = publication_image_urls_from_html(link, limit=6)
+
+    # 2) HTML de la publicación
+    urls = publication_image_urls_from_html(link, limit=6) if link else []
+
+    # Si el HTML no entregó nada útil, usamos búsqueda
+    if not urls:
+        for q in _build_fallback_queries(link, sku=sku, title=title):
+            found = ddg_images_first_urls(q, max_results=6)
+            found = _prefer_mlstatic(found, limit=6)
+            if found:
+                urls = found
+                break
+
     return urls, link
+
 # =========================
 # CORTES (lista de SKUs)
 # =========================
