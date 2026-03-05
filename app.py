@@ -3411,6 +3411,48 @@ def page_admin():
     if not pickers_rows:
         st.info("No hay pickeadores creados todavía.")
     else:
+                # Si el picking se generó con 1 solo picker, aquí no habrá destinos para repartir.
+        # Permitimos crear pickeadores extra (P2, P3, ...) directamente desde este panel.
+        if len(pickers_rows) == 1:
+            st.warning("Solo hay 1 pickeador creado. Crea pickeadores destino para poder repartir tareas.")
+            with st.expander("➕ Crear pickeadores destino", expanded=True):
+                add_n_pre = st.number_input(
+                    "Cuántos pickeadores destino agregar",
+                    min_value=1, max_value=10, value=1, step=1,
+                    key="adm_add_pickers_n_pre"
+                )
+                if st.button("Crear pickeadores ahora", key="adm_add_pickers_btn_pre"):
+                    try:
+                        # Calcula el siguiente P# disponible
+                        nums = []
+                        for _n in [r[1] for r in pickers_rows]:
+                            _s = str(_n).strip()
+                            if _s.startswith("P") and _s[1:].isdigit():
+                                nums.append(int(_s[1:]))
+                        next_i = (max(nums) + 1) if nums else 1
+
+                        created = 0
+                        for k in range(int(add_n_pre)):
+                            new_name = f"P{next_i + k}"
+                            try:
+                                c.execute("INSERT INTO pickers (name) VALUES (?)", (new_name,))
+                                created += 1
+                            except Exception:
+                                pass
+                        if created > 0:
+                            conn.commit()
+                            sfx_emit("OK")
+                            st.success(f"Se crearon {created} pickeadores. Ya puedes repartir tareas.")
+                            st.rerun()
+                        else:
+                            conn.rollback()
+                            sfx_emit("ERR")
+                            st.error("No se creó ningún pickeador nuevo (puede que ya existan).")
+                    except Exception as e:
+                        conn.rollback()
+                        sfx_emit("ERR")
+                        st.error(f"Error creando pickeadores: {e}")
+
         picker_id_to_name = {int(pid): pname for pid, pname in pickers_rows}
         picker_names = [pname for _, pname in pickers_rows]
         picker_name_to_id = {pname: int(pid) for pid, pname in pickers_rows}
