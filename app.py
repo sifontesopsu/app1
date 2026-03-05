@@ -1795,7 +1795,6 @@ def save_orders_and_build_ots(
 
     # título ML preferido por SKU (si no hay título técnico)
     title_ml_by_sku = {}
-    _fam_prefix6 = {}  # prefijo6 -> familia (para packs sin familia)
     if "title_ml" in dfw.columns:
         for sku, g in dfw.groupby("sku_ml"):
             t = ""
@@ -1806,35 +1805,33 @@ def save_orders_and_build_ots(
                     break
             title_ml_by_sku[sku] = t
 
-        # Prefijos (primeros 6 dígitos) para inferir packs sin Familia (packs)
-        # Construimos un índice prefijo6 -> familia usando SKUs del maestro que SÍ traen familia.
+        # Prefijos (SKU base -> Familia) para inferir packs sin Familia (prefijo más largo)
+        _fam_bases = []
         try:
-            for k, v in (familia_map_sku or {}).items():
-                base_sku = normalize_sku(k)
-                fam = str(v or "").strip()
-                if not base_sku or not fam or fam.lower() == "nan":
-                    continue
-                if len(base_sku) < 6:
-                    continue
-                p6 = base_sku[:6]
-                if p6 and p6 not in _fam_prefix6:
-                    _fam_prefix6[p6] = fam
+            _fam_bases = [
+                (normalize_sku(k), str(v).strip())
+                for k, v in (familia_map_sku or {}).items()
+                if str(v or "").strip() and str(v).strip().lower() != "nan"
+            ]
+            # Evitar prefijos demasiado cortos que podrían mezclar familias
+            _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
+            _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
         except Exception:
-            _fam_prefix6 = {}
+            _fam_bases = []
     def _fam_for_sku(sku: str) -> str:
             # 1) Familia directa en maestro
             f = str(familia_map_sku.get(sku, "") or "").strip()
             if f and f.lower() != "nan":
                 return f
 
-            # 2) Fallback: inferir por prefijo de 6 dígitos (packs)
+            # 2) Fallback: inferir por "prefijo más largo" (packs)
+            # Busca un SKU base del maestro (con familia) que sea prefijo del SKU actual.
             ssku = normalize_sku(sku)
             if not ssku:
                 return "Sin Familia"
-            if len(ssku) >= 6:
-                fam = _fam_prefix6.get(ssku[:6], "")
-                if fam:
-                    return fam
+            for base_sku, base_fam in _fam_bases:
+                if ssku != base_sku and ssku.startswith(base_sku):
+                    return base_fam
             return "Sin Familia"
 
     dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
