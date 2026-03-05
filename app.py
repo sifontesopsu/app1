@@ -1797,6 +1797,7 @@ def save_orders_and_build_ots(
     dfw = sales_df.copy()
     dfw["sku_ml"] = dfw["sku_ml"].map(normalize_sku)
     dfw = dfw[dfw["sku_ml"].ne("")].copy()
+
     # título ML preferido por SKU (si no hay título técnico)
     title_ml_by_sku = {}
     if "title_ml" in dfw.columns:
@@ -1809,51 +1810,34 @@ def save_orders_and_build_ots(
                     break
             title_ml_by_sku[sku] = t
 
-    # --- Inferencia de familia para packs SIN familia ---
-    # Regla Aurora: los packs comparten los primeros dígitos con el SKU base que sí tiene familia.
-    # Para ser quirúrgicos, NO tocamos nada de lectura de códigos de barra; solo etiquetamos/ordenamos.
-    PREFIX_LEN = 5  # ajustable si en tu maestro se comporta mejor con 4/6
-
-    # Mapa prefijo -> familia (elige la familia más frecuente en ese prefijo)
-    _prefix_counts: dict[str, dict[str, int]] = {}
-    for _sku_base, _fam in (familia_map_sku or {}).items():
-        _s = normalize_sku(_sku_base)
-        _f = str(_fam or "").strip()
-        if not _s or not _f or _f.lower() == "nan":
-            continue
-        _p = _s[:PREFIX_LEN] if len(_s) >= PREFIX_LEN else _s
-        _prefix_counts.setdefault(_p, {})
-        _prefix_counts[_p][_f] = _prefix_counts[_p].get(_f, 0) + 1
-
-    _prefix_to_family: dict[str, str] = {}
-    for _p, _fd in _prefix_counts.items():
+        # Prefijos (SKU base -> Familia) para inferir packs sin Familia (prefijo más largo)
+        _fam_bases = []
         try:
-            _prefix_to_family[_p] = max(_fd.items(), key=lambda kv: kv[1])[0]
+            _fam_bases = [
+                (normalize_sku(k), str(v).strip())
+                for k, v in (familia_map_sku or {}).items()
+                if str(v or "").strip() and str(v).strip().lower() != "nan"
+            ]
+            # Evitar prefijos demasiado cortos que podrían mezclar familias
+            _fam_bases = [(k, v) for k, v in _fam_bases if k and len(k) >= 4]
+            _fam_bases.sort(key=lambda kv: len(kv[0]), reverse=True)
         except Exception:
-            pass
-
+            _fam_bases = []
     def _fam_for_sku(sku: str) -> str:
-        # 1) Familia directa en maestro
-        f = str((familia_map_sku or {}).get(sku, "") or "").strip()
-        if f and f.lower() != "nan":
-            return f
+            # 1) Familia directa en maestro
+            f = str(familia_map_sku.get(sku, "") or "").strip()
+            if f and f.lower() != "nan":
+                return f
 
-        # 2) Fallback: por prefijo (packs)
-        ssku = normalize_sku(sku)
-        if not ssku:
+            # 2) Fallback: inferir por "prefijo más largo" (packs)
+            # Busca un SKU base del maestro (con familia) que sea prefijo del SKU actual.
+            ssku = normalize_sku(sku)
+            if not ssku:
+                return "Sin Familia"
+            for base_sku, base_fam in _fam_bases:
+                if ssku != base_sku and ssku.startswith(base_sku):
+                    return base_fam
             return "Sin Familia"
-
-        p = ssku[:PREFIX_LEN] if len(ssku) >= PREFIX_LEN else ssku
-        if p in _prefix_to_family:
-            return _prefix_to_family[p]
-
-        # 3) Fallback extra: probar prefijos más cortos (evita dejar packs al final)
-        for L in range(min(PREFIX_LEN - 1, len(ssku)), 2, -1):
-            p2 = ssku[:L]
-            if p2 in _prefix_to_family:
-                return _prefix_to_family[p2]
-
-        return "Sin Familia"
 
     dfw["family"] = dfw["sku_ml"].map(_fam_for_sku)
 
@@ -3411,48 +3395,6 @@ def page_admin():
     if not pickers_rows:
         st.info("No hay pickeadores creados todavía.")
     else:
-                # Si el picking se generó con 1 solo picker, aquí no habrá destinos para repartir.
-        # Permitimos crear pickeadores extra (P2, P3, ...) directamente desde este panel.
-        if len(pickers_rows) == 1:
-            st.warning("Solo hay 1 pickeador creado. Crea pickeadores destino para poder repartir tareas.")
-            with st.expander("➕ Crear pickeadores destino", expanded=True):
-                add_n_pre = st.number_input(
-                    "Cuántos pickeadores destino agregar",
-                    min_value=1, max_value=10, value=1, step=1,
-                    key="adm_add_pickers_n_pre"
-                )
-                if st.button("Crear pickeadores ahora", key="adm_add_pickers_btn_pre"):
-                    try:
-                        # Calcula el siguiente P# disponible
-                        nums = []
-                        for _n in [r[1] for r in pickers_rows]:
-                            _s = str(_n).strip()
-                            if _s.startswith("P") and _s[1:].isdigit():
-                                nums.append(int(_s[1:]))
-                        next_i = (max(nums) + 1) if nums else 1
-
-                        created = 0
-                        for k in range(int(add_n_pre)):
-                            new_name = f"P{next_i + k}"
-                            try:
-                                c.execute("INSERT INTO pickers (name) VALUES (?)", (new_name,))
-                                created += 1
-                            except Exception:
-                                pass
-                        if created > 0:
-                            conn.commit()
-                            sfx_emit("OK")
-                            st.success(f"Se crearon {created} pickeadores. Ya puedes repartir tareas.")
-                            st.rerun()
-                        else:
-                            conn.rollback()
-                            sfx_emit("ERR")
-                            st.error("No se creó ningún pickeador nuevo (puede que ya existan).")
-                    except Exception as e:
-                        conn.rollback()
-                        sfx_emit("ERR")
-                        st.error(f"Error creando pickeadores: {e}")
-
         picker_id_to_name = {int(pid): pname for pid, pname in pickers_rows}
         picker_names = [pname for _, pname in pickers_rows]
         picker_name_to_id = {pname: int(pid) for pid, pname in pickers_rows}
@@ -3521,45 +3463,33 @@ def page_admin():
                 other_picker_names = [n for n in picker_names if n != src_name]
                 if not other_picker_names:
                     st.warning("No hay pickeadores destino disponibles.")
-                    with st.expander("➕ Agregar pickeadores destino"):
-                        add_n = st.number_input(
-                            "Cuántos pickeadores quieres agregar",
-                            min_value=1, max_value=10, value=1, step=1,
-                            key="adm_add_pickers_n"
+
+                    # Caso típico: el picking se generó con 1 solo picker (ej: solo P1).
+                    # Permite crear pickeadores adicionales aquí mismo, sin afectar lectura de EAN/barcodes.
+                    with st.expander("➕ Crear pickeadores destino", expanded=True):
+                        current_n = len(picker_names)
+                        total_target = st.number_input(
+                            "Cantidad total de pickeadores (P1..Pn)",
+                            min_value=max(2, current_n),
+                            max_value=12,
+                            value=max(2, current_n + 1),
+                            step=1,
+                            key="adm_create_pickers_total",
                         )
-                        if st.button("Crear pickeadores", key="adm_add_pickers_btn"):
-                            try:
-                                # Calcula el siguiente P# disponible
-                                nums = []
-                                for _n in picker_names:
-                                    _s = str(_n).strip()
-                                    if _s.startswith("P") and _s[1:].isdigit():
-                                        nums.append(int(_s[1:]))
-                                next_i = (max(nums) + 1) if nums else 1
-
-                                created = 0
-                                for k in range(int(add_n)):
-                                    new_name = f"P{next_i + k}"
-                                    try:
-                                        c.execute("INSERT INTO pickers (name) VALUES (?)", (new_name,))
-                                        created += 1
-                                    except Exception:
-                                        # Si ya existe (UNIQUE), lo saltamos sin romper el flujo
-                                        pass
-
-                                if created > 0:
-                                    conn.commit()
-                                    sfx_emit("OK")
-                                    st.success(f"Se crearon {created} pickeadores. Ya puedes repartir tareas.")
-                                    st.rerun()
-                                else:
-                                    conn.rollback()
-                                    sfx_emit("ERR")
-                                    st.error("No se creó ningún pickeador nuevo (puede que ya existan).")
-                            except Exception as e:
-                                conn.rollback()
-                                sfx_emit("ERR")
-                                st.error(f"No se pudo crear pickeadores: {e}")
+                        if st.button("Crear/asegurar pickeadores", key="adm_create_pickers_btn"):
+                            existing = set(picker_names)
+                            created = []
+                            for i in range(1, int(total_target) + 1):
+                                pname = f"P{i}"
+                                if pname not in existing:
+                                    c.execute("INSERT INTO pickers (name) VALUES (?)", (pname,))
+                                    created.append(pname)
+                            conn.commit()
+                            if created:
+                                st.success("Pickeadores creados: " + ", ".join(created))
+                            else:
+                                st.info("Ya existían los pickeadores solicitados.")
+                            st.rerun()
                 else:
                     dests = st.multiselect("Pickeadores destino", other_picker_names, default=other_picker_names, key="adm_reassign_dests")
                     if not dests:
