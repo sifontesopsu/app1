@@ -3463,35 +3463,24 @@ def page_admin():
                 other_picker_names = [n for n in picker_names if n != src_name]
                 if not other_picker_names:
                     st.warning("No hay pickeadores destino disponibles.")
-
-                    # Si el picking se generó con 1 solo pickeador (ej: solo P1),
-                    # permite crear pickeadores destino aquí mismo para poder repartir tareas.
                     with st.expander("➕ Crear pickeadores destino", expanded=True):
-                        total_pickers = st.number_input(
-                            "Cantidad total de pickeadores (P1..Pn)",
+                        st.caption("Crea pickeadores adicionales (P2, P3, ...) para poder repartir tareas desde el pickeador origen.")
+                        total = st.number_input(
+                            "Cantidad total de pickeadores (incluye el origen)",
                             min_value=2,
-                            max_value=20,
-                            value=2,
+                            max_value=12,
+                            value=max(2, len(picker_names) + 1),
                             step=1,
                             key="adm_create_pickers_total",
-                            help="Se crearán/asegurarán P1..Pn si no existen."
                         )
                         if st.button("Crear/asegurar pickeadores", key="adm_create_pickers_btn"):
-                            created = 0
-                            for i in range(1, int(total_pickers) + 1):
-                                pname = f"P{i}"
-                                try:
-                                    c.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (pname,))
-                                    if c.rowcount and c.rowcount > 0:
-                                        created += 1
-                                except Exception:
-                                    pass
-                            try:
-                                conn.commit()
-                            except Exception:
-                                pass
-                            sfx_emit("OK")
-                            st.success(f"Listo. Pickeadores asegurados hasta P{int(total_pickers)} (nuevos: {created}).")
+                            existing = set(picker_names)
+                            for i in range(1, int(total) + 1):
+                                name = f"P3469"
+                                if name not in existing:
+                                    conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (name,))
+                            conn.commit()
+                            st.success("Pickeadores creados. Ahora ya puedes seleccionar destinos.")
                             st.rerun()
                 else:
                     dests = st.multiselect("Pickeadores destino", other_picker_names, default=other_picker_names, key="adm_reassign_dests")
