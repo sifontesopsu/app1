@@ -3463,25 +3463,26 @@ def page_admin():
                 other_picker_names = [n for n in picker_names if n != src_name]
                 if not other_picker_names:
                     st.warning("No hay pickeadores destino disponibles.")
+
                     with st.expander("➕ Crear pickeadores destino", expanded=True):
-                        st.caption("Crea pickeadores adicionales (P2, P3, ...) para poder repartir tareas desde el pickeador origen.")
-                        total = st.number_input(
-                            "Cantidad total de pickeadores (incluye el origen)",
-                            min_value=2,
-                            max_value=12,
-                            value=max(2, len(picker_names) + 1),
-                            step=1,
-                            key="adm_create_pickers_total",
+                        new_picker_name = st.text_input(
+                            "Nombre del nuevo pickeador (ej: P2)",
+                            value="P2",
+                            key="adm_new_picker_name"
                         )
-                        if st.button("Crear/asegurar pickeadores", key="adm_create_pickers_btn"):
-                            existing = set(picker_names)
-                            for i in range(1, int(total) + 1):
-                                name = f"P3469"
-                                if name not in existing:
-                                    conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (name,))
-                            conn.commit()
-                            st.success("Pickeadores creados. Ahora ya puedes seleccionar destinos.")
-                            st.rerun()
+                        if st.button("Crear pickeador", key="adm_create_picker_btn"):
+                            nn = (new_picker_name or "").strip()
+                            if not nn:
+                                st.error("Ingresa un nombre válido.")
+                            else:
+                                nn = nn.upper()
+                                try:
+                                    conn.execute("INSERT OR IGNORE INTO pickers (name) VALUES (?)", (nn,))
+                                    conn.commit()
+                                    st.success(f"{nn} creado. Ya puedes repartir tareas.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"No se pudo crear el pickeador: {e}")
                 else:
                     dests = st.multiselect("Pickeadores destino", other_picker_names, default=other_picker_names, key="adm_reassign_dests")
                     if not dests:
